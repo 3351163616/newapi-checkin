@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 
-const html = readFileSync(new URL("./templates/index.html", import.meta.url), "utf8");
+const html = readFileSync(new URL("../templates/index.html", import.meta.url), "utf8");
 const js = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).sort((a, b) => b.length - a.length)[0];
 
 /** 抓出一个函数的完整源码。先跳过参数表再数花括号 —— 形如 `options = {}` 的默认值会骗过朴素计数。 */

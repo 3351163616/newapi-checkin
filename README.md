@@ -66,7 +66,7 @@ uvicorn balance_server:app --host 0.0.0.0 --port 8003
 
 ```bash
 .venv/bin/python -m pytest -q        # 后端，全假数据驱动，不发上游请求
-node test_site_frontend.mjs          # 前端
+node tests/test_site_frontend.mjs    # 前端
 ```
 
 ## 说明
