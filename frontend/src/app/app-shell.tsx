@@ -46,14 +46,14 @@ export function AppShell() {
         to={href}
         onClick={() => setMobileOpen(false)}
         className={({ isActive }) => cn(
-          "group flex h-9 items-center gap-2.5 rounded-md px-3 text-sm font-normal text-muted-foreground transition-colors hover:bg-secondary/55 hover:text-foreground",
+          "group flex h-10 items-center gap-3 rounded-md px-3 text-[15px] font-normal text-muted-foreground transition-colors hover:bg-secondary/55 hover:text-foreground",
           isActive && "bg-secondary/60 text-foreground",
         )}
       >
         {({ isActive }) => (
           <>
-            <span className="flex size-5 shrink-0 items-center justify-center">
-              <Icon className={cn("size-4 text-muted-foreground", isActive && "text-foreground")} strokeWidth={1.8} />
+            <span className="flex size-6 shrink-0 items-center justify-center">
+              <Icon className={cn("size-[18px] text-muted-foreground", isActive && "text-foreground")} strokeWidth={1.8} />
             </span>
             {label}
           </>
@@ -63,7 +63,7 @@ export function AppShell() {
   }
 
   const navigationContent = (
-    <nav className="mt-7 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2 pb-2" aria-label="主导航">
+    <nav className="mt-8 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2 pb-2" aria-label="主导航">
       <div className="space-y-1">{navigationLinks()}</div>
     </nav>
   );
@@ -84,9 +84,9 @@ export function AppShell() {
 
   return (
     <div className="min-h-screen bg-background">
-      <aside className="fixed inset-y-0 left-0 z-30 hidden h-screen w-[260px] flex-col overflow-hidden bg-sidebar px-4 py-5 lg:flex">
+      <aside className="fixed inset-y-0 left-0 z-30 hidden h-screen w-[280px] flex-col overflow-hidden bg-sidebar px-4 py-5 lg:flex">
         <div className="flex h-7 shrink-0 items-center px-2.5">
-          <Link to="/dashboard" className="truncate text-lg font-semibold text-foreground">
+          <Link to="/dashboard" className="truncate text-xl font-semibold text-foreground">
             New API Balance Manager
           </Link>
         </div>
@@ -94,7 +94,7 @@ export function AppShell() {
         <div className="relative z-10 mt-4 shrink-0 border-t border-sidebar-border/60 bg-sidebar pt-4">{footerControl}</div>
       </aside>
 
-      <div className="flex min-h-screen flex-col lg:pl-[260px]">
+      <div className="flex min-h-screen flex-col lg:pl-[280px]">
         {/* 桌面顶栏：右侧圆形主题切换 + 登出 */}
         <header className="sticky top-0 z-40 hidden h-12 items-center justify-end gap-1.5 border-b bg-background/80 px-5 backdrop-blur-sm lg:flex">
           <ThemeToggleButton theme={theme} setTheme={setTheme} />
@@ -118,7 +118,7 @@ export function AppShell() {
             </SheetTrigger>
             <SheetContent side="left" className="flex h-dvh max-h-dvh w-72 flex-col gap-0 overflow-hidden bg-sidebar px-3 py-4 [&>button]:right-2 [&>button]:top-3.5 [&>button]:flex [&>button]:size-7 [&>button]:items-center [&>button]:justify-center">
               <SheetHeader className="h-7 shrink-0 px-2.5 text-left">
-                <SheetTitle className="flex h-7 items-center text-base">New API Balance Manager</SheetTitle>
+                <SheetTitle className="flex h-7 items-center text-lg">New API Balance Manager</SheetTitle>
                 <SheetDescription className="sr-only">主导航</SheetDescription>
               </SheetHeader>
               <nav className="mt-5 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1 pb-2" aria-label="主导航">
@@ -133,9 +133,14 @@ export function AppShell() {
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-[1280px] flex-1 px-5 py-6 sm:px-8 lg:py-8">
+        <main className="w-full flex-1 px-4 py-5 sm:px-6 lg:py-6">
           <Outlet />
         </main>
+        <footer className="border-t px-4 py-3 sm:px-6">
+          <p className="text-[11px] text-muted-foreground">
+            New API Balance Manager · Powered by curl_cffi + FastAPI · 数据仅存于本地
+          </p>
+        </footer>
       </div>
     </div>
   );

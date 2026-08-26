@@ -194,6 +194,22 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* ── 宽屏自适应：整体等比放大 ──────────────────────────────────────────────
+   Tailwind 的间距/字号/组件尺寸全走 rem，调 html 的 font-size 一行就能让
+   整个界面等比放大（字体、间距、卡片、图标一起变），比逐组件改响应式类
+   干净得多。2xl(1536) 起放大 1 档，4K(1920) 再放大 1 档。 */
+@media (min-width: 1536px) {
+  html {
+    font-size: 16.5px;
+  }
+}
+
+@media (min-width: 1920px) {
+  html {
+    font-size: 17.5px;
+  }
+}
+
 /* 密钥 / token / 账号 ID 这类数据内容用等宽：能对齐、能防 0/O 与 l/1 混淆。
    仅限数据本身，UI 文本一律走 Inter。 */
 .font-data {
