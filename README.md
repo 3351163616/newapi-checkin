@@ -76,4 +76,4 @@ node tests/test_site_frontend.mjs    # 前端
 
 ## License
 
-MIT
+[MIT](LICENSE)
