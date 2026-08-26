@@ -1,0 +1,3855 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnyRouter 余额查询</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              dark: {
+                900: "#0f172a",
+                800: "#1e293b",
+                700: "#334155",
+                600: "#475569",
+              },
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+      body {
+        font-family: "Inter", sans-serif;
+      }
+      .gradient-border {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1px;
+        border-radius: 0.75rem;
+      }
+      .gradient-border > div {
+        background: #1e293b;
+        border-radius: 0.7rem;
+      }
+      .shimmer {
+        background: linear-gradient(90deg, #334155 0%, #475569 50%, #334155 100%);
+        background-size: 200% 100%;
+        animation: shimmer 1.5s infinite;
+      }
+      @keyframes shimmer {
+        0% {
+          background-position: 200% 0;
+        }
+        100% {
+          background-position: -200% 0;
+        }
+      }
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: #475569 transparent;
+      }
+      ::-webkit-scrollbar {
+        width: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #475569;
+        border-radius: 3px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #64748b;
+      }
+    </style>
+  </head>
+  <body class="bg-dark-900 min-h-screen text-gray-100 flex flex-col">
+    <!-- Login Overlay -->
+    <div id="loginOverlay" class="fixed inset-0 z-[100] flex items-center justify-center bg-dark-900">
+      <div class="bg-dark-800 rounded-xl p-8 shadow-2xl w-full max-w-md mx-4">
+        <div class="text-center mb-8">
+          <h1 class="text-2xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">AnyRouter 余额查询</h1>
+          <p class="text-gray-400 mt-2">请登录以继续</p>
+        </div>
+        <form id="loginForm" class="space-y-5">
+          <div>
+            <label class="block text-sm text-gray-400 mb-1">用户名</label>
+            <input
+              type="text"
+              id="loginUsername"
+              placeholder="请输入用户名"
+              class="w-full bg-dark-700 border border-dark-600 rounded-lg px-4 py-3 text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+            />
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-1">密码</label>
+            <input
+              type="password"
+              id="loginPassword"
+              placeholder="请输入密码"
+              class="w-full bg-dark-700 border border-dark-600 rounded-lg px-4 py-3 text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+            />
+          </div>
+          <div id="loginError" class="text-center text-sm text-red-400 min-h-[20px]"></div>
+          <button
+            type="submit"
+            id="loginBtn"
+            class="w-full py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold rounded-lg shadow-lg transition duration-200"
+          >
+            登录
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <div class="container mx-auto px-4 py-8 max-w-6xl flex-1 flex flex-col">
+      <!-- Header -->
+      <div class="text-center mb-10 relative">
+        <h1 class="text-4xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">AnyRouter 余额查询</h1>
+        <p class="text-gray-400 mt-2">批量查询账号余额，支持 JSON 格式输入</p>
+        <!-- 设置按钮 -->
+        <button onclick="openMonitorModal()" class="absolute right-0 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-purple-400 transition" title="监控设置">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
+            />
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+          <span id="monitorIndicator" class="hidden absolute -top-1 -right-1 w-3 h-3 bg-green-500 rounded-full animate-pulse"></span>
+        </button>
+      </div>
+
+      <!-- 网站切换：任一时刻只显示一类账号。AnyRouter / AgentRouter 是固定的两个特殊站点，
+           其余 new-api 同构站点（GoRouter / TaBiAI / 以后新加的）由 /api/sites 动态渲染 -->
+      <div class="mb-6 flex items-center gap-3 flex-wrap">
+        <span class="text-sm text-gray-400">当前网站</span>
+        <div id="providerSwitcher" class="inline-flex bg-dark-800 rounded-lg p-1 border border-dark-700 flex-wrap">
+          <button id="provAny" onclick="switchProvider('anyrouter')" class="px-5 py-1.5 text-sm font-medium rounded-md bg-emerald-600 text-white transition">AnyRouter</button>
+          <button id="provAgent" onclick="switchProvider('agentrouter')" class="px-5 py-1.5 text-sm font-medium rounded-md text-gray-400 hover:text-gray-200 transition">AgentRouter</button>
+          <!-- 动态站点按钮插在这里 -->
+        </div>
+        <button
+          onclick="openSiteManager()"
+          title="添加 / 编辑 new-api 站点（只需填域名，后端无需改动）"
+          class="px-3 py-1.5 text-xs font-medium rounded-lg bg-dark-800 border border-dark-700 text-gray-400 hover:text-purple-300 hover:border-purple-800 transition flex items-center gap-1.5"
+        >
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+          </svg>
+          站点管理
+        </button>
+      </div>
+
+      <!-- Summary Cards (隐藏，查询后显示) -->
+      <div id="summarySection" class="hidden mb-8">
+        <div class="grid grid-cols-1 gap-4">
+          <!-- AnyRouter 汇总 -->
+          <div id="anySummaryCard" class="bg-dark-800 rounded-xl p-5 border border-emerald-900/40">
+            <div class="flex items-center gap-2 mb-3">
+              <span class="text-emerald-300 font-semibold">AnyRouter 汇总</span>
+              <span id="anyCount" class="text-xs text-gray-500">0 个账号</span>
+            </div>
+            <div class="grid grid-cols-3 gap-3">
+              <div>
+                <div class="text-gray-400 text-xs mb-1">余额</div>
+                <div id="anyTotalQuota" class="text-xl font-bold text-green-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">已用</div>
+                <div id="anyTotalUsed" class="text-xl font-bold text-orange-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">今日用量</div>
+                <div id="anyTodayUsage" class="text-xl font-bold text-pink-400">--</div>
+              </div>
+            </div>
+          </div>
+          <!-- AgentRouter 汇总 -->
+          <div id="agentSummaryCard" class="bg-dark-800 rounded-xl p-5 border border-cyan-900/40">
+            <div class="flex items-center gap-2 mb-3">
+              <span class="text-cyan-300 font-semibold">AgentRouter 汇总</span>
+              <span id="agentCount" class="text-xs text-gray-500">0 个账号</span>
+            </div>
+            <div class="grid grid-cols-3 gap-3">
+              <div>
+                <div class="text-gray-400 text-xs mb-1">余额</div>
+                <div id="agentTotalQuota" class="text-xl font-bold text-green-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">已用</div>
+                <div id="agentTotalUsed" class="text-xl font-bold text-orange-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">成功</div>
+                <div id="agentSuccess" class="text-xl font-bold text-purple-400">0/0</div>
+              </div>
+            </div>
+          </div>
+          <!-- new-api 站点汇总（GoRouter / TaBiAI / 以后新加的都复用这一张卡） -->
+          <div id="siteSummaryCard" class="hidden bg-dark-800 rounded-xl p-5 border border-orange-900/40">
+            <div class="flex items-center gap-2 mb-3">
+              <span id="siteSummaryTitle" class="text-orange-300 font-semibold">站点汇总</span>
+              <span id="siteCount" class="text-xs text-gray-500">0 个账号</span>
+            </div>
+            <div class="grid grid-cols-3 gap-3">
+              <div>
+                <div class="text-gray-400 text-xs mb-1">余额</div>
+                <div id="siteTotalQuota" class="text-xl font-bold text-green-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">已用</div>
+                <div id="siteTotalUsed" class="text-xl font-bold text-orange-400">$0.00</div>
+              </div>
+              <div>
+                <div class="text-gray-400 text-xs mb-1">今日用量</div>
+                <div id="siteTodayUsage" class="text-xl font-bold text-pink-400">--</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="grid md:grid-cols-2 gap-6 flex-1 items-start">
+        <!-- Input Section -->
+        <div class="bg-dark-800 rounded-xl p-6 shadow-xl flex flex-col">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold text-gray-200">账号管理</h2>
+            <div class="flex items-center gap-2">
+              <button
+                onclick="openKeyManager()"
+                id="keyManagerBtn"
+                title="查看/新建/删除各账号在站点上的 API 密钥，支持批量复制"
+                class="px-3 py-1.5 text-xs font-medium rounded-md bg-dark-700 text-gray-300 hover:bg-dark-600 hover:text-purple-300 transition"
+              >
+                API 密钥
+              </button>
+              <button
+                onclick="dedupeAccounts()"
+                id="dedupBtn"
+                title="同网站同 ID 的账号只保留一个（优先保留有效 cookie）"
+                class="px-3 py-1.5 text-xs font-medium rounded-md bg-dark-700 text-gray-300 hover:bg-dark-600 hover:text-amber-300 transition"
+              >
+                ID 去重
+              </button>
+              <div class="flex bg-dark-700 rounded-lg p-0.5">
+                <button onclick="switchTab('visual')" id="tabVisual" class="px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white transition">可视化</button>
+                <button onclick="switchTab('json')" id="tabJson" class="px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition">JSON</button>
+              </div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 mb-4">
+            <button
+              id="queryBtn"
+              onclick="queryBalance()"
+              title="只查询顶部所选网站的账号余额"
+              class="flex-1 min-w-[120px] py-3 px-4 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="queryIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              <span id="queryText">查询余额</span>
+            </button>
+            <button
+              id="anyrouterCheckinBtn"
+              onclick="anyrouterCheckin()"
+              class="flex-1 min-w-[130px] py-3 px-4 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="anyrouterCheckinIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span id="anyrouterCheckinText">AnyRouter 签到</span>
+            </button>
+            <button
+              id="agentCheckinBtn"
+              onclick="agentrouterCheckin()"
+              class="flex-1 min-w-[130px] py-3 px-4 bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-500 hover:to-cyan-500 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="agentCheckinIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span id="agentCheckinText">AgentRouter 签到</span>
+            </button>
+            <button
+              id="agentFastCheckinBtn"
+              onclick="agentrouterFastCheckin()"
+              class="flex-1 min-w-[130px] py-3 px-4 bg-gradient-to-r from-teal-500 to-cyan-400 hover:from-teal-400 hover:to-cyan-300 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="agentFastCheckinIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
+              <span id="agentFastCheckinText">AgentRouter 一键全签</span>
+            </button>
+            <button
+              id="siteCheckinBtn"
+              onclick="siteCheckin()"
+              class="hidden flex-1 min-w-[130px] py-3 px-4 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="siteCheckinIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span id="siteCheckinText">站点签到</span>
+            </button>
+            <button
+              id="renewBtn"
+              onclick="renewCookies()"
+              class="flex-1 min-w-[120px] py-3 px-4 bg-gradient-to-r from-blue-600 to-sky-600 hover:from-blue-500 hover:to-sky-500 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2"
+            >
+              <svg id="renewIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              <span id="renewText">Cookie 续期</span>
+            </button>
+          </div>
+
+          <!-- 每日自动签到开关（随当前网站切换，仅影响 0 点自动触发） -->
+          <div class="flex items-center justify-between mb-4 px-3 py-2.5 bg-dark-700/50 rounded-lg border border-dark-600">
+            <div class="min-w-0">
+              <div class="text-xs font-medium text-gray-200">
+                每日自动签到 · <span id="autoCheckinScope" class="text-emerald-300">AnyRouter</span>
+              </div>
+              <div id="autoCheckinHint" class="text-xs text-gray-500 mt-0.5">每天 0 点自动签到；关闭后仅停止自动触发，手动签到不受影响</div>
+              <div id="agentGapRow" class="hidden mt-2 flex items-center gap-2 text-xs text-gray-400">
+                <span>缓慢签到间隔</span>
+                <input id="agentGapMin" type="number" min="1" max="1440" class="w-16 px-2 py-1 rounded bg-dark-800 border border-dark-600 text-gray-200" />
+                <span>~</span>
+                <input id="agentGapMax" type="number" min="1" max="1440" class="w-16 px-2 py-1 rounded bg-dark-800 border border-dark-600 text-gray-200" />
+                <span>分钟</span>
+                <button onclick="saveAgentGap()" class="px-2 py-1 rounded bg-dark-600 hover:bg-dark-500 text-gray-300 transition">保存</button>
+              </div>
+            </div>
+            <button
+              id="autoCheckinToggle"
+              onclick="toggleAutoCheckin()"
+              role="switch"
+              aria-checked="true"
+              aria-label="每日自动签到开关"
+              class="relative shrink-0 w-11 h-6 rounded-full bg-dark-600 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500"
+            >
+              <span id="autoCheckinKnob" class="absolute top-0.5 left-0.5 w-5 h-5 bg-gray-300 rounded-full shadow transition-transform"></span>
+            </button>
+          </div>
+
+          <!-- AnyRouter 签到进度面板 -->
+          <div id="anyrouterCheckinProgress" class="hidden mb-3 bg-dark-700/60 rounded-lg p-4 border border-emerald-900/40">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-2">
+                <span class="text-sm font-medium text-emerald-300">AnyRouter 签到进度</span>
+                <span id="anyrouterRunningDot" class="hidden w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+              </div>
+              <span id="anyrouterProgressStat" class="text-xs text-gray-400"></span>
+            </div>
+            <div class="w-full bg-dark-800 rounded-full h-2.5 mb-2 overflow-hidden">
+              <div id="anyrouterProgressBar" class="bg-gradient-to-r from-green-500 to-emerald-500 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+            <div id="anyrouterProgressInfo" class="text-xs text-gray-500 mb-2"></div>
+            <div id="anyrouterAccountStatus" class="flex flex-wrap gap-1.5"></div>
+          </div>
+
+          <!-- new-api 站点签到进度面板（各站点复用） -->
+          <div id="siteCheckinProgress" class="hidden mb-3 bg-dark-700/60 rounded-lg p-4 border border-orange-900/40">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-2">
+                <span id="siteProgressTitle" class="text-sm font-medium text-orange-300">站点签到进度</span>
+                <span id="siteRunningDot" class="hidden w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+              </div>
+              <span id="siteProgressStat" class="text-xs text-gray-400"></span>
+            </div>
+            <div class="w-full bg-dark-800 rounded-full h-2.5 mb-2 overflow-hidden">
+              <div id="siteProgressBar" class="bg-gradient-to-r from-orange-500 to-amber-500 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+            <div id="siteProgressInfo" class="text-xs text-gray-500 mb-2"></div>
+            <div id="siteAccountStatus" class="flex flex-wrap gap-1.5"></div>
+          </div>
+
+          <!-- new-api 站点浏览器签到面板：站点开着 Turnstile 时用。sitekey 有域名限制，
+               脚本必须在该站点自己的页面上跑；且它是 HTTPS 页面，无法 fetch 回本服务的 HTTP 地址，
+               所以脚本不回传结果，靠「同步状态」用未挂 Turnstile 的 GET 反向核对 -->
+          <div id="siteBrowserPanel" class="hidden mb-3 bg-dark-700/60 rounded-lg p-4 border border-amber-900/50">
+            <div class="flex items-center gap-2 mb-2">
+              <svg class="w-4 h-4 text-amber-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+              <span id="siteBrowserTitle" class="text-sm font-medium text-amber-300">该站点已开启人机校验，需在浏览器完成签到</span>
+            </div>
+            <ol class="text-xs text-gray-400 space-y-1 mb-3 list-decimal list-inside">
+              <li>点下面「复制签到脚本」（若浏览器拒绝自动复制，脚本会显示在文本框里，点一下即全选，Ctrl+C）</li>
+              <li>打开 <a id="siteBrowserLink" href="#" target="_blank" rel="noopener" class="text-amber-400 underline">站点首页</a>，按 F12 打开 Console，粘贴回车（约 1 分钟跑完）</li>
+              <li>跑完回来点「同步状态」，核对结果并更新余额</li>
+            </ol>
+            <div class="flex flex-wrap gap-2">
+              <button
+                id="siteCopyScriptBtn"
+                onclick="copySiteScript()"
+                class="px-3 py-2 text-xs font-medium bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition flex items-center gap-1.5"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <span id="siteCopyScriptText">复制签到脚本</span>
+              </button>
+              <button
+                id="siteSyncBtn"
+                onclick="siteSyncStatus()"
+                class="px-3 py-2 text-xs font-medium bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg transition flex items-center gap-1.5"
+              >
+                <svg id="siteSyncIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span id="siteSyncText">同步状态</span>
+              </button>
+            </div>
+            <textarea
+              id="siteScriptHolder"
+              class="hidden mt-2 w-full h-28 text-xs font-mono bg-dark-800 text-gray-300 rounded p-2 border border-dark-600 resize-y"
+              readonly
+              spellcheck="false"
+              onclick="this.select()"
+              title="点击可全选，Ctrl+C 复制"
+            ></textarea>
+            <div id="siteCopyHint" class="hidden mt-2 text-xs text-gray-400"></div>
+          </div>
+
+          <!-- Cookie 续期结果面板 -->
+          <div id="renewResult" class="hidden mb-3 bg-dark-700/60 rounded-lg p-4 border border-blue-900/40">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-sm font-medium text-blue-300">Cookie 续期结果</span>
+              <span id="renewStat" class="text-xs text-gray-400"></span>
+            </div>
+            <div id="renewNotice" class="hidden mb-2 text-xs text-amber-300 bg-amber-900/20 border border-amber-800/40 rounded px-2 py-1.5"></div>
+            <div id="renewAccountStatus" class="flex flex-wrap gap-1.5"></div>
+          </div>
+
+          <!-- AgentRouter 签到进度面板 -->
+          <div id="checkinProgress" class="hidden mb-4 bg-dark-700/60 rounded-lg p-4 border border-cyan-900/40">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-2">
+                <span class="text-sm font-medium text-cyan-300">AgentRouter 签到进度</span>
+                <span id="checkinRunningDot" class="hidden w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span id="checkinProgressStat" class="text-xs text-gray-400"></span>
+                <button id="checkinStopBtn" onclick="stopCheckin()" class="hidden px-2 py-1 text-xs rounded bg-red-900/50 text-red-300 hover:bg-red-800/60 transition">停止</button>
+              </div>
+            </div>
+            <div class="w-full bg-dark-800 rounded-full h-2.5 mb-2 overflow-hidden">
+              <div id="checkinProgressBar" class="bg-gradient-to-r from-teal-500 to-cyan-500 h-2.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+            <div id="checkinProgressInfo" class="text-xs text-gray-500 mb-2"></div>
+            <div id="checkinAccountStatus" class="flex flex-wrap gap-1.5"></div>
+          </div>
+
+          <!-- Visual Panel -->
+          <div id="visualPanel" class="flex-1 flex flex-col min-h-0">
+            <div id="accountList" class="flex-1 overflow-y-auto space-y-2 mb-3 pr-1 min-h-0">
+              <div id="accountListEmpty" class="text-gray-500 text-center py-10">
+                <svg class="w-12 h-12 mx-auto mb-3 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
+                </svg>
+                <p class="text-sm">点击下方按钮添加账号</p>
+              </div>
+            </div>
+            <button
+              onclick="toggleAddForm()"
+              id="addAccountBtn"
+              class="w-full py-2.5 border-2 border-dashed border-dark-600 hover:border-purple-500 text-gray-400 hover:text-purple-400 rounded-lg transition flex items-center justify-center gap-2 text-sm"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+              </svg>
+              添加账号
+            </button>
+            <!-- Add/Edit Form -->
+            <div id="accountForm" class="hidden mt-3 bg-dark-700/70 rounded-lg p-4 space-y-3 border border-dark-600">
+              <div class="flex items-center justify-between">
+                <span id="formTitle" class="text-sm font-medium text-gray-300">添加新账号</span>
+                <button onclick="cancelForm()" class="text-gray-500 hover:text-gray-300 transition">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div class="flex bg-dark-800 rounded-lg p-0.5">
+                <button onclick="setFormType('token')" id="formTypeToken" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white transition">Token 模式</button>
+                <button onclick="setFormType('cookie')" id="formTypeCookie" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition">Cookie 模式</button>
+                <button onclick="setFormType('login')" id="formTypeLogin" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition">Login</button>
+                <button onclick="setFormType('site')" id="formTypeSite" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition">new-api 站点</button>
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">账号名称</label>
+                <input
+                  type="text"
+                  id="formName"
+                  placeholder="例如: 主账号"
+                  class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              <div id="formTokenFields">
+                <div class="space-y-3">
+                  <div>
+                    <label class="block text-xs text-gray-400 mb-1">Access Token</label>
+                    <input
+                      type="password"
+                      id="formAccessToken"
+                      placeholder="sk-..."
+                      class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    />
+                  </div>
+                  <div class="grid grid-cols-2 gap-3">
+                    <div>
+                      <label class="block text-xs text-gray-400 mb-1">User ID</label>
+                      <input
+                        type="text"
+                        id="formUserId"
+                        placeholder="12345"
+                        class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      />
+                    </div>
+                    <div>
+                      <label class="block text-xs text-gray-400 mb-1">Provider</label>
+                      <select id="formProvider" class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                        <option value="anyrouter">anyrouter</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div id="formCookieFields" class="hidden space-y-3">
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">Session Cookie</label>
+                  <input
+                    type="text"
+                    id="formSession"
+                    placeholder="session cookie 值"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">API User</label>
+                  <input
+                    type="text"
+                    id="formApiUser"
+                    placeholder="12345"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+              </div>
+              <div id="formLoginFields" class="hidden space-y-3">
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">用户名 (邮箱)</label>
+                  <input
+                    type="text"
+                    id="formLoginUsername"
+                    placeholder="user@email.com"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">密码</label>
+                  <input
+                    type="password"
+                    id="formLoginPassword"
+                    placeholder="密码"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+              </div>
+              <div id="formSiteFields" class="hidden space-y-3">
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">所属站点</label>
+                  <select id="formSiteId" class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                    <!-- 由 renderSiteOptions() 填充 -->
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">Access Token</label>
+                  <input
+                    type="password"
+                    id="formSiteToken"
+                    placeholder="访问令牌"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">User ID</label>
+                  <input
+                    type="text"
+                    id="formSiteUserId"
+                    placeholder="11962"
+                    class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+              </div>
+              <div class="flex gap-2 pt-1">
+                <button onclick="saveAccountFromForm()" class="flex-1 py-2 px-4 bg-purple-600 hover:bg-purple-500 text-white text-sm font-medium rounded-lg transition">保存</button>
+                <button onclick="cancelForm()" class="py-2 px-4 bg-dark-600 hover:bg-dark-500 text-gray-300 text-sm rounded-lg transition">取消</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- JSON Panel -->
+          <div id="jsonPanel" class="hidden flex-1 flex flex-col">
+            <div class="flex items-center justify-end mb-2">
+              <button onclick="loadExample()" class="text-xs text-purple-400 hover:text-purple-300 transition">加载示例</button>
+            </div>
+            <textarea
+              id="accountInput"
+              placeholder='支持三种格式:\n\n\t1. Access Token（AnyRouter）:\n\t[{"name": "账号名", "access_token": "xxx", "user_id": "123", "provider": "anyrouter"}]\n\n\t2. Session Cookie（AnyRouter）:\n\t[{"name": "账号名", "cookies": {"session": "xxx"}, "api_user": "123"}]\n\n\t3. new-api 站点（provider 填站点 ID，如 gorouter / tabitoken）:\n\t[{"name": "账号名", "access_token": "xxx", "user_id": "123", "provider": "gorouter"}]'
+              class="w-full flex-1 min-h-[320px] bg-dark-700 border border-dark-600 rounded-lg p-4 text-sm text-gray-300 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent resize-none font-mono"
+            ></textarea>
+          </div>
+        </div>
+
+        <!-- Results Section -->
+        <div class="bg-dark-800 rounded-xl p-6 shadow-xl flex flex-col">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold text-gray-200">查询结果</h2>
+            <div id="sortControls" class="hidden flex items-center gap-3">
+              <span class="text-xs text-gray-500">排序:</span>
+              <button onclick="sortResults('quota')" id="sortQuota" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-400 hover:text-purple-400 transition">余额 ↓</button>
+              <button onclick="sortResults('used')" id="sortUsed" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-400 hover:text-purple-400 transition">已用 ↓</button>
+              <button onclick="sortResults('todayUsed')" id="sortTodayUsed" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-400 hover:text-purple-400 transition">今日 ↓</button>
+              <span class="text-gray-600">|</span>
+              <span class="text-xs text-gray-500">筛选:</span>
+              <select id="checkinFilter" onchange="filterResults()" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-300 border border-dark-600 focus:outline-none focus:border-purple-500">
+                <option value="all">全部</option>
+                <option value="checked">已签到</option>
+                <option value="unchecked">未签到</option>
+              </select>
+            </div>
+          </div>
+          <div id="resultsContainer" class="space-y-3 flex-1 overflow-y-auto pr-2">
+            <div class="text-gray-500 text-center py-16">
+              <svg class="w-16 h-16 mx-auto mb-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="1.5"
+                  d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
+                />
+              </svg>
+              <p>输入账号配置后点击查询</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 站点管理 Modal：增删改 new-api 同构站点。只填域名即可，后端零改动 -->
+      <div id="siteManagerModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeSiteManager()"></div>
+        <div class="relative bg-dark-800 rounded-xl p-6 shadow-2xl w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-xl font-semibold text-gray-200">new-api 站点管理</h2>
+              <p class="text-xs text-gray-500 mt-1">GoRouter / TaBiAI 这类站点接口完全同构，加一个只需填域名。AnyRouter 与 AgentRouter 走各自的特殊逻辑，不在此列。</p>
+            </div>
+            <button onclick="closeSiteManager()" class="text-gray-400 hover:text-gray-200 transition">
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <div id="siteManagerList" class="space-y-2 mb-4"></div>
+
+          <div class="bg-dark-700/60 rounded-lg p-4 border border-dark-600">
+            <div class="text-sm font-medium text-gray-200 mb-3">添加站点</div>
+            <div class="grid md:grid-cols-2 gap-3">
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">站点 ID（英文，创建后不可改）</label>
+                <input
+                  type="text"
+                  id="newSiteId"
+                  placeholder="tabitoken"
+                  class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">显示名称</label>
+                <input
+                  type="text"
+                  id="newSiteLabel"
+                  placeholder="TaBiAI"
+                  class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">域名</label>
+                <input
+                  type="text"
+                  id="newSiteDomain"
+                  placeholder="https://tabitoken.com"
+                  class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">主题色</label>
+                <select id="newSiteAccent" class="w-full bg-dark-800 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500">
+                  <option value="orange">橙色</option>
+                  <option value="sky">天蓝</option>
+                  <option value="violet">紫罗兰</option>
+                  <option value="rose">玫红</option>
+                  <option value="lime">青柠</option>
+                  <option value="amber">琥珀</option>
+                </select>
+              </div>
+            </div>
+            <div class="flex items-center gap-2 mt-3">
+              <button onclick="addSite()" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm font-medium rounded-lg transition">添加</button>
+              <button onclick="probeNewSite()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 text-gray-200 text-sm rounded-lg transition">先探测一下</button>
+              <span id="siteManagerHint" class="text-xs text-gray-500"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Key Manager Modal -->
+      <div id="keyManagerModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeKeyManager()"></div>
+        <div class="relative bg-dark-800 rounded-xl shadow-2xl w-full max-w-4xl mx-4 max-h-[92vh] flex flex-col">
+          <div class="flex items-start justify-between p-6 pb-4">
+            <div>
+              <h2 class="text-xl font-semibold text-gray-200">API 密钥管理 · <span id="keyManagerTitle" class="text-purple-400"></span></h2>
+              <p class="text-xs text-gray-500 mt-1">
+                展示各账号在站点上创建的 API 密钥（new-api 的「令牌」），直接显示完整密钥，可新建、删除、批量复制。
+                <span class="text-gray-600">结果已缓存，打开与复制都不再请求站点；个别限流未取到的点「显示」补取。</span>
+              </p>
+            </div>
+            <button onclick="closeKeyManager()" class="text-gray-400 hover:text-gray-200 transition shrink-0">
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <!-- 工具条 -->
+          <div class="px-6 pb-3 flex flex-wrap items-center gap-2 border-b border-dark-700">
+            <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer select-none">
+              <input type="checkbox" id="keySelectAll" onchange="toggleSelectAllKeyAccounts(this.checked)" class="w-3.5 h-3.5 rounded bg-dark-700 border-dark-600 text-purple-500 focus:ring-0 cursor-pointer" />
+              全选
+            </label>
+            <span id="keyManagerStat" class="text-xs text-gray-500"></span>
+            <div class="flex-1"></div>
+            <select id="keyCopyFormat" class="bg-dark-700 border border-dark-600 rounded-md px-2 py-1 text-xs text-gray-300 focus:outline-none focus:border-purple-500">
+              <option value="key">仅密钥（一行一个）</option>
+              <option value="named">账号 · 密钥名 · 密钥</option>
+              <option value="json">JSON</option>
+            </select>
+            <button onclick="copyKeys('selected')" id="keyCopySelectedBtn" class="px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 hover:bg-purple-500 text-white transition">复制选中</button>
+            <button onclick="copyKeys('all')" id="keyCopyAllBtn" class="px-3 py-1.5 text-xs font-medium rounded-md bg-dark-700 hover:bg-dark-600 text-gray-200 transition">复制全部</button>
+            <button onclick="loadKeyManager(true)" class="px-3 py-1.5 text-xs font-medium rounded-md bg-dark-700 hover:bg-dark-600 text-gray-300 transition">刷新</button>
+          </div>
+
+          <div id="keyManagerHint" class="hidden px-6 pt-3 text-xs"></div>
+
+          <!-- 账号 + 密钥列表 -->
+          <div id="keyManagerList" class="flex-1 overflow-y-auto px-6 py-4 space-y-2 min-h-0"></div>
+
+          <!-- 复制兜底文本框（HTTP 页面没有 clipboard 权限时用） -->
+          <div class="px-6 pb-4">
+            <textarea id="keyCopyHolder" class="hidden w-full h-24 bg-dark-900 border border-dark-600 rounded-lg px-3 py-2 text-xs text-gray-300 font-mono" readonly></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- Monitor Modal -->
+      <div id="monitorModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeMonitorModal()"></div>
+        <div class="relative bg-dark-800 rounded-xl p-6 shadow-2xl w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto">
+          <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xl font-semibold text-gray-200">余额监控设置</h2>
+            <div class="flex items-center gap-4">
+              <div id="monitorStatus" class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                <span class="text-sm text-gray-400">未启动</span>
+              </div>
+              <button onclick="closeMonitorModal()" class="text-gray-400 hover:text-gray-200 transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-6">
+            <!-- Monitor Config -->
+            <div class="space-y-4">
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">检测间隔（小时）</label>
+                  <input
+                    type="number"
+                    id="monitorInterval"
+                    value="6"
+                    min="0.1"
+                    step="0.5"
+                    class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">告警阈值（美元）</label>
+                  <input
+                    type="number"
+                    id="monitorThreshold"
+                    value="10"
+                    min="0"
+                    step="1"
+                    class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">SMTP 服务器</label>
+                  <input
+                    type="text"
+                    id="smtpServer"
+                    placeholder="smtp.qq.com"
+                    class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label class="block text-xs text-gray-400 mb-1">SMTP 端口</label>
+                  <input
+                    type="number"
+                    id="smtpPort"
+                    value="465"
+                    class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">发件邮箱</label>
+                <input
+                  type="email"
+                  id="emailUser"
+                  placeholder="your@email.com"
+                  class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">邮箱密码/授权码</label>
+                <input
+                  type="password"
+                  id="emailPass"
+                  placeholder="授权码或密码"
+                  class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+
+              <div>
+                <label class="block text-xs text-gray-400 mb-1">收件邮箱</label>
+                <input
+                  type="email"
+                  id="emailTo"
+                  placeholder="notify@email.com"
+                  class="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+
+              <div class="flex gap-3 pt-2">
+                <button
+                  onclick="startMonitor()"
+                  id="startMonitorBtn"
+                  class="flex-1 py-2 px-4 bg-green-600 hover:bg-green-500 text-white font-semibold rounded-lg transition flex items-center justify-center gap-2"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  启动监控
+                </button>
+                <button
+                  onclick="stopMonitor()"
+                  id="stopMonitorBtn"
+                  disabled
+                  class="flex-1 py-2 px-4 bg-red-600 hover:bg-red-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition flex items-center justify-center gap-2"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+                  </svg>
+                  停止监控
+                </button>
+              </div>
+            </div>
+
+            <!-- Monitor Logs -->
+            <div class="flex flex-col">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-xs text-gray-400">监控日志</span>
+                <div id="monitorTimes" class="text-xs text-gray-500"></div>
+              </div>
+              <div id="monitorLogs" class="flex-1 min-h-[200px] max-h-[300px] bg-dark-700 rounded-lg p-3 overflow-y-auto font-mono text-xs text-gray-400">
+                <div class="text-gray-500">监控未启动</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="text-center mt-6 py-4 text-gray-500 text-sm">
+        <p>Powered by Playwright + FastAPI</p>
+      </div>
+    </div>
+
+    <script>
+      // ========== 认证相关 ==========
+      function showLoginOverlay() {
+        document.getElementById("loginOverlay").classList.remove("hidden");
+      }
+
+      function hideLoginOverlay() {
+        document.getElementById("loginOverlay").classList.add("hidden");
+      }
+
+      async function checkAuth() {
+        const token = localStorage.getItem("auth_token");
+        if (!token) {
+          showLoginOverlay();
+          return false;
+        }
+        try {
+          const resp = await fetch("/api/check-auth", {
+            headers: { Authorization: "Bearer " + token },
+          });
+          const data = await resp.json();
+          if (data.authenticated) {
+            hideLoginOverlay();
+            return true;
+          } else {
+            localStorage.removeItem("auth_token");
+            showLoginOverlay();
+            return false;
+          }
+        } catch (e) {
+          showLoginOverlay();
+          return false;
+        }
+      }
+
+      document.getElementById("loginForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById("loginBtn");
+        const errorEl = document.getElementById("loginError");
+        const username = document.getElementById("loginUsername").value.trim();
+        const password = document.getElementById("loginPassword").value;
+
+        if (!username || !password) {
+          errorEl.textContent = "请输入用户名和密码";
+          return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "登录中...";
+        errorEl.textContent = "";
+
+        try {
+          const resp = await fetch("/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, password }),
+          });
+          const data = await resp.json();
+
+          if (data.success) {
+            localStorage.setItem("auth_token", data.token);
+            hideLoginOverlay();
+            // 登录成功后立即加载账号与配置（否则列表为空，需手动刷新）
+            loadSavedConfig();
+            warmupWAF();
+            fetchMonitorStatus();
+            if (!monitorPollInterval) {
+              monitorPollInterval = setInterval(fetchMonitorStatus, 5000);
+            }
+          } else {
+            errorEl.textContent = data.message || "登录失败";
+          }
+        } catch (err) {
+          errorEl.textContent = "网络错误，请重试";
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "登录";
+        }
+      });
+
+      async function authFetch(url, options = {}) {
+        const token = localStorage.getItem("auth_token");
+        if (token) {
+          if (!options.headers) options.headers = {};
+          options.headers["Authorization"] = "Bearer " + token;
+        }
+        const resp = await window.fetch(url, options);
+        if (resp.status === 401) {
+          localStorage.removeItem("auth_token");
+          showLoginOverlay();
+          throw new Error("未登录");
+        }
+        return resp;
+      }
+
+      // 保存查询结果用于排序和筛选
+      let currentResults = null;
+      let currentResultsAny = [];
+      let currentResultsAgent = [];
+      // 各 new-api 站点的查询结果：site_id -> results[]
+      let currentResultsSite = {};
+      // 当前显示的网站：anyrouter | agentrouter | 或任一 new-api 站点的 id（如 gorouter / tabitoken）
+      let currentProvider = "anyrouter";
+      let currentSort = { field: null, desc: true };
+      let currentFilter = "all";
+      // 今日 0 点余额基线（来自 daily_usage.json 当天快照），今日用量 = 当前 used − 基线 used。
+      // 原先是逐账号打 stat 接口实时取，占一次 AnyRouter 查询一半的请求量且最慢，改为快照口径。
+      let usageBaseline = null;
+
+      // ===== new-api 站点（通用）=====
+      // sites 来自 /api/sites；账号、签到状态、Turnstile 状态都按 site_id 分桶，
+      // 加一个站点只是多一个桶，前端逻辑不变。
+      let newapiSites = [];
+      let siteAccounts = {}; // site_id -> [{name, access_token, user_id}]
+      let siteCheckinStatus = {}; // site_id -> status
+      let siteTurnstile = {}; // site_id -> {enabled, site_key, probed}
+      let sitePollInterval = null;
+
+      // 账号管理状态
+      let currentTab = "visual";
+      let tokenAccounts = [];
+      let cookieAccounts = [];
+      let loginAccounts = [];
+      let formType = "token";
+      // Login 签到进度状态
+      let checkinStatus = null;
+      let checkinPollInterval = null;
+      let anyrouterCheckinStatus = null;
+      let anyrouterPollInterval = null;
+
+      // 当前站点（currentProvider 指向 new-api 站点时返回其配置，否则 null）
+      function currentSite() {
+        return newapiSites.find((s) => s.id === currentProvider) || null;
+      }
+      function isSiteProvider() {
+        return !!currentSite();
+      }
+      // 站点主题色 → Tailwind 类名。新增色系只需在这里加一行。
+      const ACCENTS = {
+        orange: { text: "text-orange-300", bg: "bg-orange-600", border: "border-orange-900/40", from: "from-orange-500", to: "to-amber-500", btnFrom: "from-orange-600", btnTo: "to-amber-600" },
+        sky: { text: "text-sky-300", bg: "bg-sky-600", border: "border-sky-900/40", from: "from-sky-500", to: "to-blue-500", btnFrom: "from-sky-600", btnTo: "to-blue-600" },
+        violet: { text: "text-violet-300", bg: "bg-violet-600", border: "border-violet-900/40", from: "from-violet-500", to: "to-purple-500", btnFrom: "from-violet-600", btnTo: "to-purple-600" },
+        rose: { text: "text-rose-300", bg: "bg-rose-600", border: "border-rose-900/40", from: "from-rose-500", to: "to-pink-500", btnFrom: "from-rose-600", btnTo: "to-pink-600" },
+        lime: { text: "text-lime-300", bg: "bg-lime-600", border: "border-lime-900/40", from: "from-lime-500", to: "to-green-500", btnFrom: "from-lime-600", btnTo: "to-green-600" },
+        amber: { text: "text-amber-300", bg: "bg-amber-600", border: "border-amber-900/40", from: "from-amber-500", to: "to-yellow-500", btnFrom: "from-amber-600", btnTo: "to-yellow-600" },
+      };
+      function accentOf(site) {
+        return ACCENTS[(site && site.accent) || "orange"] || ACCENTS.orange;
+      }
+
+      const exampleData = [
+        {
+          name: "示例账号1（Token方式）",
+          access_token: "your_access_token_here",
+          user_id: "12345",
+          provider: "anyrouter",
+        },
+        {
+          name: "示例账号2（Cookie方式）",
+          cookies: { session: "your_session_cookie" },
+          api_user: "67890",
+        },
+        {
+          name: "示例账号3（new-api 站点，provider 填站点 ID）",
+          access_token: "your_access_token_here",
+          user_id: "11962",
+          provider: "gorouter",
+        },
+      ];
+
+      // ========== 账号 ID 去重 ==========
+      // 同网站下 token.user_id 与 cookie.api_user 属同一 ID 命名空间（anyrouter）；login 按 username 去重；
+      // new-api 站点各自按 user_id 去重（不同站点 ID 不冲突，所以 key 里带 site_id）。
+      // 重复时优先保留可用的 cookie（有效期最长者），其次保留第一个。
+      function _acctKey(a, type) {
+        if (type === "token") return (a.provider || "anyrouter") + ":" + a.user_id;
+        if (type === "cookie") return "anyrouter:" + a.api_user;
+        if (type.startsWith("site:")) return type.slice(5) + ":" + a.user_id;
+        return "agentrouter:" + String(a.username || "").toLowerCase();
+      }
+      function _acctTypeLabel(t) {
+        if (t === "token") return "Token";
+        if (t === "cookie") return "Cookie";
+        if (t === "login") return "Login";
+        if (t.startsWith("site:")) {
+          const s = newapiSites.find((x) => x.id === t.slice(5));
+          return s ? s.label : t.slice(5);
+        }
+        return t;
+      }
+      function _acctId(e) {
+        if (e.type === "cookie") return e.a.api_user;
+        if (e.type === "login") return e.a.username;
+        return e.a.user_id;
+      }
+      async function dedupeAccounts() {
+        const entries = [];
+        tokenAccounts.forEach((a, i) => entries.push({ type: "token", i, a, key: _acctKey(a, "token") }));
+        cookieAccounts.forEach((a, i) => entries.push({ type: "cookie", i, a, key: _acctKey(a, "cookie") }));
+        loginAccounts.forEach((a, i) => entries.push({ type: "login", i, a, key: _acctKey(a, "login") }));
+        for (const s of newapiSites) {
+          const t = "site:" + s.id;
+          (siteAccounts[s.id] || []).forEach((a, i) => entries.push({ type: t, i, a, key: _acctKey(a, t) }));
+        }
+        const groups = {};
+        entries.forEach((e) => {
+          (groups[e.key] = groups[e.key] || []).push(e);
+        });
+        const removeSet = new Set();
+        const removed = [];
+        Object.values(groups).forEach((g) => {
+          if (g.length <= 1) return;
+          const cookies = g.filter((e) => e.type === "cookie");
+          let keep;
+          if (cookies.length) {
+            keep = cookies.reduce((best, e) => {
+              const db = sessionDaysLeft(best.a.cookies && best.a.cookies.session);
+              const de = sessionDaysLeft(e.a.cookies && e.a.cookies.session);
+              return (de == null ? -1 : de) > (db == null ? -1 : db) ? e : best;
+            });
+          } else {
+            keep = g[0];
+          }
+          g.forEach((e) => {
+            if (e !== keep) {
+              removeSet.add(e.type + ":" + e.i);
+              removed.push(e);
+            }
+          });
+        });
+        if (removed.length === 0) {
+          alert("没有发现同网站重复 ID 的账号");
+          return;
+        }
+        const list = removed.map((e) => "· [" + _acctTypeLabel(e.type) + "] " + e.a.name + "（ID " + _acctId(e) + "）").join("\n");
+        if (!confirm("发现 " + removed.length + " 个同网站重复 ID 的账号将被移除（同 ID 只保留一个，优先保留有效 cookie / 有效期最长者）：\n\n" + list + "\n\n确定去重？")) return;
+        tokenAccounts = tokenAccounts.filter((a, i) => !removeSet.has("token:" + i));
+        cookieAccounts = cookieAccounts.filter((a, i) => !removeSet.has("cookie:" + i));
+        loginAccounts = loginAccounts.filter((a, i) => !removeSet.has("login:" + i));
+        await saveTokenAccounts();
+        await saveConfig();
+        await saveLoginAccounts();
+        for (const s of newapiSites) {
+          const t = "site:" + s.id;
+          const before = (siteAccounts[s.id] || []).length;
+          siteAccounts[s.id] = (siteAccounts[s.id] || []).filter((a, i) => !removeSet.has(t + ":" + i));
+          if (siteAccounts[s.id].length !== before) await saveSiteAccounts(s.id);
+        }
+        renderAccountCards();
+        syncToJsonView();
+        alert("去重完成，已移除 " + removed.length + " 个重复账号");
+      }
+
+      // ========== Tab 切换 ==========
+      // 内存账号序列化到 JSON textarea（token + cookie + login + 各 new-api 站点合并）
+      // 站点账号与 token 字段同形，靠 provider:"<site_id>" 标记区分，保证往返无损
+      function syncToJsonView() {
+        const siteForJson = [];
+        for (const s of newapiSites) {
+          for (const a of siteAccounts[s.id] || []) siteForJson.push({ ...a, provider: s.id });
+        }
+        document.getElementById("accountInput").value = JSON.stringify([...tokenAccounts, ...cookieAccounts, ...loginAccounts, ...siteForJson], null, 2);
+      }
+
+      // JSON textarea 反向解析回各类账号数组；失败返回 false
+      function syncFromJsonView() {
+        const input = document.getElementById("accountInput").value.trim();
+        if (!input) {
+          tokenAccounts = [];
+          cookieAccounts = [];
+          loginAccounts = [];
+          for (const s of newapiSites) siteAccounts[s.id] = [];
+          return true;
+        }
+        try {
+          const parsed = JSON.parse(input);
+          if (!Array.isArray(parsed)) throw new Error("JSON 必须是数组");
+          const newTokens = [];
+          const newCookies = [];
+          const newLogins = [];
+          const newSite = {};
+          for (const s of newapiSites) newSite[s.id] = [];
+          const siteIds = new Set(newapiSites.map((s) => s.id));
+          for (const a of parsed) {
+            if (a && a.access_token && siteIds.has(a.provider)) newSite[a.provider].push({ name: a.name, access_token: a.access_token, user_id: a.user_id });
+            else if (a && a.access_token) newTokens.push(a);
+            else if (a && a.username && a.password) newLogins.push(a);
+            else newCookies.push(a);
+          }
+          tokenAccounts = newTokens;
+          cookieAccounts = newCookies;
+          loginAccounts = newLogins;
+          siteAccounts = { ...siteAccounts, ...newSite };
+          return true;
+        } catch (e) {
+          alert("JSON 格式错误，无法切换：" + e.message);
+          return false;
+        }
+      }
+
+      function switchTab(mode) {
+        if (mode === currentTab) return;
+        if (mode === "json") {
+          syncToJsonView();
+        } else if (currentTab === "json") {
+          if (!syncFromJsonView()) return;
+          renderAccountCards();
+          saveConfig();
+          saveTokenAccounts();
+          saveLoginAccounts();
+          for (const s of newapiSites) saveSiteAccounts(s.id);
+        }
+        currentTab = mode;
+        const visualPanel = document.getElementById("visualPanel");
+        const jsonPanel = document.getElementById("jsonPanel");
+        const tabVisual = document.getElementById("tabVisual");
+        const tabJson = document.getElementById("tabJson");
+        if (mode === "visual") {
+          visualPanel.classList.remove("hidden");
+          jsonPanel.classList.add("hidden");
+          tabVisual.className = "px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white transition";
+          tabJson.className = "px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition";
+        } else {
+          visualPanel.classList.add("hidden");
+          jsonPanel.classList.remove("hidden");
+          tabJson.className = "px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white transition";
+          tabVisual.className = "px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition";
+        }
+      }
+
+      // ========== 账号卡片渲染 ==========
+      function maskToken(token) {
+        if (!token) return "";
+        if (token.length <= 8) return "****";
+        return token.substring(0, 6) + "..." + token.substring(token.length - 4);
+      }
+
+      // 当前所选网站下的账号，附上定位用的 `_ref`（"<type>:<局部下标>"，站点是 "site:<id>:<下标>"）。
+      // 账号卡与密钥管理共用这一份，避免两处各写一套 ref 拼装逻辑而漂移。
+      // AnyRouter = token + cookie；AgentRouter = login；其余每个 new-api 站点一组。
+      function providerAccounts() {
+        if (currentProvider === "anyrouter") {
+          return [
+            ...tokenAccounts.map((a, i) => ({ ...a, _type: "token", _ref: "token:" + i })),
+            ...cookieAccounts.map((a, i) => ({ ...a, _type: "cookie", _ref: "cookie:" + i })),
+          ];
+        }
+        if (currentProvider === "agentrouter") {
+          return loginAccounts.map((a, i) => ({ ...a, _type: "login", _ref: "login:" + i }));
+        }
+        const site = currentSite();
+        if (!site) return [];
+        return (siteAccounts[site.id] || []).map((a, i) => ({ ...a, _type: "site", _siteId: site.id, _ref: "site:" + site.id + ":" + i }));
+      }
+
+      function renderAccountCards() {
+        const list = document.getElementById("accountList");
+        const empty = document.getElementById("accountListEmpty");
+        const accounts = providerAccounts();
+        const site = currentSite();
+        const groupHeader = (title, n, accent) =>
+          `<div class="flex items-center gap-2 mb-1.5 mt-3 first:mt-0"><span class="text-xs font-semibold ${accent}">${title}</span><span class="text-xs text-gray-500">${n} 个</span><div class="flex-1 h-px bg-dark-600"></div></div>`;
+        // 只显示当前选中网站的账号
+        let html = "";
+        if (currentProvider === "anyrouter") {
+          html = accounts.length
+            ? groupHeader("AnyRouter（Token / Cookie）", accounts.length, "text-emerald-300") + accounts.map(acctCardHtml).join("")
+            : '<div class="text-gray-500 text-center py-8 text-sm">暂无 AnyRouter 账号</div>';
+        } else if (currentProvider === "agentrouter") {
+          html = accounts.length
+            ? groupHeader("AgentRouter（Login）", accounts.length, "text-cyan-300") + accounts.map(acctCardHtml).join("")
+            : '<div class="text-gray-500 text-center py-8 text-sm">暂无 AgentRouter 账号</div>';
+        } else if (site) {
+          html = accounts.length
+            ? groupHeader(site.label + "（Token）", accounts.length, accentOf(site).text) + accounts.map(acctCardHtml).join("")
+            : `<div class="text-gray-500 text-center py-8 text-sm">暂无 ${site.label} 账号</div>`;
+        }
+        if (!html) {
+          list.innerHTML = "";
+          list.appendChild(empty.cloneNode(true));
+          return;
+        }
+        list.innerHTML = html;
+      }
+
+      function acctCardHtml(a) {
+        {
+          {
+            const isToken = a._type === "token";
+            const isLogin = a._type === "login";
+            const isSite = a._type === "site";
+            const site = isSite ? newapiSites.find((s) => s.id === a._siteId) : null;
+            const acc = accentOf(site);
+            const badge = isToken
+              ? '<span class="px-1.5 py-0.5 bg-blue-900/50 text-blue-400 text-xs rounded">Token</span>'
+              : isLogin
+                ? '<span class="px-1.5 py-0.5 bg-purple-900/50 text-purple-400 text-xs rounded">Login</span>'
+                : isSite
+                  ? `<span class="px-1.5 py-0.5 bg-dark-600 ${acc.text} text-xs rounded">${site ? site.label : a._siteId}</span>`
+                  : '<span class="px-1.5 py-0.5 bg-amber-900/50 text-amber-400 text-xs rounded">Cookie</span>';
+            const detail =
+              isToken || isSite
+                ? `<span class="text-gray-500">ID: ${a.user_id}</span> <span class="text-gray-600">|</span> <span class="text-gray-500">${maskToken(a.access_token)}</span>`
+                : isLogin
+                  ? `<span class="text-gray-500">${a.username}</span>`
+                  : `<span class="text-gray-500">User: ${a.api_user}</span>`;
+            // Login 账号显示签到状态徽标
+            let expiryChip = a._type === "cookie" ? cookieExpiryBadge(a.cookies && a.cookies.session) : "";
+            let checkinChip = "";
+            const st = isSite ? siteCheckinStatus[a._siteId] : null;
+            if (isSite && st) {
+              const gi = (st.accounts || []).find((x) => x.name === a.name);
+              if (gi) {
+                if (gi.status === "signed") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-emerald-900/50 text-emerald-400 text-xs rounded">已签到</span>';
+                } else if (gi.status === "already") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-emerald-900/50 text-emerald-400 text-xs rounded">今日已签</span>';
+                } else if (gi.status === "failed") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-red-900/50 text-red-400 text-xs rounded">失败</span>';
+                } else {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-dark-600 text-gray-400 text-xs rounded">待签到</span>';
+                }
+              }
+            }
+            if (isLogin && checkinStatus) {
+              const info = (checkinStatus.accounts || []).find((x) => x.name === a.name);
+              if (info) {
+                if (a.name === checkinStatus.current && checkinStatus.running) {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-blue-900/50 text-blue-300 text-xs rounded animate-pulse">签到中</span>';
+                } else if (info.status === "signed") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-emerald-900/50 text-emerald-400 text-xs rounded">已签到</span>';
+                } else if (info.status === "already") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-emerald-900/50 text-emerald-400 text-xs rounded">今日已签</span>';
+                } else if (info.status === "failed") {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-red-900/50 text-red-400 text-xs rounded">失败</span>';
+                } else {
+                  checkinChip = '<span class="px-1.5 py-0.5 bg-dark-600 text-gray-400 text-xs rounded">待签到</span>';
+                }
+              }
+            }
+            return `
+						<div class="bg-dark-700 rounded-lg p-3 group hover:bg-dark-600 transition">
+							<div class="flex items-center justify-between">
+								<div class="flex-1 min-w-0">
+									<div class="flex items-center gap-2 mb-0.5">
+										<span class="font-medium text-gray-200 text-sm truncate">${a.name}</span>
+										${badge}
+										${expiryChip}${checkinChip}
+									</div>
+									<div class="text-xs truncate">${detail}</div>
+								</div>
+								<div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition">
+									<button onclick="editAccount('${a._ref}')" class="p-1.5 text-gray-400 hover:text-purple-400 rounded transition" title="编辑">
+										<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+									</button>
+									<button onclick="deleteAccount('${a._ref}')" class="p-1.5 text-gray-400 hover:text-red-400 rounded transition" title="删除">
+										<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+									</button>
+								</div>
+							</div>
+						</div>`;
+          }
+        }
+      }
+
+      // ========== 表单操作 ==========
+      // editingRef 记录正在编辑的账号，格式与卡片的 _ref 一致："token:3" / "site:tabitoken:0"；
+      // 新增时为 null。之前用跨类型全局下标，站点数量一变就会错位。
+      let editingRef = null;
+
+      function toggleAddForm() {
+        editingRef = null;
+        // 默认表单类型跟随当前选中的网站，减少误加到别的站点
+        const defType = isSiteProvider() ? "site" : currentProvider === "agentrouter" ? "login" : "token";
+        formType = defType;
+        document.getElementById("formTitle").textContent = "添加新账号";
+        document.getElementById("formName").value = "";
+        document.getElementById("formAccessToken").value = "";
+        document.getElementById("formUserId").value = "";
+        document.getElementById("formProvider").value = "anyrouter";
+        document.getElementById("formSession").value = "";
+        document.getElementById("formApiUser").value = "";
+        document.getElementById("formSiteToken").value = "";
+        document.getElementById("formSiteUserId").value = "";
+        renderSiteOptions(isSiteProvider() ? currentProvider : "");
+        setFormType(defType);
+        document.getElementById("accountForm").classList.remove("hidden");
+        document.getElementById("addAccountBtn").classList.add("hidden");
+        document.getElementById("formName").focus();
+      }
+
+      function cancelForm() {
+        document.getElementById("accountForm").classList.add("hidden");
+        document.getElementById("addAccountBtn").classList.remove("hidden");
+        editingRef = null;
+      }
+
+      // 表单里的「所属站点」下拉由站点清单驱动
+      function renderSiteOptions(selected) {
+        const sel = document.getElementById("formSiteId");
+        if (!sel) return;
+        sel.innerHTML = newapiSites.map((s) => `<option value="${s.id}">${s.label}（${s.domain.replace(/^https?:\/\//, "")}）</option>`).join("");
+        if (selected) sel.value = selected;
+      }
+
+      function setFormType(type) {
+        formType = type;
+        const activeClass = "flex-1 px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white transition";
+        const inactiveClass = "flex-1 px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 transition";
+        const map = [
+          ["formTokenFields", "formTypeToken", "token"],
+          ["formCookieFields", "formTypeCookie", "cookie"],
+          ["formLoginFields", "formTypeLogin", "login"],
+          ["formSiteFields", "formTypeSite", "site"],
+        ];
+        for (const [fieldsId, btnId, t] of map) {
+          document.getElementById(fieldsId).classList.toggle("hidden", type !== t);
+          document.getElementById(btnId).className = type === t ? activeClass : inactiveClass;
+        }
+      }
+
+      // 把 _ref 解析成 {arr, idx, type, siteId, save}
+      function resolveRef(ref) {
+        const parts = String(ref).split(":");
+        if (parts[0] === "token") return { arr: tokenAccounts, idx: +parts[1], type: "token", save: saveTokenAccounts };
+        if (parts[0] === "cookie") return { arr: cookieAccounts, idx: +parts[1], type: "cookie", save: saveConfig };
+        if (parts[0] === "login") return { arr: loginAccounts, idx: +parts[1], type: "login", save: saveLoginAccounts };
+        if (parts[0] === "site") {
+          const siteId = parts[1];
+          return {
+            arr: siteAccounts[siteId] || [],
+            idx: +parts[2],
+            type: "site",
+            siteId,
+            save: () => saveSiteAccounts(siteId),
+          };
+        }
+        return null;
+      }
+
+      function editAccount(ref) {
+        const r = resolveRef(ref);
+        if (!r) return;
+        const account = r.arr[r.idx];
+        if (!account) return;
+        if (r.type === "token") {
+          setFormType("token");
+          document.getElementById("formAccessToken").value = account.access_token || "";
+          document.getElementById("formUserId").value = account.user_id || "";
+          document.getElementById("formProvider").value = account.provider || "anyrouter";
+        } else if (r.type === "cookie") {
+          setFormType("cookie");
+          document.getElementById("formSession").value = account.cookies?.session || "";
+          document.getElementById("formApiUser").value = account.api_user || "";
+        } else if (r.type === "login") {
+          setFormType("login");
+          document.getElementById("formLoginUsername").value = account.username || "";
+          document.getElementById("formLoginPassword").value = account.password || "";
+        } else {
+          renderSiteOptions(r.siteId);
+          setFormType("site");
+          document.getElementById("formSiteToken").value = account.access_token || "";
+          document.getElementById("formSiteUserId").value = account.user_id || "";
+        }
+        editingRef = ref;
+        document.getElementById("formTitle").textContent = "编辑账号";
+        document.getElementById("formName").value = account.name || "";
+        document.getElementById("accountForm").classList.remove("hidden");
+        document.getElementById("addAccountBtn").classList.add("hidden");
+        document.getElementById("formName").focus();
+      }
+
+      async function deleteAccount(ref) {
+        const r = resolveRef(ref);
+        if (!r) return;
+        const acct = r.arr[r.idx];
+        if (!acct) return;
+        if (!confirm(`确定删除账号「${acct.name}」？`)) return;
+        r.arr.splice(r.idx, 1);
+        await r.save();
+        renderAccountCards();
+      }
+
+      async function saveAccountFromForm() {
+        const name = document.getElementById("formName").value.trim();
+        if (!name) {
+          alert("请输入账号名称");
+          return;
+        }
+        // 编辑时只在「类型没变」的情况下原地替换；改了类型就当作移到另一组（旧的先删掉）
+        const editing = editingRef ? resolveRef(editingRef) : null;
+        const sameType = editing && editing.type === formType;
+
+        if (formType === "token") {
+          const access_token = document.getElementById("formAccessToken").value.trim();
+          const user_id = document.getElementById("formUserId").value.trim();
+          if (!access_token || !user_id) {
+            alert("请填写 Access Token 和 User ID");
+            return;
+          }
+          const account = { name, access_token, user_id, provider: document.getElementById("formProvider").value };
+          if (sameType) tokenAccounts[editing.idx] = account;
+          else tokenAccounts.push(account);
+          if (!sameType && editing) {
+            editing.arr.splice(editing.idx, 1);
+            await editing.save();
+          }
+          await saveTokenAccounts();
+        } else if (formType === "cookie") {
+          const session = document.getElementById("formSession").value.trim();
+          const api_user = document.getElementById("formApiUser").value.trim();
+          if (!session || !api_user) {
+            alert("请填写 Session Cookie 和 API User");
+            return;
+          }
+          const account = { name, cookies: { session }, api_user };
+          if (sameType) cookieAccounts[editing.idx] = account;
+          else cookieAccounts.push(account);
+          if (!sameType && editing) {
+            editing.arr.splice(editing.idx, 1);
+            await editing.save();
+          }
+          await saveConfig();
+        } else if (formType === "login") {
+          const username = document.getElementById("formLoginUsername").value.trim();
+          const password = document.getElementById("formLoginPassword").value.trim();
+          if (!username || !password) {
+            alert("请填写用户名和密码");
+            return;
+          }
+          const account = { name, username, password };
+          if (sameType) loginAccounts[editing.idx] = account;
+          else loginAccounts.push(account);
+          if (!sameType && editing) {
+            editing.arr.splice(editing.idx, 1);
+            await editing.save();
+          }
+          await saveLoginAccounts();
+        } else if (formType === "site") {
+          const siteId = document.getElementById("formSiteId").value;
+          const access_token = document.getElementById("formSiteToken").value.trim();
+          const user_id = document.getElementById("formSiteUserId").value.trim();
+          if (!siteId) {
+            alert("请先在「站点管理」里添加站点");
+            return;
+          }
+          if (!access_token || !user_id) {
+            alert("请填写 Access Token 和 User ID");
+            return;
+          }
+          const account = { name, access_token, user_id };
+          if (!siteAccounts[siteId]) siteAccounts[siteId] = [];
+          // 编辑时若把账号换到了另一个站点，要从原站点移除
+          if (sameType && editing.siteId === siteId) {
+            siteAccounts[siteId][editing.idx] = account;
+          } else {
+            siteAccounts[siteId].push(account);
+            if (editing) {
+              editing.arr.splice(editing.idx, 1);
+              await editing.save();
+            }
+          }
+          await saveSiteAccounts(siteId);
+        }
+        cancelForm();
+        renderAccountCards();
+      }
+
+      // ========== 配置加载/保存 ==========
+      async function loadTokenAccounts() {
+        try {
+          const resp = await authFetch("/api/token/accounts");
+          const data = await resp.json();
+          if (data.success) {
+            tokenAccounts = data.accounts || [];
+          }
+        } catch (e) {
+          console.error("加载 token 账号失败:", e);
+        }
+      }
+
+      async function saveTokenAccounts() {
+        try {
+          await authFetch("/api/token/accounts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accounts: tokenAccounts }),
+          });
+        } catch (e) {
+          console.error("保存 token 账号失败:", e);
+        }
+        syncToJsonView();
+      }
+
+      async function loadLoginAccounts() {
+        try {
+          const resp = await authFetch("/api/login-accounts/accounts");
+          const data = await resp.json();
+          if (data.success) {
+            loginAccounts = data.accounts || [];
+          }
+        } catch (e) {
+          console.error("加载 login 账号失败:", e);
+        }
+      }
+
+      async function saveLoginAccounts() {
+        try {
+          await authFetch("/api/login-accounts/accounts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accounts: loginAccounts }),
+          });
+        } catch (e) {
+          console.error("保存 login 账号失败:", e);
+        }
+        syncToJsonView();
+      }
+
+      // ===== new-api 站点：清单与账号 =====
+      async function loadSites() {
+        try {
+          const resp = await authFetch("/api/sites");
+          const data = await resp.json();
+          if (data.success) newapiSites = data.sites || [];
+        } catch (e) {
+          console.error("加载站点清单失败:", e);
+        }
+        renderProviderSwitcher();
+      }
+
+      async function loadSiteAccounts(siteId) {
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(siteId) + "/accounts");
+          const data = await resp.json();
+          if (data.success) siteAccounts[siteId] = data.accounts || [];
+        } catch (e) {
+          console.error("加载站点账号失败:", siteId, e);
+        }
+      }
+
+      async function saveSiteAccounts(siteId) {
+        try {
+          await authFetch("/api/site/" + encodeURIComponent(siteId) + "/accounts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accounts: siteAccounts[siteId] || [] }),
+          });
+        } catch (e) {
+          console.error("保存站点账号失败:", siteId, e);
+        }
+        syncToJsonView();
+      }
+
+      // 顶部切换器：AnyRouter / AgentRouter 固定，其余站点按清单动态插入
+      function renderProviderSwitcher() {
+        const box = document.getElementById("providerSwitcher");
+        if (!box) return;
+        box.querySelectorAll("[data-site-btn]").forEach((el) => el.remove());
+        for (const s of newapiSites) {
+          const btn = document.createElement("button");
+          btn.setAttribute("data-site-btn", s.id);
+          btn.id = "prov_" + s.id;
+          btn.textContent = s.label;
+          btn.onclick = () => switchProvider(s.id);
+          btn.className = "px-5 py-1.5 text-sm font-medium rounded-md text-gray-400 hover:text-gray-200 transition";
+          box.appendChild(btn);
+        }
+        // 站点被删掉后当前选中项可能已不存在，退回 AnyRouter
+        const known = ["anyrouter", "agentrouter", ...newapiSites.map((s) => s.id)];
+        if (!known.includes(currentProvider)) currentProvider = "anyrouter";
+        highlightProviderButtons();
+      }
+
+      function highlightProviderButtons() {
+        const base = "px-5 py-1.5 text-sm font-medium rounded-md transition";
+        const anyBtn = document.getElementById("provAny");
+        const agentBtn = document.getElementById("provAgent");
+        if (anyBtn) anyBtn.className = base + (currentProvider === "anyrouter" ? " bg-emerald-600 text-white" : " text-gray-400 hover:text-gray-200");
+        if (agentBtn) agentBtn.className = base + (currentProvider === "agentrouter" ? " bg-cyan-600 text-white" : " text-gray-400 hover:text-gray-200");
+        for (const s of newapiSites) {
+          const btn = document.getElementById("prov_" + s.id);
+          if (btn) btn.className = base + (currentProvider === s.id ? " " + accentOf(s).bg + " text-white" : " text-gray-400 hover:text-gray-200");
+        }
+      }
+
+      async function loadSavedConfig() {
+        let strayTokens = [];
+        try {
+          const resp = await authFetch("/api/config");
+          const result = await resp.json();
+          if (result.success && result.data) {
+            if (result.data.accounts) {
+              // 防污染：saved_config.json 里混入的 access_token 记录分流出来
+              const tmpCookies = [];
+              for (const a of result.data.accounts) {
+                if (a && a.access_token) strayTokens.push(a);
+                else tmpCookies.push(a);
+              }
+              cookieAccounts = tmpCookies;
+            }
+            if (result.data.email) {
+              const e = result.data.email;
+              if (e.smtp_server) document.getElementById("smtpServer").value = e.smtp_server;
+              if (e.smtp_port) document.getElementById("smtpPort").value = e.smtp_port;
+              if (e.email_user) document.getElementById("emailUser").value = e.email_user;
+              if (e.email_to) document.getElementById("emailTo").value = e.email_to;
+            }
+            if (result.data.monitor) {
+              if (result.data.monitor.interval) document.getElementById("monitorInterval").value = result.data.monitor.interval;
+              if (result.data.monitor.threshold) document.getElementById("monitorThreshold").value = result.data.monitor.threshold;
+            }
+          }
+        } catch (e) {
+          console.error("加载配置失败:", e);
+        }
+        await loadTokenAccounts();
+        await loadLoginAccounts();
+        // 站点清单先加载，再按清单并发拉各站点账号
+        await loadSites();
+        await Promise.all(newapiSites.map((s) => loadSiteAccounts(s.id)));
+        // 把 saved_config.json 里误存的 token 账号合并到 tokenAccounts 并自动清理
+        if (strayTokens.length > 0) {
+          const existing = new Set(tokenAccounts.map((t) => t.name));
+          for (const t of strayTokens) {
+            if (!existing.has(t.name)) {
+              tokenAccounts.push(t);
+              existing.add(t.name);
+            }
+          }
+          await saveTokenAccounts();
+          await saveConfig();
+        }
+        renderAccountCards();
+        syncToJsonView();
+        // 加载签到进度，若正在运行则恢复轮询
+        await pollCheckinStatus();
+        if (checkinStatus && checkinStatus.running) startCheckinPolling();
+        await pollAnyrouterCheckinStatus();
+        if (anyrouterCheckinStatus && anyrouterCheckinStatus.running) startAnyrouterCheckinPolling();
+        await Promise.all(newapiSites.map((s) => pollSiteCheckinStatus(s.id)));
+        if (isSiteProvider() && siteCheckinStatus[currentProvider] && siteCheckinStatus[currentProvider].running) startSitePolling();
+        await loadAutoCheckinSettings();
+        // 探测各站点是否开着 Turnstile，决定签到按钮走浏览器脚本还是服务器端
+        await Promise.all(newapiSites.map((s) => loadSiteTurnstile(s.id)));
+        // 首屏也要按当前网站收起不相关的按钮与面板（切换时由 switchProvider 负责）
+        applyProviderVisibility();
+        renderSiteCheckinProgress();
+      }
+
+      async function saveConfig() {
+        const config = {
+          accounts: cookieAccounts,
+          email: {
+            smtp_server: document.getElementById("smtpServer").value.trim(),
+            smtp_port: parseInt(document.getElementById("smtpPort").value) || 465,
+            email_user: document.getElementById("emailUser").value.trim(),
+            email_to: document.getElementById("emailTo").value.trim(),
+          },
+          monitor: {
+            interval: parseFloat(document.getElementById("monitorInterval").value) || 6,
+            threshold: parseFloat(document.getElementById("monitorThreshold").value) || 10,
+          },
+        };
+        try {
+          await authFetch("/api/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(config),
+          });
+        } catch (e) {
+          console.error("保存配置失败:", e);
+        }
+        syncToJsonView();
+      }
+
+      function loadExample() {
+        document.getElementById("accountInput").value = JSON.stringify(exampleData, null, 2);
+      }
+      function sortResults(field) {
+        if (!currentResults) return;
+
+        // 第三次点击同一字段：取消排序
+        if (currentSort.field === field && !currentSort.desc) {
+          currentSort = { field: null, desc: true };
+        } else if (currentSort.field === field) {
+          currentSort.desc = false;
+        } else {
+          currentSort.field = field;
+          currentSort.desc = true;
+        }
+
+        // 更新按钮样式
+        const quotaBtn = document.getElementById("sortQuota");
+        const usedBtn = document.getElementById("sortUsed");
+        const todayUsedBtn = document.getElementById("sortTodayUsed");
+
+        const activeClass = "px-2 py-1 text-xs rounded transition bg-purple-600 text-white";
+        const normalClass = "px-2 py-1 text-xs rounded transition bg-dark-700 text-gray-400 hover:text-purple-400";
+
+        quotaBtn.className = currentSort.field === "quota" ? activeClass : normalClass;
+        usedBtn.className = currentSort.field === "used" ? activeClass : normalClass;
+        todayUsedBtn.className = currentSort.field === "todayUsed" ? activeClass : normalClass;
+
+        quotaBtn.textContent = "余额 " + (currentSort.field === "quota" ? (currentSort.desc ? "↓" : "↑") : "↓");
+        usedBtn.textContent = "已用 " + (currentSort.field === "used" ? (currentSort.desc ? "↓" : "↑") : "↓");
+        todayUsedBtn.textContent = "今日 " + (currentSort.field === "todayUsed" ? (currentSort.desc ? "↓" : "↑") : "↓");
+
+        // 重新渲染
+        renderResultsSplit();
+      }
+
+      function filterResults() {
+        currentFilter = document.getElementById("checkinFilter").value;
+        renderResultsSplit();
+      }
+
+      function setLoading(loading) {
+        const btn = document.getElementById("queryBtn");
+        const icon = document.getElementById("queryIcon");
+        const text = document.getElementById("queryText");
+
+        if (loading) {
+          btn.disabled = true;
+          btn.classList.add("opacity-70", "cursor-not-allowed");
+          icon.innerHTML =
+            '<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>';
+          icon.classList.add("animate-spin");
+          text.textContent = "查询中...";
+        } else {
+          btn.disabled = false;
+          btn.classList.remove("opacity-70", "cursor-not-allowed");
+          icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>';
+          icon.classList.remove("animate-spin");
+          text.textContent = "查询余额";
+        }
+      }
+
+      function showSkeleton(count) {
+        const container = document.getElementById("resultsContainer");
+        container.innerHTML = Array(count)
+          .fill(0)
+          .map(
+            () => `
+				<div class="bg-dark-700 rounded-lg p-4">
+					<div class="shimmer h-5 w-32 rounded mb-3"></div>
+					<div class="shimmer h-4 w-48 rounded"></div>
+				</div>
+			`,
+          )
+          .join("");
+      }
+
+      // 今日用量 = 当前已用 − 今日 0 点基线已用；没有基线（当天无快照或账号是今天新加的）返回 null
+      // AgentRouter 的余额本身就是签到时写入的快照（带 as_of），与基线同源，相减恒为 0，
+      // 那不是"今天没用量"而是"测不出来"，所以一并返回 null 让它显示 "--"。
+      function todayUsedOf(r) {
+        if (!r || !r.success || !usageBaseline || r.as_of) return null;
+        // 基线按「站点:账号名」查 —— 裸名字会让跨站重名的账号取到别人的基线
+        const base = usageBaseline[(r._provider || "") + ":" + r.name];
+        if (base == null) return null;
+        const diff = (r.used || 0) - base;
+        return diff > 0 ? Math.round(diff * 100) / 100 : 0;
+      }
+
+      function getTodayUsed(r) {
+        if (!r.success) return -1;
+        const v = todayUsedOf(r);
+        return v == null ? -1 : v; // 没有数据时排到最后
+      }
+
+      // 暂无法通过 stat API 判断是否已签到
+      function hasCheckedIn(r) {
+        return null;
+      }
+
+      // 对单个 provider 的结果应用当前排序
+      function applySortFilter(results) {
+        let sorted = [...results];
+        if (currentSort.field) {
+          sorted.sort((a, b) => {
+            let aVal, bVal;
+            if (currentSort.field === "todayUsed") {
+              aVal = getTodayUsed(a);
+              bVal = getTodayUsed(b);
+            } else {
+              aVal = a.success ? a[currentSort.field] || 0 : -1;
+              bVal = b.success ? b[currentSort.field] || 0 : -1;
+            }
+            return currentSort.desc ? bVal - aVal : aVal - bVal;
+          });
+        }
+        return sorted;
+      }
+
+      // 渲染某个 provider 的分区（标题 + 卡片）
+      function providerSection(title, titleCls, results) {
+        if (!results || results.length === 0) return "";
+        const cards = applySortFilter(results).map(cardHtml).join("");
+        const header = `<div class="flex items-center gap-2 mb-2 mt-4 first:mt-0"><span class="text-sm font-semibold ${titleCls}">${title}</span><span class="text-xs text-gray-500">${results.length} 个</span><div class="flex-1 h-px bg-dark-600"></div></div>`;
+        return header + cards;
+      }
+
+      // 只渲染当前选中网站的结果（绝不同时显示多站）
+      function renderResultsSplit() {
+        const container = document.getElementById("resultsContainer");
+        const site = currentSite();
+        const html =
+          currentProvider === "anyrouter"
+            ? providerSection("AnyRouter 余额", "text-emerald-300", currentResultsAny)
+            : currentProvider === "agentrouter"
+              ? providerSection("AgentRouter 余额", "text-cyan-300", currentResultsAgent)
+              : site
+                ? providerSection(site.label + " 余额", accentOf(site).text, currentResultsSite[site.id] || [])
+                : "";
+        container.innerHTML = html || '<div class="text-gray-500 text-center py-10">暂无结果</div>';
+      }
+
+      // 切换当前网站，同步刷新汇总 / 结果 / 账号管理
+      function switchProvider(p) {
+        currentProvider = p;
+        highlightProviderButtons();
+        applyProviderVisibility();
+        renderAccountCards();
+        renderResultsSplit();
+        renderAutoCheckinToggle();
+        renderSiteCheckinProgress();
+        // 切到别的站点时停掉上一站的轮询，必要时对新站点重开
+        stopSitePolling();
+        if (isSiteProvider() && siteCheckinStatus[p] && siteCheckinStatus[p].running) startSitePolling();
+      }
+
+      // ========== 每日自动签到开关 ==========
+      // 键名统一为 "<provider>_auto"：anyrouter_auto / agentrouter_auto / <site_id>_auto
+      let autoCheckinSettings = { anyrouter_auto: true, agentrouter_auto: true };
+
+      function autoCheckinKey() {
+        return currentProvider + "_auto";
+      }
+
+      function providerLabel() {
+        if (currentProvider === "anyrouter") return "AnyRouter";
+        if (currentProvider === "agentrouter") return "AgentRouter";
+        const s = currentSite();
+        return s ? s.label : currentProvider;
+      }
+
+      // 开关只展示/控制“当前网站”的设置，随 switchProvider 同步
+      function renderAutoCheckinToggle() {
+        const btn = document.getElementById("autoCheckinToggle");
+        const knob = document.getElementById("autoCheckinKnob");
+        const scope = document.getElementById("autoCheckinScope");
+        if (!btn) return;
+        const on = !!autoCheckinSettings[autoCheckinKey()];
+        const site = currentSite();
+        const accent =
+          currentProvider === "anyrouter"
+            ? { text: "text-emerald-300", bg: "bg-emerald-600" }
+            : currentProvider === "agentrouter"
+              ? { text: "text-cyan-300", bg: "bg-cyan-600" }
+              : accentOf(site);
+        scope.textContent = providerLabel();
+        scope.className = accent.text;
+        // 站点开着 Turnstile 时 0 点自动签到必然失败，需每天手动跑浏览器脚本；
+        // 站长关掉校验后探测到 enabled=false，提示自动回到常规文案。
+        const hint = document.getElementById("autoCheckinHint");
+        if (hint) {
+          const ts = site ? siteTurnstile[site.id] : null;
+          const blocked = !!(site && ts && ts.enabled);
+          hint.textContent = blocked
+            ? `${site.label} 已启用 Turnstile 人机校验，0 点自动签到会失败，需每天手动在浏览器完成签到`
+            : "每天 0 点自动签到；关闭后仅停止自动触发，手动签到不受影响";
+          hint.className = blocked ? "text-xs text-amber-500/90 mt-0.5" : "text-xs text-gray-500 mt-0.5";
+        }
+        btn.className =
+          "relative shrink-0 w-11 h-6 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500 " + (on ? accent.bg : "bg-dark-600");
+        btn.setAttribute("aria-checked", on ? "true" : "false");
+        knob.className = "absolute top-0.5 w-5 h-5 rounded-full shadow transition-all " + (on ? "left-[22px] bg-white" : "left-0.5 bg-gray-300");
+        renderAgentGapRow();
+      }
+
+      // 缓慢签到模式的间隔设置（仅 AgentRouter 显示；数值随 /api/checkin/settings 持久化）
+      function renderAgentGapRow() {
+        const row = document.getElementById("agentGapRow");
+        if (!row) return;
+        row.classList.toggle("hidden", currentProvider !== "agentrouter");
+        const mn = document.getElementById("agentGapMin");
+        const mx = document.getElementById("agentGapMax");
+        if (!mn || !mx) return;
+        // 用户正在输入时不覆盖
+        if (document.activeElement !== mn) mn.value = autoCheckinSettings.agentrouter_gap_min ?? 30;
+        if (document.activeElement !== mx) mx.value = autoCheckinSettings.agentrouter_gap_max ?? 60;
+      }
+
+      async function saveAgentGap() {
+        const mn = parseInt(document.getElementById("agentGapMin").value, 10);
+        const mx = parseInt(document.getElementById("agentGapMax").value, 10);
+        if (!mn || !mx || mn < 1 || mx < 1 || mn > 1440 || mx > 1440) {
+          alert("间隔必须是 1~1440 之间的分钟数");
+          return;
+        }
+        try {
+          const resp = await authFetch("/api/checkin/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ agentrouter_gap_min: mn, agentrouter_gap_max: mx }),
+          });
+          const data = await resp.json();
+          if (data.success) {
+            autoCheckinSettings = data.settings;
+            renderAgentGapRow();
+          } else alert(data.error || "保存失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        }
+      }
+
+      async function loadAutoCheckinSettings() {
+        try {
+          const resp = await authFetch("/api/checkin/settings");
+          const data = await resp.json();
+          if (data.success) autoCheckinSettings = data.settings;
+        } catch (e) {
+          /* 忽略，保持默认 */
+        }
+        renderAutoCheckinToggle();
+      }
+
+      async function toggleAutoCheckin() {
+        const key = autoCheckinKey();
+        const next = !autoCheckinSettings[key];
+        const label = providerLabel();
+        // 乐观更新，失败再回滚
+        autoCheckinSettings[key] = next;
+        renderAutoCheckinToggle();
+        try {
+          const resp = await authFetch("/api/checkin/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ [key]: next }),
+          });
+          const data = await resp.json();
+          if (data.success) {
+            autoCheckinSettings = data.settings;
+          } else {
+            autoCheckinSettings[key] = !next;
+            alert(data.error || "设置保存失败");
+          }
+        } catch (e) {
+          autoCheckinSettings[key] = !next;
+          alert("网络请求失败: " + e.message);
+        }
+        renderAutoCheckinToggle();
+        document.getElementById("autoCheckinHint").textContent = autoCheckinSettings[key]
+          ? `${label} 每天 0 点自动签到已开启`
+          : `${label} 每日自动签到已关闭，手动签到仍可用`;
+      }
+
+      // 根据当前网站控制汇总卡与按钮的显隐
+      function applyProviderVisibility() {
+        const site = currentSite();
+        const anyCard = document.getElementById("anySummaryCard");
+        const agentCard = document.getElementById("agentSummaryCard");
+        const siteCard = document.getElementById("siteSummaryCard");
+        if (anyCard) anyCard.classList.toggle("hidden", currentProvider !== "anyrouter");
+        if (agentCard) agentCard.classList.toggle("hidden", currentProvider !== "agentrouter");
+        if (siteCard) {
+          siteCard.classList.toggle("hidden", !site);
+          if (site) {
+            const acc = accentOf(site);
+            siteCard.className = `bg-dark-800 rounded-xl p-5 border ${acc.border}`;
+            const title = document.getElementById("siteSummaryTitle");
+            title.textContent = site.label + " 汇总";
+            title.className = acc.text + " font-semibold";
+          }
+        }
+        // AnyRouter / AgentRouter 的按钮一直可见（沿用原有行为，它们各自有确认弹窗）；
+        // 站点签到按钮是「当前站点」的，随切换显示并换成该站点的配色，按钮文案由
+        // applySiteCheckinMode 按 Turnstile 状态决定。
+        const siteBtn = document.getElementById("siteCheckinBtn");
+        if (siteBtn) {
+          siteBtn.classList.toggle("hidden", !site);
+          if (site) {
+            const acc = accentOf(site);
+            siteBtn.className = `flex-1 min-w-[130px] py-3 px-4 bg-gradient-to-r ${acc.btnFrom} ${acc.btnTo} hover:opacity-90 text-white font-semibold rounded-lg shadow-lg transition duration-200 flex items-center justify-center gap-2`;
+          }
+        }
+        // 站点的浏览器签到面板只在选中该站点且它开着 Turnstile 时出现
+        applySiteCheckinMode();
+      }
+
+      function cardHtml(r) {
+        {
+            if (r.success) {
+              // 计算今日用量和签到状态
+              let todayUsageHtml = "";
+              let checkinBadge = "";
+              const checked = hasCheckedIn(r);
+              const todayUsed = todayUsedOf(r);
+
+              if (todayUsed != null) {
+                todayUsageHtml = `
+								<div>
+									<div class="text-xs text-gray-500">今日用量</div>
+									<div class="text-lg font-bold text-pink-400">$${todayUsed.toFixed(2)}</div>
+								</div>`;
+
+                // 签到状态徽章
+                if (checked === true) {
+                  checkinBadge = '<span class="px-2 py-1 bg-emerald-900/50 text-emerald-400 text-xs rounded-full">已签到</span>';
+                } else if (checked === false) {
+                  checkinBadge = '<span class="px-2 py-1 bg-yellow-900/50 text-yellow-400 text-xs rounded-full">未签到</span>';
+                }
+              }
+              return `
+						<div class="bg-dark-700 rounded-lg p-4 border-l-4 border-green-500">
+							<div class="flex justify-between items-start">
+								<div>
+									<div class="font-semibold text-gray-200">${r.name}</div>
+									<div class="text-xs text-gray-500 mt-0.5">${r.username || ""}</div>
+								</div>
+								<div class="flex gap-2">
+									${checkinBadge}
+									<span class="px-2 py-1 bg-green-900/50 text-green-400 text-xs rounded-full">成功</span>
+								</div>
+							</div>
+							<div class="mt-3 flex gap-6">
+								<div>
+									<div class="text-xs text-gray-500">当前余额</div>
+									<div class="text-lg font-bold text-green-400">$${r.quota.toFixed(2)}</div>
+								</div>
+								<div>
+									<div class="text-xs text-gray-500">已使用</div>
+									<div class="text-lg font-bold text-orange-400">$${r.used.toFixed(2)}</div>
+								</div>
+								${todayUsageHtml}
+							</div>
+						</div>
+					`;
+            } else {
+              return `
+						<div class="bg-dark-700 rounded-lg p-4 border-l-4 border-red-500">
+							<div class="flex justify-between items-start">
+								<div class="font-semibold text-gray-200">${r.name}</div>
+								<span class="px-2 py-1 bg-red-900/50 text-red-400 text-xs rounded-full">失败</span>
+							</div>
+							<div class="mt-2 text-sm text-red-400">${r.error}</div>
+						</div>
+					`;
+            }
+        }
+      }
+
+      function renderResults(data) {
+        const container = document.getElementById("resultsContainer");
+        const summarySection = document.getElementById("summarySection");
+        const sortControls = document.getElementById("sortControls");
+
+        if (!data.success) {
+          sortControls.classList.add("hidden");
+          container.innerHTML = `
+					<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">
+						<div class="font-semibold mb-1">查询失败</div>
+						<div class="text-sm">${data.error}</div>
+					</div>
+				`;
+          return;
+        }
+
+        // data: { success, any:{results,summary}, agent:{results,summary}, site:{id,results,summary} }
+        // summary 传 null 时由 results 现算（单站查询走这条路）
+        const any = data.any || { results: [], summary: null };
+        const agent = data.agent || { results: [], summary: null };
+        const siteData = data.site || null;
+        // 给每行打上站点标记：今日用量的基线按「站点:账号名」查表，跨站重名才不会串
+        // （agentrouter 与 gorouter 有 15 个同名账号）。集中在这里打，下游都能用到。
+        const tag = (rows, provider) => (rows || []).map((r) => ({ ...r, _provider: provider }));
+        currentResultsAny = tag(any.results, "anyrouter");
+        currentResultsAgent = tag(agent.results, "agentrouter");
+        if (siteData && siteData.id) currentResultsSite[siteData.id] = tag(siteData.results, siteData.id);
+        currentResults = [...currentResultsAny, ...currentResultsAgent, ...Object.values(currentResultsSite).flat()];
+        currentSort = { field: null, desc: true };
+        currentFilter = "all";
+
+        // 显示排序控件
+        sortControls.classList.remove("hidden");
+        const normalCls = "px-2 py-1 text-xs rounded bg-dark-700 text-gray-400 hover:text-purple-400 transition";
+        document.getElementById("sortQuota").className = normalCls;
+        document.getElementById("sortUsed").className = normalCls;
+        document.getElementById("sortTodayUsed").className = normalCls;
+        document.getElementById("sortQuota").textContent = "余额 ↓";
+        document.getElementById("sortUsed").textContent = "已用 ↓";
+        document.getElementById("sortTodayUsed").textContent = "今日 ↓";
+        document.getElementById("checkinFilter").value = "all";
+
+        // AnyRouter 汇总（今日用量按快照基线算）
+        summarySection.classList.remove("hidden");
+        const asum = any.summary || mkSummary(currentResultsAny);
+        document.getElementById("anyTotalQuota").textContent = `$${(asum.total_quota || 0).toFixed(2)}`;
+        document.getElementById("anyTotalUsed").textContent = `$${(asum.total_used || 0).toFixed(2)}`;
+        document.getElementById("anyCount").textContent = `${asum.account_count || 0} 个账号`;
+        document.getElementById("anyTodayUsage").textContent = sumTodayUsage(currentResultsAny);
+
+        // AgentRouter 汇总
+        const gsum = agent.summary || mkSummary(currentResultsAgent);
+        document.getElementById("agentTotalQuota").textContent = `$${(gsum.total_quota || 0).toFixed(2)}`;
+        document.getElementById("agentTotalUsed").textContent = `$${(gsum.total_used || 0).toFixed(2)}`;
+        document.getElementById("agentCount").textContent = `${gsum.account_count || 0} 个账号`;
+        document.getElementById("agentSuccess").textContent = `${gsum.success_count || 0}/${gsum.account_count || 0}`;
+
+        // 当前 new-api 站点汇总（同一张卡复用，随切换重填）
+        const cur = currentSite();
+        if (cur) {
+          const rows = currentResultsSite[cur.id] || [];
+          const osum = mkSummary(rows);
+          document.getElementById("siteTotalQuota").textContent = `$${(osum.total_quota || 0).toFixed(2)}`;
+          document.getElementById("siteTotalUsed").textContent = `$${(osum.total_used || 0).toFixed(2)}`;
+          document.getElementById("siteCount").textContent = `${osum.account_count || 0} 个账号`;
+          document.getElementById("siteTodayUsage").textContent = sumTodayUsage(rows);
+        }
+
+        applyProviderVisibility();
+        renderResultsSplit();
+      }
+
+      // 汇总某组结果的今日用量；无数据返回 "--"
+      function sumTodayUsage(results) {
+        if (!usageBaseline) return "--";
+        let t = 0,
+          has = false;
+        for (const r of results) {
+          const v = todayUsedOf(r);
+          if (v != null) {
+            t += v;
+            has = true;
+          }
+        }
+        return has ? `$${t.toFixed(2)}` : "--";
+      }
+
+      // 只查询当前所选网站的余额（其余站点保留上一次结果，不重复请求）
+      async function queryBalance() {
+        if (currentProvider === "anyrouter") await queryAnyrouterBalance();
+        else if (currentProvider === "agentrouter") await queryAgentrouterBalance();
+        else if (isSiteProvider()) await querySiteBalance(currentProvider);
+      }
+
+      // 把某一站的查询结果并入现有结果并重绘（不动其它站的数据）
+      function mkSummary(arr) {
+        return {
+          total_quota: Math.round(arr.reduce((s, r) => s + (r.success ? r.quota || 0 : 0), 0) * 100) / 100,
+          total_used: Math.round(arr.reduce((s, r) => s + (r.success ? r.used || 0 : 0), 0) * 100) / 100,
+          account_count: arr.length,
+          success_count: arr.filter((r) => r.success).length,
+        };
+      }
+
+      function renderProviderResults(provider, results) {
+        const isSite = !!newapiSites.find((s) => s.id === provider);
+        renderResults({
+          success: true,
+          any: { results: provider === "anyrouter" ? results : currentResultsAny, summary: null },
+          agent: { results: provider === "agentrouter" ? results : currentResultsAgent, summary: null },
+          site: isSite ? { id: provider, results, summary: null } : null,
+        });
+      }
+
+      // AnyRouter：token + cookie 账号实时查询（需 WAF cookie + 代理）
+      async function queryAnyrouterBalance() {
+        let tokenAccs, cookieAccs;
+        if (currentTab === "json") {
+          const input = document.getElementById("accountInput").value.trim();
+          if (!input) {
+            alert("请输入账号配置");
+            return;
+          }
+          let accounts;
+          try {
+            accounts = JSON.parse(input);
+            if (!Array.isArray(accounts)) throw new Error("需要数组格式");
+          } catch (e) {
+            alert("JSON 格式错误：" + e.message);
+            return;
+          }
+          // JSON 视图里 provider 等于某个站点 id 的记录属于该站点，不算 AnyRouter
+          const siteIds = new Set(newapiSites.map((s) => s.id));
+          tokenAccs = accounts.filter((a) => a && a.access_token && !siteIds.has(a.provider));
+          cookieAccs = accounts.filter((a) => a && !a.access_token && !(a.username && a.password));
+        } else {
+          tokenAccs = tokenAccounts;
+          cookieAccs = cookieAccounts;
+        }
+        const totalCount = tokenAccs.length + cookieAccs.length;
+        if (totalCount === 0) {
+          alert("没有 AnyRouter 账号，请先添加或切换到其它网站");
+          return;
+        }
+        setLoading(true);
+        showSkeleton(totalCount);
+        try {
+          const fetches = [authFetch("/api/usage/today")];
+          if (tokenAccs.length > 0) {
+            fetches.push(
+              authFetch("/api/token/query", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ accounts: tokenAccs }),
+              }),
+            );
+          }
+          if (cookieAccs.length > 0) {
+            fetches.push(
+              authFetch("/api/query", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ accounts: cookieAccs }),
+              }),
+            );
+          }
+          const responses = await Promise.all(fetches);
+          const usageData = await responses[0].json();
+          // 基线是全站共用的一份快照，直接整体替换即可
+          if (usageData.success) usageBaseline = usageData.baseline;
+          let anyResults = [];
+          for (let i = 1; i < responses.length; i++) {
+            const data = await responses[i].json();
+            if (data.success) anyResults = anyResults.concat(data.results);
+          }
+          if (anyResults.length === 0) renderResults({ success: false, error: "查询失败，请重试" });
+          else renderProviderResults("anyrouter", anyResults);
+        } catch (e) {
+          renderResults({ success: false, error: "网络请求失败：" + e.message });
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // AgentRouter：实时查询（复用服务端缓存的 session，冷启动才逐个登录，会慢一些）
+      async function queryAgentrouterBalance() {
+        if (loginAccounts.length === 0) {
+          alert("没有 AgentRouter 账号，请先添加或切换到其它网站");
+          return;
+        }
+        setLoading(true);
+        showSkeleton(loginAccounts.length);
+        // WAF 按出口 IP 限速：后端分小批查、自动轮换 mihomo 出口 IP、被拦的账号重登重试，
+        // 一轮全量约 1~2 分钟 —— 给个提示，免得看起来像卡死
+        document
+          .getElementById("resultsContainer")
+          .insertAdjacentHTML(
+            "afterbegin",
+            '<div id="arQueryHint" class="mb-3 text-sm text-amber-400">正在分批查询并自动轮换出口 IP 避开 WAF（约 1~2 分钟，请勿重复点击）…</div>',
+          );
+        try {
+          let agentResults = [];
+          const gresp = await authFetch("/api/login-accounts/balances");
+          const gdata = await gresp.json();
+          if (!gdata.success && gdata.error) {
+            renderResults({ success: false, error: gdata.error });
+            return;
+          }
+          if (gdata.success) agentResults = gdata.results || [];
+          // 顺便刷新签到状态，供账号卡徽标使用
+          try {
+            const cresp = await authFetch("/api/login-accounts/checkin/status");
+            const cdata = await cresp.json();
+            if (cdata.success) checkinStatus = cdata.status;
+          } catch (e) {
+            /* 忽略 */
+          }
+          // 基线必须在余额查询之后再取：那次查询会把当天第一次的已用量写成基线，
+          // 顺序反了就取不到今天的基线，今日用量又会显示 "--"
+          try {
+            const uresp = await authFetch("/api/usage/today");
+            const udata = await uresp.json();
+            if (udata.success) usageBaseline = udata.baseline;
+          } catch (e) {
+            /* 忽略 */
+          }
+          if (agentResults.length === 0) renderResults({ success: false, error: "查询失败，请重试" });
+          else renderProviderResults("agentrouter", agentResults);
+          renderAccountCards();
+        } catch (e) {
+          renderResults({ success: false, error: "网络请求失败：" + e.message });
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // new-api 站点：token 实时查询，无 WAF/代理依赖
+      async function querySiteBalance(siteId) {
+        const site = newapiSites.find((s) => s.id === siteId);
+        if (!site) return;
+        const accs = siteAccounts[siteId] || [];
+        if (accs.length === 0) {
+          alert(`没有 ${site.label} 账号，请先添加或切换到其它网站`);
+          return;
+        }
+        setLoading(true);
+        showSkeleton(accs.length);
+        try {
+          const [uresp, oresp] = await Promise.all([
+            authFetch("/api/usage/today"),
+            authFetch("/api/site/" + encodeURIComponent(siteId) + "/query", { method: "POST" }),
+          ]);
+          const usageData = await uresp.json();
+          if (usageData.success) usageBaseline = usageData.baseline;
+          const odata = await oresp.json();
+          const rows = odata.success ? odata.results || [] : [];
+          // 顺便刷新签到状态，供账号卡徽标使用
+          await pollSiteCheckinStatus(siteId);
+          if (rows.length === 0) renderResults({ success: false, error: odata.error || "查询失败，请重试" });
+          else renderProviderResults(siteId, rows);
+          renderAccountCards();
+        } catch (e) {
+          renderResults({ success: false, error: "网络请求失败：" + e.message });
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // 通用按钮 loading 切换
+      function setBtnLoading(btnId, iconId, textId, loading, loadingText, idleText, idleIconPath) {
+        const btn = document.getElementById(btnId),
+          icon = document.getElementById(iconId),
+          text = document.getElementById(textId);
+        if (!btn) return;
+        if (loading) {
+          btn.disabled = true;
+          btn.classList.add("opacity-70", "cursor-not-allowed");
+          icon.innerHTML =
+            '<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>';
+          icon.classList.add("animate-spin");
+          text.textContent = loadingText;
+        } else {
+          btn.disabled = false;
+          btn.classList.remove("opacity-70", "cursor-not-allowed");
+          icon.innerHTML = idleIconPath;
+          icon.classList.remove("animate-spin");
+          text.textContent = idleText;
+        }
+      }
+
+      const CHECK_ICON = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>';
+      const BOLT_ICON = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>';
+      const RENEW_ICON =
+        '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>';
+
+      // 解码 gorilla session cookie，算出剩余有效天数（首段为签名unix秒，有效期30天）
+      function sessionDaysLeft(session) {
+        try {
+          let b64 = (session || "").replace(/-/g, "+").replace(/_/g, "/");
+          while (b64.length % 4) b64 += "=";
+          const raw = atob(b64);
+          const ts = parseInt(raw.split("|")[0], 10);
+          if (!ts || ts < 1000000000) return null;
+          return ((ts + 2592000) * 1000 - Date.now()) / 86400000;
+        } catch (e) {
+          return null;
+        }
+      }
+      function cookieExpiryBadge(session) {
+        const d = sessionDaysLeft(session);
+        if (d === null) return "";
+        if (d <= 0) return '<span class="px-1.5 py-0.5 bg-red-900/50 text-red-400 text-xs rounded">cookie已过期</span>';
+        const days = Math.floor(d);
+        const cls = days <= 3 ? "bg-red-900/50 text-red-400" : days <= 7 ? "bg-amber-900/50 text-amber-400" : "bg-emerald-900/50 text-emerald-400";
+        return `<span class="px-1.5 py-0.5 ${cls} text-xs rounded">cookie剩${days}天</span>`;
+      }
+
+      // AnyRouter 签到：cookie 账号并发签到，数秒完成
+      async function anyrouterCheckin() {
+        if (anyrouterCheckinStatus && anyrouterCheckinStatus.running) {
+          alert("AnyRouter 签到正在运行中，请查看进度面板");
+          return;
+        }
+        if (cookieAccounts.length === 0) {
+          alert("没有 AnyRouter（cookie）账号需要签到");
+          return;
+        }
+        if (!confirm("即将签到 " + cookieAccounts.length + " 个 AnyRouter cookie 账号（并发，数秒完成）。确定开始？")) return;
+        setBtnLoading("anyrouterCheckinBtn", "anyrouterCheckinIcon", "anyrouterCheckinText", true, "签到中...", "AnyRouter 签到", CHECK_ICON);
+        try {
+          const resp = await authFetch("/api/anyrouter/checkin/start", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            anyrouterCheckinStatus = data.status;
+            renderAnyrouterCheckinProgress();
+            startAnyrouterCheckinPolling();
+          } else alert(data.error || "启动 AnyRouter 签到失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          setBtnLoading("anyrouterCheckinBtn", "anyrouterCheckinIcon", "anyrouterCheckinText", false, "签到中...", "AnyRouter 签到", CHECK_ICON);
+        }
+      }
+
+      // AgentRouter 签到：Login 账号随机顺序逐个签到，账号间随机等待 30~60 分钟（后台运行）
+      async function agentrouterCheckin() {
+        if (checkinStatus && checkinStatus.running) {
+          alert("AgentRouter 签到正在运行中，请查看进度面板");
+          return;
+        }
+        if (loginAccounts.length === 0) {
+          alert("没有 AgentRouter（Login）账号需要签到");
+          return;
+        }
+        if (!confirm("即将开始签到 " + loginAccounts.length + " 个 AgentRouter 账号。账号将按随机顺序逐个签到，每个账号之间随机等待 " + (autoCheckinSettings.agentrouter_gap_min ?? 30) + "~" + (autoCheckinSettings.agentrouter_gap_max ?? 60) + " 分钟（可在设置里改），整个流程可能持续数小时（后台运行）。确定开始？"))
+          return;
+        setBtnLoading("agentCheckinBtn", "agentCheckinIcon", "agentCheckinText", true, "签到中...", "AgentRouter 签到", CHECK_ICON);
+        try {
+          const resp = await authFetch("/api/login-accounts/checkin/start", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            checkinStatus = data.status;
+            renderCheckinProgress();
+            renderAccountCards();
+            startCheckinPolling();
+          } else alert(data.error || "启动签到失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          setBtnLoading("agentCheckinBtn", "agentCheckinIcon", "agentCheckinText", false, "签到中...", "AgentRouter 签到", CHECK_ICON);
+        }
+      }
+
+      // AgentRouter 一键全签：轮换出口 IP 分批登录（登录即签到），约 1~2 分钟，
+      // 与上面的缓慢模式互补 —— WAF 拦不住轮换，也就不需要再等几十分钟一个账号
+      async function agentrouterFastCheckin() {
+        if (checkinStatus && checkinStatus.running) {
+          alert("AgentRouter 签到正在运行中，请查看进度面板");
+          return;
+        }
+        if (loginAccounts.length === 0) {
+          alert("没有 AgentRouter（Login）账号需要签到");
+          return;
+        }
+        if (!confirm("即将一次性签到全部 AgentRouter 账号：自动轮换出口 IP 分批登录，约 1~2 分钟完成（今日已签到的账号会跳过）。确定开始？"))
+          return;
+        setBtnLoading("agentFastCheckinBtn", "agentFastCheckinIcon", "agentFastCheckinText", true, "全签中...", "AgentRouter 一键全签", BOLT_ICON);
+        try {
+          const resp = await authFetch("/api/login-accounts/checkin/fast", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            if (data.status) checkinStatus = data.status;
+            // 签到顺带写入的余额是今日基线的重要来源，刷一下基线今日用量才有得算
+            try {
+              const uresp = await authFetch("/api/usage/today");
+              const udata = await uresp.json();
+              if (udata.success) usageBaseline = udata.baseline;
+            } catch (e) { /* 忽略 */ }
+            renderCheckinProgress();
+            renderAccountCards();
+            const sm = data.summary || {};
+            let msg = `签到完成：新签 ${sm.new_signed ?? 0} 个，今日已签 ${sm.already ?? 0} 个，失败 ${sm.failed ?? 0} 个`;
+            if (sm.aborted) msg += "\n（部分账号因 WAF 惩罚期提前中止，等 30~60 分钟再点一次补签即可）";
+            alert(msg);
+          } else alert(data.error || "签到失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          setBtnLoading("agentFastCheckinBtn", "agentFastCheckinIcon", "agentFastCheckinText", false, "全签中...", "AgentRouter 一键全签", BOLT_ICON);
+        }
+      }
+
+      // ===== new-api 站点签到 =====
+      // 这类站点的 POST /api/user/checkin 可能挂了 Cloudflare Turnstile（GET 没挂）。
+      // Turnstile 的 sitekey 有域名限制，在本 Web UI 上渲染 widget 拿不到 token，
+      // 所以走「在站点自己的 Console 里跑脚本签到 → 回来点同步状态核对」。
+      // 站长若关掉 Turnstile，探测到 enabled=false，按钮自动切回服务器端一键签到。
+
+      async function loadSiteTurnstile(siteId) {
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(siteId) + "/turnstile");
+          const data = await resp.json();
+          if (data.success) siteTurnstile[siteId] = data.turnstile;
+        } catch (e) {
+          /* 探测失败时保持未知，按需时再探 */
+        }
+      }
+
+      // 按 Turnstile 状态切换 UI：开启 → 显示浏览器脚本面板；关闭 → 恢复一键签到
+      function applySiteCheckinMode() {
+        const panel = document.getElementById("siteBrowserPanel");
+        const btnText = document.getElementById("siteCheckinText");
+        const site = currentSite();
+        const ts = site ? siteTurnstile[site.id] : null;
+        const blocked = !!(site && ts && ts.enabled);
+        if (panel) panel.classList.toggle("hidden", !blocked);
+        if (btnText && site) btnText.textContent = site.label + (blocked ? " 签到（需浏览器）" : " 签到");
+        if (blocked) {
+          document.getElementById("siteBrowserTitle").textContent = `${site.label} 已开启人机校验，需在浏览器完成签到`;
+          const link = document.getElementById("siteBrowserLink");
+          link.href = site.domain;
+          link.textContent = site.domain.replace(/^https?:\/\//, "");
+        }
+      }
+
+      // 生成在站点 Console 里执行的自包含签到脚本。
+      // accsOverride 传入「只含待签到账号」的列表（copySiteScript 查过状态后过滤出来的）；
+      // 不传时取全部账号 —— 测试与非过滤场景用。
+      function buildSiteScript(site, accsOverride) {
+        const accs = (accsOverride || siteAccounts[site.id] || []).map((a) => ({ n: a.name, t: a.access_token, u: String(a.user_id) }));
+        const ts = siteTurnstile[site.id] || {};
+        return [
+          "(async () => {",
+          "  const A = " + JSON.stringify(accs) + ";",
+          "  const SITEKEY = " + JSON.stringify(ts.site_key || "") + ";",
+          "  if (!SITEKEY) { console.error('未拿到 sitekey，请回 Web UI 重新点一次签到'); return; }",
+          "  if (!window.turnstile) {",
+          "    await new Promise((res, rej) => { const s = document.createElement('script');",
+          "      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js'; s.onload = res; s.onerror = rej;",
+          "      document.head.appendChild(s); });",
+          "    await new Promise(r => setTimeout(r, 1500));",
+          "  }",
+          "  let box = document.getElementById('__ts_box');",
+          "  if (!box) { box = document.createElement('div'); box.id = '__ts_box';",
+          "    box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99999;background:#fff;padding:8px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.3)';",
+          "    document.body.appendChild(box); }",
+          "  let wid = null, seq = 0, pend = null;",
+          "  const settle = (s, err, tok) => { if (s !== seq || !pend) return; const p = pend; pend = null;",
+          "    err ? p.rej(new Error(err)) : p.res(tok); };",
+          "  const getToken = () => { const s = ++seq; return new Promise((res, rej) => { pend = { res, rej };",
+          "    if (wid === null) { wid = turnstile.render(box, { sitekey: SITEKEY,",
+          "      callback: t => settle(seq, null, t),",
+          "      'error-callback': e => settle(seq, 'Turnstile 错误 ' + e),",
+          "      'timeout-callback': () => settle(seq, 'Turnstile 超时') }); }",
+          "    else { turnstile.reset(wid); }",
+          "    setTimeout(() => settle(s, 'Turnstile 30s 超时'), 30000); }); };",
+          "  let ok = 0, already = 0, bad = 0;",
+          "  console.log('%c开始签到 ' + A.length + ' 个账号', 'color:#f59e0b;font-weight:bold');",
+          "  for (let i = 0; i < A.length; i++) {",
+          "    const a = A[i];",
+          "    try {",
+          "      const tok = await getToken();",
+          "      const r = await fetch(" + JSON.stringify(site.sign_in_path || "/api/user/checkin") + " + '?turnstile=' + encodeURIComponent(tok), { method: 'POST',",
+          // credentials:'omit' 不能省。脚本跑在站点自己的页面上，fetch 默认 same-origin
+          // 会自动带上浏览器登录用的 session cookie；而 new-api 的 authHelper 是
+          // 「session 优先、有 session 就完全不看 Authorization 头」，随后拿 New-Api-User
+          // 跟 session 里的 id 比对，于是除了当前登录的那个账号，其余全部 401
+          // 「无权进行此操作，New-Api-User 与登录用户不匹配」。omit 之后没有 session，
+          // 才会走 access_token 分支。附带好处：响应里的 Set-Cookie 也被忽略，
+          // 不会被 Turnstile 中间件的 session.Save() 动到用户的登录态。
+          "        credentials: 'omit',",
+          "        headers: { Authorization: 'Bearer ' + a.t, " + JSON.stringify(site.api_user_key || "new-api-user") + ": a.u, Accept: 'application/json' } });",
+          "      const d = await r.json();",
+          "      if (d.success) { ok++; console.log('[' + (i+1) + '/' + A.length + '] ✓ ' + a.n + ' 签到成功'); }",
+          "      else if ((d.message || '').includes('已签')) { already++; console.log('[' + (i+1) + '/' + A.length + '] = ' + a.n + ' 今日已签到'); }",
+          "      else { bad++; console.warn('[' + (i+1) + '/' + A.length + '] ✗ ' + a.n + ' ' + d.message); }",
+          "    } catch (e) { bad++; console.error('[' + (i+1) + '/' + A.length + '] ✗ ' + a.n + ' ' + e.message); }",
+          "  }",
+          "  try { turnstile.remove(wid); } catch (e) {}",
+          "  box.remove();",
+          "  console.log('%c完成：新签 ' + ok + ' · 已签 ' + already + ' · 失败 ' + bad + '，回 Web UI 点「同步状态」',",
+          "    'color:#10b981;font-weight:bold');",
+          "})();",
+        ].join("\n");
+      }
+
+      // 按 /checkin/sync 的核对结果（GET /api/user/checkin，不挂 Turnstile）剔除
+      // 今日已签到的账号 —— sync 的 `success` 字段即「今日已签到」。
+      // 查不到结果的账号保守保留 —— 最多让脚本收到一句「今日已签到」，不丢签到机会。
+      function filterPendingAccounts(accs, results) {
+        const byName = {};
+        (results || []).forEach((x) => { if (x && x.name) byName[x.name] = x; });
+        return accs.filter((a) => {
+          const r = byName[a.name];
+          return !r || r.success !== true;
+        });
+      }
+
+      async function copySiteScript() {
+        const site = currentSite();
+        if (!site) return;
+        const accs = siteAccounts[site.id] || [];
+        if (accs.length === 0) {
+          alert(`没有 ${site.label} 账号`);
+          return;
+        }
+        const hint = document.getElementById("siteCopyHint");
+        const txt = document.getElementById("siteCopyScriptText");
+        const holder = document.getElementById("siteScriptHolder");
+
+        // 复制前先跑一遍「同步状态」（GET 核对 + 查余额 + 写快照，与同步按钮同端点），
+        // 一举两得：界面上的签到徽标刷新到位；已签到的账号不进脚本 ——
+        // token 一次性，替已签的取 token 是纯浪费，还会拖慢后面的账号。
+        let pending = accs;
+        let doneCount = 0;
+        txt.textContent = "同步状态...";
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(site.id) + "/checkin/sync", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            siteCheckinStatus[site.id] = data.status;
+            renderSiteCheckinProgress();
+            renderAccountCards();
+            pending = filterPendingAccounts(accs, data.results);
+            doneCount = accs.length - pending.length;
+          }
+        } catch (e) {
+          // 同步失败就全量生成，别拦着用户签到
+        }
+        if (pending.length === 0) {
+          txt.textContent = "复制签到脚本";
+          hint.classList.remove("hidden");
+          hint.textContent = `${accs.length} 个账号今日都已签到，不用跑脚本 ✓`;
+          hint.className = "mt-2 text-xs text-emerald-400";
+          holder.classList.add("hidden");
+          return;
+        }
+        if (!siteTurnstile[site.id]) await loadSiteTurnstile(site.id);
+        const script = buildSiteScript(site, pending);
+
+        // 先把脚本填进可见的 textarea：一是自动复制失败时用户能手动选，
+        // 二是 execCommand('copy') 只能从"真正可见且有尺寸"的元素取内容 ——
+        // 之前它带 opacity-0 w-0 h-0，选区是空的，所以复制出来是空白。
+        holder.value = script;
+        holder.classList.remove("hidden");
+
+        let copied = false;
+        try {
+          // navigator.clipboard 只在安全上下文（HTTPS / localhost）可用，HTTP 访问时为 undefined
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(script);
+            copied = true;
+          }
+        } catch (e) {
+          /* 落到 execCommand 兜底 */
+        }
+        if (!copied) {
+          try {
+            holder.focus();
+            holder.select();
+            holder.setSelectionRange(0, script.length);
+            copied = document.execCommand("copy");
+          } catch (e) {
+            copied = false;
+          }
+        }
+
+        hint.classList.remove("hidden");
+        const size = (script.length / 1024).toFixed(1);
+        const host = site.domain.replace(/^https?:\/\//, "");
+        if (copied) {
+          txt.textContent = "已复制 ✓";
+          hint.textContent = `已复制 ${pending.length} 个待签到账号的脚本（${size} KB${doneCount ? `，跳过 ${doneCount} 个今日已签` : ""}）。到 ${host} 按 F12 打开 Console 粘贴回车，跑完回来点「同步状态」。`;
+          hint.className = "mt-2 text-xs text-emerald-400";
+          setTimeout(() => {
+            txt.textContent = "复制签到脚本";
+          }, 2500);
+        } else {
+          hint.textContent = "浏览器拒绝了自动复制（HTTP 页面无剪贴板权限）。脚本已显示在上方文本框，点一下框内即可全选，再按 Ctrl+C 复制。";
+          hint.className = "mt-2 text-xs text-amber-400";
+          holder.focus();
+          holder.select();
+        }
+      }
+
+      // 浏览器脚本跑完后：让后端调 GET /api/user/checkin 核对真实签到状态并刷新余额
+      async function siteSyncStatus() {
+        const site = currentSite();
+        if (!site) return;
+        if ((siteAccounts[site.id] || []).length === 0) {
+          alert(`没有 ${site.label} 账号`);
+          return;
+        }
+        const btn = document.getElementById("siteSyncBtn");
+        const txt = document.getElementById("siteSyncText");
+        btn.disabled = true;
+        btn.classList.add("opacity-60", "cursor-not-allowed");
+        txt.textContent = "同步中...";
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(site.id) + "/checkin/sync", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            siteCheckinStatus[site.id] = data.status;
+            renderSiteCheckinProgress();
+            const hint = document.getElementById("siteCopyHint");
+            hint.classList.remove("hidden");
+            const allDone = data.checked_in === data.total;
+            hint.textContent = "同步完成：" + data.checked_in + "/" + data.total + " 个账号今日已签到" + (allDone ? "，全部完成 ✓" : "，未签到的请重新执行脚本");
+            hint.className = allDone ? "mt-2 text-xs text-emerald-400" : "mt-2 text-xs text-amber-400";
+            try {
+              await querySiteBalance(site.id);
+            } catch (e) {}
+          } else alert(data.error || "同步失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.classList.remove("opacity-60", "cursor-not-allowed");
+          txt.textContent = "同步状态";
+        }
+      }
+
+      async function siteCheckin() {
+        const site = currentSite();
+        if (!site) return;
+        const st = siteCheckinStatus[site.id];
+        if (st && st.running) {
+          alert(`${site.label} 签到正在运行中，请查看进度面板`);
+          return;
+        }
+        const accs = siteAccounts[site.id] || [];
+        if (accs.length === 0) {
+          alert(`没有 ${site.label} 账号需要签到`);
+          return;
+        }
+        // 每次点击都重探一次：站长可能刚关掉 Turnstile
+        await loadSiteTurnstile(site.id);
+        applySiteCheckinMode();
+        if (siteTurnstile[site.id] && siteTurnstile[site.id].enabled) {
+          const panel = document.getElementById("siteBrowserPanel");
+          if (panel) {
+            panel.classList.remove("hidden");
+            panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          }
+          await copySiteScript();
+          return;
+        }
+        // Turnstile 已关闭：走服务器端一键签到
+        if (!confirm(`即将签到 ${accs.length} 个 ${site.label} 账号（并发，数秒完成）。确定开始？`)) return;
+        const idle = site.label + " 签到";
+        setBtnLoading("siteCheckinBtn", "siteCheckinIcon", "siteCheckinText", true, "签到中...", idle, CHECK_ICON);
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(site.id) + "/checkin/start", { method: "POST" });
+          const data = await resp.json();
+          if (data.success) {
+            siteCheckinStatus[site.id] = data.status;
+            renderSiteCheckinProgress();
+            startSitePolling();
+          } else alert(data.error || `启动 ${site.label} 签到失败`);
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          setBtnLoading("siteCheckinBtn", "siteCheckinIcon", "siteCheckinText", false, "签到中...", idle, CHECK_ICON);
+        }
+      }
+
+
+      // Cookie 续期：对 cookie 账号调用 /api/oauth/state 续期 30 天，新 session 写回配置
+      async function renewCookies() {
+        if (cookieAccounts.length === 0) {
+          alert("没有 AnyRouter（cookie）账号需要续期");
+          return;
+        }
+        if (!confirm("即将为 " + cookieAccounts.length + " 个 cookie 账号续期 session（+30 天）。仅对仍有效的登录 cookie 生效，已过期账号会提示需重新登录。确定续期？")) return;
+        setBtnLoading("renewBtn", "renewIcon", "renewText", true, "续期中...", "Cookie 续期", RENEW_ICON);
+        try {
+          const resp = await authFetch("/api/anyrouter/renew", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+          const data = await resp.json();
+          if (data.success) {
+            renderRenewResult(data);
+            await loadSavedConfig();
+          } else alert(data.error || "续期失败");
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        } finally {
+          setBtnLoading("renewBtn", "renewIcon", "renewText", false, "续期中...", "Cookie 续期", RENEW_ICON);
+        }
+      }
+
+      function renderRenewResult(data) {
+        const panel = document.getElementById("renewResult");
+        panel.classList.remove("hidden");
+        const s = data.summary || {};
+        let stat = "成功 " + (s.renewed || 0) + " · 失败 " + (s.failed || 0);
+        if (s.skipped) stat += "（含跳过 " + s.skipped + "）";
+        document.getElementById("renewStat").textContent = stat + " / 共 " + (s.total || 0);
+
+        // 限流是 IP 级的，整轮都会失败，单看每个账号的 ✗ 看不出这一点，所以单独提示
+        const notice = document.getElementById("renewNotice");
+        if (data.notice) {
+          notice.textContent = data.notice;
+          notice.classList.remove("hidden");
+        } else {
+          notice.classList.add("hidden");
+        }
+
+        const chips = (data.results || [])
+          .map((r) => {
+            const cls = r.success ? "bg-emerald-900/50 text-emerald-400" : r.skipped ? "bg-dark-600 text-gray-400" : "bg-red-900/50 text-red-400";
+            const label = r.success ? "✓" : r.skipped ? "–" : "✗";
+            const tip = r.success ? r.name + ": 续期成功，有效期至 " + (r.expires_at || "") + "（剩 " + (r.days_left != null ? r.days_left : "?") + " 天）" : r.name + ": " + (r.message || "失败");
+            return '<span class="px-1.5 py-0.5 text-xs rounded ' + cls + '" title="' + tip.replace(/"/g, "&quot;") + '">' + label + " " + r.name + "</span>";
+          })
+          .join("");
+        document.getElementById("renewAccountStatus").innerHTML = chips;
+      }
+
+      // ===== AnyRouter 签到进度轮询与渲染 =====
+      async function pollAnyrouterCheckinStatus() {
+        try {
+          const resp = await authFetch("/api/anyrouter/checkin/status");
+          const data = await resp.json();
+          if (data.success) {
+            anyrouterCheckinStatus = data.status;
+            renderAnyrouterCheckinProgress();
+            if (!anyrouterCheckinStatus.running) stopAnyrouterCheckinPolling();
+          }
+        } catch (e) {}
+      }
+      function startAnyrouterCheckinPolling() {
+        if (anyrouterPollInterval) return;
+        anyrouterPollInterval = setInterval(pollAnyrouterCheckinStatus, 3000);
+      }
+      function stopAnyrouterCheckinPolling() {
+        if (anyrouterPollInterval) {
+          clearInterval(anyrouterPollInterval);
+          anyrouterPollInterval = null;
+        }
+      }
+      function renderAnyrouterCheckinProgress() {
+        const panel = document.getElementById("anyrouterCheckinProgress");
+        const s = anyrouterCheckinStatus;
+        if (!s || (!s.total && !s.started_at)) {
+          panel.classList.add("hidden");
+          return;
+        }
+        panel.classList.remove("hidden");
+        const total = s.total || 0,
+          done = s.done || 0;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        document.getElementById("anyrouterProgressBar").style.width = pct + "%";
+        document.getElementById("anyrouterRunningDot").classList.toggle("hidden", !s.running);
+        document.getElementById("anyrouterProgressStat").textContent = done + "/" + total + " 已处理 · 成功 " + (s.signed || 0) + " · 失败 " + (s.failed || 0);
+        let info = "";
+        if (s.running) info = "签到进行中...";
+        else if (s.finished_at) info = "本轮完成于 " + s.finished_at + "（" + (s.trigger === "auto" ? "自动" : "手动") + "触发）";
+        document.getElementById("anyrouterProgressInfo").textContent = info;
+        const statusMeta = {
+          signed: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          already: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          failed: { cls: "bg-red-900/50 text-red-400", label: "✗" },
+          pending: { cls: "bg-dark-600 text-gray-400", label: "·" },
+        };
+        const chips = (s.accounts || [])
+          .map((a) => {
+            const meta = statusMeta[a.status] || statusMeta.pending;
+            const title = a.message ? a.name + ": " + a.message : a.name;
+            return '<span class="px-1.5 py-0.5 text-xs rounded ' + meta.cls + '" title="' + title.replace(/"/g, "&quot;") + '">' + meta.label + " " + a.name + "</span>";
+          })
+          .join("");
+        document.getElementById("anyrouterAccountStatus").innerHTML = chips;
+      }
+
+      // ===== new-api 站点签到进度轮询与渲染 =====
+      // 状态按 site_id 分桶；进度面板只显示当前选中站点的那一份。
+      async function pollSiteCheckinStatus(siteId) {
+        try {
+          const resp = await authFetch("/api/site/" + encodeURIComponent(siteId) + "/checkin/status");
+          const data = await resp.json();
+          if (data.success) {
+            siteCheckinStatus[siteId] = data.status;
+            if (currentProvider === siteId) {
+              renderSiteCheckinProgress();
+              renderAccountCards();
+              if (!data.status.running) stopSitePolling();
+            }
+          }
+        } catch (e) {}
+      }
+      function startSitePolling() {
+        if (sitePollInterval || !isSiteProvider()) return;
+        const siteId = currentProvider;
+        sitePollInterval = setInterval(() => pollSiteCheckinStatus(siteId), 3000);
+      }
+      function stopSitePolling() {
+        if (sitePollInterval) {
+          clearInterval(sitePollInterval);
+          sitePollInterval = null;
+        }
+      }
+      function renderSiteCheckinProgress() {
+        const panel = document.getElementById("siteCheckinProgress");
+        const site = currentSite();
+        const s = site ? siteCheckinStatus[site.id] : null;
+        if (!site || !s || (!s.total && !s.started_at)) {
+          panel.classList.add("hidden");
+          return;
+        }
+        panel.classList.remove("hidden");
+        const acc = accentOf(site);
+        panel.className = `mb-3 bg-dark-700/60 rounded-lg p-4 border ${acc.border}`;
+        const title = document.getElementById("siteProgressTitle");
+        title.textContent = site.label + " 签到进度";
+        title.className = "text-sm font-medium " + acc.text;
+        const bar = document.getElementById("siteProgressBar");
+        const total = s.total || 0,
+          done = s.done || 0;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        bar.className = `bg-gradient-to-r ${acc.from} ${acc.to} h-2.5 rounded-full transition-all duration-500`;
+        bar.style.width = pct + "%";
+        document.getElementById("siteRunningDot").classList.toggle("hidden", !s.running);
+        document.getElementById("siteProgressStat").textContent = done + "/" + total + " 已处理 · 成功 " + (s.signed || 0) + " · 失败 " + (s.failed || 0);
+        let info = "";
+        if (s.running) info = "签到进行中...";
+        else if (s.finished_at) info = "本轮完成于 " + s.finished_at + "（" + (s.trigger === "auto" ? "自动" : s.trigger === "browser" ? "浏览器" : "手动") + "触发）";
+        document.getElementById("siteProgressInfo").textContent = info;
+        const statusMeta = {
+          signed: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          already: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          failed: { cls: "bg-red-900/50 text-red-400", label: "✗" },
+          pending: { cls: "bg-dark-600 text-gray-400", label: "·" },
+        };
+        const chips = (s.accounts || [])
+          .map((a) => {
+            const meta = statusMeta[a.status] || statusMeta.pending;
+            const title = a.message ? a.name + ": " + a.message : a.name;
+            return '<span class="px-1.5 py-0.5 text-xs rounded ' + meta.cls + '" title="' + title.replace(/"/g, "&quot;") + '">' + meta.label + " " + a.name + "</span>";
+          })
+          .join("");
+        document.getElementById("siteAccountStatus").innerHTML = chips;
+      }
+
+      // ===== 站点管理（增删改 new-api 站点）=====
+      function openSiteManager() {
+        renderSiteManager();
+        document.getElementById("siteManagerHint").textContent = "";
+        document.getElementById("siteManagerModal").classList.remove("hidden");
+      }
+      function closeSiteManager() {
+        document.getElementById("siteManagerModal").classList.add("hidden");
+      }
+
+      function renderSiteManager() {
+        const box = document.getElementById("siteManagerList");
+        if (newapiSites.length === 0) {
+          box.innerHTML = '<div class="text-xs text-gray-500 py-3">还没有 new-api 站点，下面添加一个。</div>';
+          return;
+        }
+        box.innerHTML = newapiSites
+          .map((s) => {
+            const acc = accentOf(s);
+            const n = (siteAccounts[s.id] || []).length;
+            const ts = siteTurnstile[s.id];
+            const tsChip = !ts
+              ? '<span class="px-1.5 py-0.5 bg-dark-600 text-gray-400 text-xs rounded">未探测</span>'
+              : ts.enabled
+                ? '<span class="px-1.5 py-0.5 bg-amber-900/50 text-amber-400 text-xs rounded" title="需在该站点浏览器里跑脚本签到">Turnstile 开</span>'
+                : '<span class="px-1.5 py-0.5 bg-emerald-900/50 text-emerald-400 text-xs rounded" title="服务器端可直接签到">Turnstile 关</span>';
+            return `
+              <div class="flex items-center justify-between bg-dark-700 rounded-lg px-3 py-2">
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm font-medium ${acc.text}">${s.label}</span>
+                    <span class="text-xs text-gray-500">${s.id}</span>
+                    ${tsChip}
+                  </div>
+                  <div class="text-xs text-gray-500 truncate">${s.domain} · ${n} 个账号</div>
+                </div>
+                <button onclick="removeSite('${s.id}')" class="p-1.5 text-gray-400 hover:text-red-400 rounded transition" title="移除站点（账号文件保留）">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
+              </div>`;
+          })
+          .join("");
+      }
+
+      // 提交前先探一次：确认域名可达且真是 new-api（/api/status 带 version），省得填错才发现
+      async function probeNewSite() {
+        const domain = document.getElementById("newSiteDomain").value.trim().replace(/\/+$/, "");
+        const hint = document.getElementById("siteManagerHint");
+        if (!domain) {
+          hint.textContent = "先填域名";
+          hint.className = "text-xs text-amber-400";
+          return;
+        }
+        hint.textContent = "探测中...";
+        hint.className = "text-xs text-gray-400";
+        try {
+          const resp = await authFetch("/api/sites/probe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ domain }),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            hint.textContent = "探测失败：" + (data.error || "未知错误");
+            hint.className = "text-xs text-red-400";
+            return;
+          }
+          const i = data.info;
+          hint.textContent = `是 new-api ${i.version}${i.system_name ? "（" + i.system_name + "）" : ""} · 签到${i.checkin_enabled ? "已开启" : "未开启"} · Turnstile ${i.turnstile_check ? "开" : "关"}`;
+          hint.className = "text-xs text-emerald-400";
+          // 名称留空时用站点自报的名字当默认值
+          const labelEl = document.getElementById("newSiteLabel");
+          if (!labelEl.value.trim() && i.system_name) labelEl.value = i.system_name;
+        } catch (e) {
+          hint.textContent = "网络请求失败: " + e.message;
+          hint.className = "text-xs text-red-400";
+        }
+      }
+
+      async function addSite() {
+        const id = document.getElementById("newSiteId").value.trim();
+        const label = document.getElementById("newSiteLabel").value.trim();
+        const domain = document.getElementById("newSiteDomain").value.trim().replace(/\/+$/, "");
+        const accent = document.getElementById("newSiteAccent").value;
+        const hint = document.getElementById("siteManagerHint");
+        if (!id || !label || !domain) {
+          hint.textContent = "站点 ID、名称、域名都要填";
+          hint.className = "text-xs text-amber-400";
+          return;
+        }
+        if (newapiSites.some((s) => s.id === id)) {
+          hint.textContent = "这个站点 ID 已存在";
+          hint.className = "text-xs text-amber-400";
+          return;
+        }
+        const next = [...newapiSites, { id, label, domain, accent, auto_checkin: true }];
+        await saveSites(next, hint);
+        document.getElementById("newSiteId").value = "";
+        document.getElementById("newSiteLabel").value = "";
+        document.getElementById("newSiteDomain").value = "";
+      }
+
+      async function removeSite(id) {
+        const s = newapiSites.find((x) => x.id === id);
+        if (!s) return;
+        const n = (siteAccounts[id] || []).length;
+        if (!confirm(`确定从列表移除站点「${s.label}」？\n\n它的 ${n} 个账号与签到记录会保留在服务器上，重新添加同一个站点 ID 即可恢复。`)) return;
+        await saveSites(newapiSites.filter((x) => x.id !== id), document.getElementById("siteManagerHint"));
+      }
+
+      async function saveSites(sites, hint) {
+        try {
+          const resp = await authFetch("/api/sites", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sites }),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            if (hint) {
+              hint.textContent = data.error || "保存失败";
+              hint.className = "text-xs text-red-400";
+            }
+            return false;
+          }
+          newapiSites = data.sites || [];
+          if (hint) {
+            hint.textContent = "已保存";
+            hint.className = "text-xs text-emerald-400";
+          }
+        } catch (e) {
+          if (hint) {
+            hint.textContent = "网络请求失败: " + e.message;
+            hint.className = "text-xs text-red-400";
+          }
+          return false;
+        }
+        // 新站点的账号与 Turnstile 状态随即拉一遍，UI 立刻可用
+        await Promise.all(newapiSites.map((s) => loadSiteAccounts(s.id)));
+        await Promise.all(newapiSites.map((s) => loadSiteTurnstile(s.id)));
+        await Promise.all(newapiSites.map((s) => pollSiteCheckinStatus(s.id)));
+        await loadAutoCheckinSettings();
+        renderProviderSwitcher();
+        renderSiteManager();
+        renderSiteOptions(isSiteProvider() ? currentProvider : "");
+        applyProviderVisibility();
+        renderAccountCards();
+        renderResultsSplit();
+        renderAutoCheckinToggle();
+        renderSiteCheckinProgress();
+        syncToJsonView();
+        return true;
+      }
+
+      // ========== API 密钥管理 ==========
+      // 四类账号（AnyRouter token/cookie、AgentRouter login、各 new-api 站点）在后端都走
+      // /api/keys/*，用账号卡同一套 `_ref` 寻址，所以这里的 UI 完全不区分账号类型。
+      let keyData = {}; // ref -> 后端返回的账号密钥结果（含全量 key，后端已落缓存）
+      let keySelected = new Set(); // 勾选的账号 ref
+      let keyLoading = false;
+
+      const KEY_STATUS = {
+        1: { label: "启用", cls: "bg-emerald-900/50 text-emerald-400" },
+        2: { label: "已禁用", cls: "bg-red-900/50 text-red-400" },
+        3: { label: "已过期", cls: "bg-amber-900/50 text-amber-400" },
+        4: { label: "已耗尽", cls: "bg-amber-900/50 text-amber-400" },
+      };
+
+      function keyProviderLabel() {
+        if (currentProvider === "anyrouter") return "AnyRouter";
+        if (currentProvider === "agentrouter") return "AgentRouter";
+        const s = currentSite();
+        return s ? s.label : currentProvider;
+      }
+
+      function openKeyManager() {
+        const accs = providerAccounts();
+        if (accs.length === 0) {
+          alert(`当前网站（${keyProviderLabel()}）还没有账号`);
+          return;
+        }
+        document.getElementById("keyManagerTitle").textContent = keyProviderLabel();
+        document.getElementById("keyManagerModal").classList.remove("hidden");
+        keySelected = new Set();
+        document.getElementById("keySelectAll").checked = false;
+        loadKeyManager();
+      }
+
+      function closeKeyManager() {
+        document.getElementById("keyManagerModal").classList.add("hidden");
+        document.getElementById("keyCopyHolder").classList.add("hidden");
+        setKeyHint("");
+      }
+
+      function setKeyHint(text, tone) {
+        const el = document.getElementById("keyManagerHint");
+        if (!text) {
+          el.classList.add("hidden");
+          return;
+        }
+        el.classList.remove("hidden");
+        el.textContent = text;
+        el.className =
+          "px-6 pt-3 text-xs " +
+          (tone === "error" ? "text-red-400" : tone === "warn" ? "text-amber-400" : "text-emerald-400");
+      }
+
+      // 拉当前网站所有账号的密钥列表。后端会顺手把脱敏 key 换成全量并落缓存，
+      // 所以这里拿到的就是完整密钥：展示直接用，复制也零上游请求（不撞 20 次/20 分钟限流）。
+      async function loadKeyManager(force) {
+        if (keyLoading) return;
+        const accs = providerAccounts();
+        if (force) keyData = {};
+        keyLoading = true;
+        renderKeyManager(accs);
+        try {
+          const resp = await authFetch("/api/keys/list", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            // 密钥很少变：默认读缓存（零上游请求），只有点「刷新」才带 refresh 重查
+            body: JSON.stringify({ refs: accs.map((a) => a._ref), refresh: !!force }),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            setKeyHint(data.error || "读取密钥失败", "error");
+          } else {
+            (data.accounts || []).forEach((a) => (keyData[a.ref] = a));
+            const failed = (data.accounts || []).filter((a) => !a.success).length;
+            const masked = (data.accounts || []).reduce((n, a) => n + ((a.keys || []).filter((k) => k.masked).length), 0);
+            if (failed) setKeyHint(`${failed} 个账号读取失败，点账号行的 ↻ 重试`, "warn");
+            else if (masked) setKeyHint(`${masked} 个密钥未取到完整值（站点限流），点密钥行的「显示」或稍后重试`, "warn");
+          }
+        } catch (e) {
+          setKeyHint("网络请求失败: " + e.message, "error");
+        } finally {
+          keyLoading = false;
+          renderKeyManager(accs);
+        }
+      }
+
+      function renderKeyManager(accs) {
+        accs = accs || providerAccounts();
+        const list = document.getElementById("keyManagerList");
+        const totalKeys = accs.reduce((n, a) => n + ((keyData[a._ref] && keyData[a._ref].keys) || []).length, 0);
+        document.getElementById("keyManagerStat").textContent = keyLoading
+          ? "读取中（首次要取完整密钥，账号多时需几十秒）..."
+          : `${accs.length} 个账号 · ${totalKeys} 个密钥 · 已选 ${keySelected.size}`;
+
+        list.innerHTML = accs
+          .map((a) => {
+            const d = keyData[a._ref];
+            const checked = keySelected.has(a._ref) ? "checked" : "";
+            let summary;
+            if (!d) summary = '<span class="text-xs text-gray-500">读取中...</span>';
+            else if (!d.success) summary = `<span class="text-xs text-red-400 truncate" title="${esc(d.error || "")}">${esc(d.error || "失败")}</span>`;
+            else
+              summary =
+                `<span class="text-xs text-gray-400">${d.keys.length} 个密钥</span>` +
+                (d.cached ? `<span class="text-xs text-gray-600 ml-1" title="数据来自缓存，点 ↻ 重新查询">缓存于 ${tsDateTime(d.cached_at)}</span>` : "") +
+                (d.truncated ? `<span class="text-xs text-amber-400 ml-1">（共 ${d.total}，只显示前 ${d.keys.length} 个）</span>` : "") +
+                (d.warning ? `<span class="text-xs text-amber-400 ml-1">${esc(d.warning)}</span>` : "");
+
+            return `
+              <div class="bg-dark-700/60 rounded-lg border border-dark-600 overflow-hidden">
+                <div class="flex items-center gap-2 px-3 py-2">
+                  <input type="checkbox" ${checked} onchange="toggleKeySelect('${a._ref}', this.checked)"
+                    class="w-3.5 h-3.5 rounded bg-dark-800 border-dark-600 text-purple-500 focus:ring-0 cursor-pointer shrink-0" />
+                  <div class="flex items-center gap-2 flex-1 min-w-0 text-left">
+                    <span class="text-sm text-gray-200 truncate">${esc(a.name)}</span>
+                    ${summary}
+                  </div>
+                  <button onclick="refreshKeyAccount('${a._ref}')" title="绕过缓存重新查询该账号" class="px-2 py-1 text-xs rounded bg-dark-600 hover:bg-dark-500 text-gray-400 hover:text-white transition shrink-0">↻</button>
+                  <button onclick="showCreateKeyForm('${a._ref}')" class="px-2 py-1 text-xs rounded bg-dark-600 hover:bg-purple-600 text-gray-300 hover:text-white transition shrink-0">+ 新建</button>
+                </div>
+                ${keyRowsHtml(a._ref, d)}
+              </div>`;
+          })
+          .join("");
+      }
+
+      function keyRowsHtml(ref, d) {
+        const form = `
+          <div id="keyForm-${cssId(ref)}" class="hidden px-3 pb-3 pt-1">
+            <div class="bg-dark-800 rounded-lg p-3 border border-dark-600 space-y-2">
+              <div class="grid grid-cols-3 gap-2">
+                <input id="keyFormName-${cssId(ref)}" type="text" placeholder="密钥名称"
+                  class="bg-dark-900 border border-dark-600 rounded px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:border-purple-500" />
+                <input id="keyFormQuota-${cssId(ref)}" type="text" placeholder="额度（留空=无限）"
+                  class="bg-dark-900 border border-dark-600 rounded px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:border-purple-500" />
+                <input id="keyFormDays-${cssId(ref)}" type="text" placeholder="有效天数（留空=永不）"
+                  class="bg-dark-900 border border-dark-600 rounded px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:border-purple-500" />
+              </div>
+              <div class="flex items-center gap-2">
+                <button onclick="createKey('${ref}')" class="px-3 py-1 text-xs rounded bg-purple-600 hover:bg-purple-500 text-white transition">创建</button>
+                <button onclick="hideCreateKeyForm('${ref}')" class="px-3 py-1 text-xs rounded bg-dark-600 hover:bg-dark-500 text-gray-300 transition">取消</button>
+                <span class="text-xs text-gray-500">额度单位为美元</span>
+              </div>
+            </div>
+          </div>`;
+
+        if (!d) return form + '<div class="px-3 pb-3 text-xs text-gray-500">读取中...</div>';
+        if (!d.success) return form + `<div class="px-3 pb-3 text-xs text-red-400">${esc(d.error || "读取失败")}</div>`;
+        if (d.keys.length === 0) return form + '<div class="px-3 pb-3 text-xs text-gray-500">这个账号还没有密钥</div>';
+
+        const rows = d.keys
+          .map((k) => {
+            const st = KEY_STATUS[k.status] || { label: "状态 " + k.status, cls: "bg-dark-600 text-gray-400" };
+            const quota = k.unlimited_quota ? "无限额度" : `剩余 $${k.remain_quota}`;
+            const expiry = !k.expired_time || k.expired_time === -1 ? "永不过期" : "到期 " + tsDate(k.expired_time);
+            const used = `已用 $${k.used_quota}`;
+            const created = k.created_time ? "创建 " + tsDate(k.created_time) : "";
+            const accessed = k.accessed_time ? "最近用 " + tsDate(k.accessed_time) : "";
+            const extra = []
+              .concat(k.group ? ["分组 " + esc(k.group)] : [])
+              .concat(k.model_limits_enabled && k.model_limits ? ["限模型 " + esc(k.model_limits)] : [])
+              .concat(k.allow_ips ? ["限 IP " + esc(k.allow_ips)] : []);
+            return `
+              <div class="px-3 py-2 border-t border-dark-600/70 first:border-t-0">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="text-xs font-medium text-gray-200 truncate">${esc(k.name) || "（未命名）"}</span>
+                  <span class="px-1.5 py-0.5 text-[10px] rounded ${st.cls}">${st.label}</span>
+                  <div class="flex-1"></div>
+                  ${
+                    k.masked
+                      ? `<button onclick="revealKeys('${ref}')" class="px-2 py-0.5 text-[11px] rounded bg-dark-600 hover:bg-dark-500 text-gray-300 transition" title="向站点索取完整密钥（20 次/20 分钟限流）">显示</button>`
+                      : `<button onclick="copyOneKey('${ref}', ${k.id})" class="px-2 py-0.5 text-[11px] rounded bg-dark-600 hover:bg-emerald-700 text-gray-300 hover:text-white transition">复制</button>`
+                  }
+                  <button onclick="deleteKey('${ref}', ${k.id}, '${esc(k.name).replace(/'/g, "\\'")}')" class="px-2 py-0.5 text-[11px] rounded bg-dark-600 hover:bg-red-700 text-gray-400 hover:text-white transition">删除</button>
+                </div>
+                <div class="font-mono text-[11px] ${k.masked ? "text-gray-500" : "text-purple-300"} break-all mb-1">sk-${esc(k.key)}</div>
+                <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-gray-500">
+                  <span>${quota}</span><span>${used}</span><span>${expiry}</span>
+                  ${created ? `<span>${created}</span>` : ""}${accessed ? `<span>${accessed}</span>` : ""}
+                  ${extra.map((x) => `<span>${x}</span>`).join("")}
+                </div>
+              </div>`;
+          })
+          .join("");
+        return form + `<div class="bg-dark-800/60">${rows}</div>`;
+      }
+
+      function cssId(ref) {
+        return String(ref).replace(/[^a-zA-Z0-9]/g, "_");
+      }
+      function esc(s) {
+        return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      }
+      function tsDate(ts) {
+        if (!ts || ts < 0) return "-";
+        const d = new Date(ts * 1000);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      }
+      function tsDateTime(ts) {
+        if (!ts || ts < 0) return "-";
+        const d = new Date(ts * 1000);
+        return `${tsDate(ts)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      }
+      // 刷新单个账号的密钥列表（绕过缓存 —— 密钥很少变，平时打开弹窗全走缓存零上游请求）
+      async function refreshKeyAccount(ref) {
+        try {
+          const resp = await authFetch("/api/keys/list", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ refs: [ref], refresh: true }),
+          });
+          const data = await resp.json();
+          if (data.success && (data.accounts || [])[0]) {
+            keyData[ref] = data.accounts[0];
+            renderKeyManager();
+          } else setKeyHint((data && data.error) || "刷新失败", "error");
+        } catch (e) {
+          setKeyHint("网络请求失败: " + e.message, "error");
+        }
+      }
+
+      function toggleKeySelect(ref, checked) {
+        if (checked) keySelected.add(ref);
+        else keySelected.delete(ref);
+        const accs = providerAccounts();
+        document.getElementById("keySelectAll").checked = keySelected.size === accs.length && accs.length > 0;
+        renderKeyManager(accs);
+      }
+
+      function toggleSelectAllKeyAccounts(checked) {
+        const accs = providerAccounts();
+        keySelected = checked ? new Set(accs.map((a) => a._ref)) : new Set();
+        renderKeyManager(accs);
+      }
+
+      // 密钥行一直展示着，新建表单本来就在 DOM 里，直接亮出来即可
+      function showCreateKeyForm(ref) {
+        const el = document.getElementById("keyForm-" + cssId(ref));
+        if (el) {
+          el.classList.remove("hidden");
+          const name = document.getElementById("keyFormName-" + cssId(ref));
+          if (name) name.focus();
+        }
+      }
+
+      function hideCreateKeyForm(ref) {
+        const el = document.getElementById("keyForm-" + cssId(ref));
+        if (el) el.classList.add("hidden");
+      }
+
+      async function createKey(ref) {
+        const id = cssId(ref);
+        const name = (document.getElementById("keyFormName-" + id).value || "").trim();
+        const quotaRaw = (document.getElementById("keyFormQuota-" + id).value || "").trim();
+        const daysRaw = (document.getElementById("keyFormDays-" + id).value || "").trim();
+        if (!name) {
+          setKeyHint("密钥名称不能为空", "warn");
+          return;
+        }
+        const body = { ref, name, unlimited_quota: quotaRaw === "" };
+        if (quotaRaw !== "") {
+          const q = Number(quotaRaw);
+          if (!isFinite(q) || q < 0) {
+            setKeyHint("额度要填非负数字（美元），留空表示无限", "warn");
+            return;
+          }
+          body.remain_quota = q;
+        }
+        if (daysRaw !== "") {
+          const days = Number(daysRaw);
+          if (!isFinite(days) || days <= 0) {
+            setKeyHint("有效天数要填正数，留空表示永不过期", "warn");
+            return;
+          }
+          body.expired_time = Math.floor(Date.now() / 1000 + days * 86400);
+        }
+        setKeyHint("创建中...", "");
+        try {
+          const resp = await authFetch("/api/keys/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            setKeyHint(data.error || "创建失败", "error");
+            return;
+          }
+          keyData[ref] = data.account;
+          hideCreateKeyForm(ref);
+          document.getElementById("keyFormName-" + id) && (document.getElementById("keyFormName-" + id).value = "");
+          setKeyHint(`已创建密钥「${name}」`, "");
+          renderKeyManager();
+        } catch (e) {
+          setKeyHint("网络请求失败: " + e.message, "error");
+        }
+      }
+
+      async function deleteKey(ref, id, name) {
+        if (!confirm(`确定删除密钥「${name || id}」？\n\n删除后用它调用 API 会立刻失败，且无法恢复。`)) return;
+        setKeyHint("删除中...", "");
+        try {
+          const resp = await authFetch("/api/keys/delete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ref, id }),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            setKeyHint(data.error || "删除失败", "error");
+            return;
+          }
+          keyData[ref] = data.account;
+          setKeyHint(`已删除密钥「${name || id}」`, "");
+          renderKeyManager();
+        } catch (e) {
+          setKeyHint("网络请求失败: " + e.message, "error");
+        }
+      }
+
+      // 重试取完整密钥（只在限流退化为脱敏时才会出现「显示」按钮）。
+      // 后端命中缓存发现还是脱敏值会自动补取一次并回写，取到就一直留着。
+      async function revealKeys(ref) {
+        setKeyHint("获取完整密钥中...", "");
+        try {
+          const resp = await authFetch("/api/keys/list", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ refs: [ref] }),
+          });
+          const data = await resp.json();
+          const acc = (data.accounts || [])[0];
+          if (!data.success || !acc || !acc.success) {
+            setKeyHint((acc && acc.error) || data.error || "获取失败", "error");
+            return;
+          }
+          keyData[ref] = acc;
+          setKeyHint(acc.warning || "", acc.warning ? "warn" : "");
+          renderKeyManager();
+        } catch (e) {
+          setKeyHint("网络请求失败: " + e.message, "error");
+        }
+      }
+
+      function copyOneKey(ref, id) {
+        const d = keyData[ref];
+        const k = d && (d.keys || []).find((x) => x.id === id);
+        if (!k || k.masked) return;
+        copyKeyText("sk-" + k.key, "已复制密钥");
+      }
+
+      // 批量复制：直接复制界面上已展示的数据，零上游请求。
+      // （此前复制要现取全量 key，撞上 20 次/20 分钟限流就复制不全。）
+      function copyKeys(mode) {
+        const accs = providerAccounts();
+        const refs = mode === "all" ? accs.map((a) => a._ref) : accs.filter((a) => keySelected.has(a._ref)).map((a) => a._ref);
+        if (refs.length === 0) {
+          setKeyHint(mode === "all" ? "当前网站没有账号" : "还没有勾选账号", "warn");
+          return;
+        }
+        const format = document.getElementById("keyCopyFormat").value;
+        const accounts = refs.map((r) => keyData[r]).filter(Boolean);
+        const { text, count, skipped } = buildKeyText(accounts, format);
+        if (count === 0) {
+          setKeyHint(
+            skipped ? "这些密钥还没取到完整值（站点限流），点密钥行的「显示」或账号行的 ↻ 重试" : "这些账号下没有可复制的密钥",
+            "warn",
+          );
+          return;
+        }
+        copyKeyText(
+          text,
+          `已复制 ${count} 个密钥（来自 ${accounts.length} 个账号）` + (skipped ? `，${skipped} 个未取到完整值已跳过` : ""),
+          !!skipped,
+        );
+      }
+
+      // 三种格式：纯密钥（喂给客户端）、带账号名（对账用）、JSON（脚本用）
+      function buildKeyText(accounts, format) {
+        const rows = [];
+        let skipped = 0;
+        accounts.forEach((a) => {
+          if (!a.success) return;
+          (a.keys || []).forEach((k) => {
+            if (k.masked) {
+              skipped++;
+              return;
+            }
+            rows.push({ account: a.name, provider: a.provider, name: k.name, key: "sk-" + k.key });
+          });
+        });
+        let text;
+        if (format === "json") text = JSON.stringify(rows, null, 2);
+        else if (format === "named") text = rows.map((r) => `${r.account}\t${r.name}\t${r.key}`).join("\n");
+        else text = rows.map((r) => r.key).join("\n");
+        return { text, count: rows.length, skipped };
+      }
+
+      // HTTP 页面没有 navigator.clipboard（非安全上下文），execCommand 兜底时
+      // textarea 必须真正可见且有尺寸，否则选区为空、复制出来是空白（踩过）。
+      async function copyKeyText(text, okMsg, warn) {
+        const holder = document.getElementById("keyCopyHolder");
+        holder.value = text;
+        let copied = false;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            copied = true;
+          }
+        } catch (e) {
+          /* 落到 execCommand */
+        }
+        if (!copied) {
+          try {
+            holder.classList.remove("hidden");
+            holder.focus();
+            holder.select();
+            holder.setSelectionRange(0, text.length);
+            copied = document.execCommand("copy");
+          } catch (e) {
+            copied = false;
+          }
+        }
+        if (copied) {
+          holder.classList.add("hidden");
+          setKeyHint(okMsg, warn ? "warn" : "");
+        } else {
+          holder.classList.remove("hidden");
+          setKeyHint("浏览器拒绝了自动复制，内容已显示在下方文本框，请手动 Ctrl+C", "warn");
+        }
+      }
+
+      async function stopCheckin() {
+        if (!confirm("确定停止当前签到流程吗？已签到的账号不受影响，未签到的账号本轮将不再签到。")) return;
+        try {
+          const resp = await authFetch("/api/login-accounts/checkin/stop", { method: "POST" });
+          const data = await resp.json();
+          if (!data.success) alert(data.error || "停止失败");
+          await pollCheckinStatus();
+        } catch (e) {
+          alert("网络请求失败: " + e.message);
+        }
+      }
+
+      async function pollCheckinStatus() {
+        try {
+          const resp = await authFetch("/api/login-accounts/checkin/status");
+          const data = await resp.json();
+          if (data.success) {
+            checkinStatus = data.status;
+            renderCheckinProgress();
+            renderAccountCards();
+            if (!checkinStatus.running) stopCheckinPolling();
+          }
+        } catch (e) {
+          /* 忽略轮询错误 */
+        }
+      }
+
+      function startCheckinPolling() {
+        if (checkinPollInterval) return;
+        checkinPollInterval = setInterval(pollCheckinStatus, 10000);
+      }
+
+      function stopCheckinPolling() {
+        if (checkinPollInterval) {
+          clearInterval(checkinPollInterval);
+          checkinPollInterval = null;
+        }
+      }
+
+      function renderCheckinProgress() {
+        const panel = document.getElementById("checkinProgress");
+        if (!checkinStatus || (!checkinStatus.total && !checkinStatus.started_at)) {
+          panel.classList.add("hidden");
+          return;
+        }
+        panel.classList.remove("hidden");
+        const s = checkinStatus;
+        const total = s.total || 0;
+        const done = s.done || 0;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        document.getElementById("checkinProgressBar").style.width = pct + "%";
+        document.getElementById("checkinRunningDot").classList.toggle("hidden", !s.running);
+        document.getElementById("checkinStopBtn").classList.toggle("hidden", !s.running);
+        document.getElementById("checkinProgressStat").textContent = `${done}/${total} 已处理 · 成功 ${s.signed || 0} · 失败 ${s.failed || 0}`;
+
+        let info = "";
+        if (s.running) {
+          if (s.current) {
+            info = `正在签到：${s.current}`;
+          } else if (s.next_at) {
+            info = `下一个账号将在 ${s.next_at} 签到`;
+          } else {
+            info = "签到流程进行中...";
+          }
+        } else if (s.finished_at) {
+          info = `本轮完成于 ${s.finished_at}（${s.trigger === "auto" ? "自动" : "手动"}触发）`;
+        }
+        if (s.next_at && s.running && !s.current) info += ``;
+        document.getElementById("checkinProgressInfo").textContent = info;
+
+        const statusMeta = {
+          signed: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          already: { cls: "bg-emerald-900/50 text-emerald-400", label: "✓" },
+          failed: { cls: "bg-red-900/50 text-red-400", label: "✗" },
+          pending: { cls: "bg-dark-600 text-gray-400", label: "·" },
+        };
+        const chips = (s.accounts || [])
+          .map((a) => {
+            let meta = statusMeta[a.status] || statusMeta.pending;
+            let extra = "";
+            if (a.name === s.current && s.running) {
+              meta = { cls: "bg-blue-900/60 text-blue-300 animate-pulse", label: "⟳" };
+            }
+            const title = a.message ? `${a.name}: ${a.message}` : a.name;
+            return `<span class="px-1.5 py-0.5 text-xs rounded ${meta.cls}" title="${title.replace(/"/g, "&quot;")}">${meta.label} ${a.name}</span>`;
+          })
+          .join("");
+        document.getElementById("checkinAccountStatus").innerHTML = chips;
+      }
+      // ========== 监控相关函数 ==========
+      let monitorPollInterval = null;
+
+      function openMonitorModal() {
+        document.getElementById("monitorModal").classList.remove("hidden");
+      }
+
+      function closeMonitorModal() {
+        document.getElementById("monitorModal").classList.add("hidden");
+      }
+
+      // ESC 关闭模态框
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          closeMonitorModal();
+          closeSiteManager();
+        }
+      });
+
+      function getAccounts() {
+        if (currentTab === "visual") {
+          return [...tokenAccounts, ...cookieAccounts];
+        }
+        const input = document.getElementById("accountInput").value.trim();
+        if (!input) return null;
+        try {
+          const accounts = JSON.parse(input);
+          if (!Array.isArray(accounts)) return null;
+          return accounts;
+        } catch {
+          return null;
+        }
+      }
+      function updateMonitorUI(status) {
+        const statusEl = document.getElementById("monitorStatus");
+        const startBtn = document.getElementById("startMonitorBtn");
+        const stopBtn = document.getElementById("stopMonitorBtn");
+        const timesEl = document.getElementById("monitorTimes");
+        const logsEl = document.getElementById("monitorLogs");
+        const indicator = document.getElementById("monitorIndicator");
+
+        if (status.running) {
+          statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span><span class="text-sm text-green-400">运行中</span>';
+          startBtn.disabled = true;
+          startBtn.classList.add("opacity-50", "cursor-not-allowed");
+          stopBtn.disabled = false;
+          indicator.classList.remove("hidden");
+        } else {
+          statusEl.innerHTML = '<span class="w-2 h-2 rounded-full bg-gray-500"></span><span class="text-sm text-gray-400">未启动</span>';
+          startBtn.disabled = false;
+          startBtn.classList.remove("opacity-50", "cursor-not-allowed");
+          stopBtn.disabled = true;
+          indicator.classList.add("hidden");
+        }
+
+        if (status.last_check || status.next_check) {
+          let timeText = [];
+          if (status.last_check) timeText.push(`上次: ${status.last_check}`);
+          if (status.next_check && status.running) timeText.push(`下次: ${status.next_check}`);
+          timesEl.textContent = timeText.join(" | ");
+        } else {
+          timesEl.textContent = "";
+        }
+
+        if (status.logs && status.logs.length > 0) {
+          logsEl.innerHTML = status.logs.map((l) => `<div class="py-0.5"><span class="text-gray-500">[${l.time}]</span> ${l.message}</div>`).join("");
+          logsEl.scrollTop = logsEl.scrollHeight;
+        }
+      }
+
+      async function fetchMonitorStatus() {
+        try {
+          const resp = await authFetch("/api/monitor/status");
+          const status = await resp.json();
+          updateMonitorUI(status);
+        } catch (e) {
+          console.error("获取监控状态失败:", e);
+        }
+      }
+
+      async function startMonitor() {
+        const accounts = getAccounts();
+        if (!accounts || accounts.length === 0) {
+          alert("请先添加账号");
+          return;
+        }
+        saveConfig();
+        const smtpServer = document.getElementById("smtpServer").value.trim();
+        const smtpPort = parseInt(document.getElementById("smtpPort").value) || 465;
+        const emailUser = document.getElementById("emailUser").value.trim();
+        const emailPass = document.getElementById("emailPass").value;
+        const emailTo = document.getElementById("emailTo").value.trim();
+        if (!smtpServer || !emailUser || !emailPass || !emailTo) {
+          alert("请填写完整的邮箱配置");
+          return;
+        }
+        const intervalHours = parseFloat(document.getElementById("monitorInterval").value) || 6;
+        const threshold = parseFloat(document.getElementById("monitorThreshold").value) || 10;
+        // 监控 API 只支持 cookie 格式账号，所以把所有账号转换为 cookie 格式
+        // 这里使用 cookieAccounts（如果有的话）
+        const req = {
+          accounts: cookieAccounts.length > 0 ? cookieAccounts : [],
+          email: {
+            smtp_server: smtpServer,
+            smtp_port: smtpPort,
+            email_user: emailUser,
+            email_pass: emailPass,
+            email_to: emailTo,
+          },
+          interval_hours: intervalHours,
+          threshold,
+        };
+        try {
+          const resp = await authFetch("/api/monitor/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(req),
+          });
+          const data = await resp.json();
+          if (!data.success) {
+            alert("启动失败: " + data.error);
+            return;
+          }
+          if (!monitorPollInterval) {
+            monitorPollInterval = setInterval(fetchMonitorStatus, 3000);
+          }
+          fetchMonitorStatus();
+        } catch (e) {
+          alert("启动监控失败: " + e.message);
+        }
+      }
+      async function stopMonitor() {
+        try {
+          const resp = await authFetch("/api/monitor/stop", { method: "POST" });
+          const data = await resp.json();
+          if (!data.success) {
+            alert("停止失败: " + data.error);
+          }
+          fetchMonitorStatus();
+        } catch (e) {
+          alert("停止监控失败: " + e.message);
+        }
+      }
+
+      // 后台预热 WAF cookies（不阻塞页面）
+      function warmupWAF() {
+        authFetch("/api/waf/warmup").catch(() => {});
+      }
+
+      // 页面加载时检查认证
+      checkAuth().then((authenticated) => {
+        if (authenticated) {
+          loadSavedConfig();
+          warmupWAF();
+          fetchMonitorStatus();
+          monitorPollInterval = setInterval(fetchMonitorStatus, 5000);
+        }
+      });
+    </script>
+  </body>
+</html>
