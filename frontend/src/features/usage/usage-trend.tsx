@@ -129,7 +129,7 @@ export function UsageTrend({ days, loading, title = "余额与消耗趋势" }: {
                 hide={hiddenSeries.has("spend")}
                 maxBarSize={32}
                 radius={[3, 3, 0, 0]}
-                animationDuration={700}
+                animationDuration={400}
                 animationEasing="ease-out"
               />
               <Area
@@ -142,7 +142,7 @@ export function UsageTrend({ days, loading, title = "余额与消耗趋势" }: {
                 hide={hiddenSeries.has("balance")}
                 dot={false}
                 activeDot={{ r: 3, fill: "var(--color-balance)", stroke: "var(--color-background)", strokeWidth: 2 }}
-                animationDuration={700}
+                animationDuration={400}
                 animationEasing="ease-out"
               />
               <Line
@@ -155,7 +155,7 @@ export function UsageTrend({ days, loading, title = "余额与消耗趋势" }: {
                 hide={hiddenSeries.has("gain")}
                 dot={false}
                 activeDot={{ r: 3, fill: "var(--color-gain)", stroke: "var(--color-background)", strokeWidth: 2 }}
-                animationDuration={700}
+                animationDuration={400}
                 animationEasing="ease-out"
               />
               <ChartLegend content={<TrendLegend config={chartConfig} hiddenSeries={hiddenSeries} onToggle={toggleSeries} />} />

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Activity, Coins, Flame, TrendingUp } from "lucide-react";
 import { Cell, Pie, PieChart } from "recharts";
@@ -8,6 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EmptyState, ErrorState, LoadingState } from "@/shared/components/data-state";
 import { KpiCard } from "@/shared/components/kpi-card";
+import { KpiSkeleton, Skeleton } from "@/shared/components/skeleton";
 import { PageHeader } from "@/shared/components/page-header";
 import { apiGet } from "@/shared/api/client";
 import { siteDotClass } from "@/shared/lib/site-color";
@@ -29,6 +30,27 @@ const PROVIDER_PALETTE = [
 ];
 
 const money = (v: number | null | undefined) => (v === null || v === undefined ? "--" : `$${v.toFixed(2)}`);
+
+const HeatmapRow = memo(function HeatmapRow({ name, provider, signedDays, days }: { name: string; provider: string; signedDays: Set<string>; days: { date: string }[] }) {
+  return (
+    <tr>
+      <td className="w-40 truncate pr-2 text-right text-[11px] text-muted-foreground">
+        <span className="flex items-center justify-end gap-1.5">
+          <span className={siteDotClass(provider)} aria-hidden="true" />
+          {name}
+        </span>
+      </td>
+      {days.map((d) => (
+        <td key={d.date}>
+          <span
+            title={`${name} · ${d.date}：${signedDays.has(d.date) ? "已签到" : "未签到 / 无数据"}`}
+            className={cn("block size-3 rounded-[3px]", signedDays.has(d.date) ? "bg-checkin-done/80" : "bg-muted")}
+          />
+        </td>
+      ))}
+    </tr>
+  );
+});
 
 const PERIODS = [
   { value: "7", label: "7 天" },
@@ -87,6 +109,12 @@ export function UsagePage() {
       />
 
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {historyQ.isLoading ? (
+          <>
+            <KpiSkeleton /><KpiSkeleton /><KpiSkeleton /><KpiSkeleton />
+          </>
+        ) : (
+          <>
         <KpiCard label="总余额" value={money(totalBalance)} sub={stats?.dateRange ? `截至 ${stats.dateRange[1]}` : undefined} icon={Coins} iconClass="text-site-0" delay={0} />
         <KpiCard
           label="近 7 日日均消耗"
@@ -105,6 +133,8 @@ export function UsagePage() {
           delay={120}
         />
         <KpiCard label={`签到收益（${period} 天）`} value={money(totalGain)} sub="按 quota 日增量统计" icon={TrendingUp} iconClass="text-checkin-done" delay={180} />
+          </>
+        )}
       </section>
 
       <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(280px,1fr)]">
@@ -215,26 +245,13 @@ export function UsagePage() {
         <h2 className="text-sm font-medium">签到热力图</h2>
         <p className="mt-1 text-xs text-muted-foreground">根据额度变化推算（后端未持久化签到历史，quota 较前一日增加即视为当日签到成功）</p>
         <div className="mt-3 overflow-x-auto">
-          {stats && stats.accounts.length > 0 ? (
+          {historyQ.isLoading ? (
+            <Skeleton className="h-40 w-full" />
+          ) : stats && stats.accounts.length > 0 ? (
             <table className="border-separate border-spacing-[2px]">
               <tbody>
                 {stats.accounts.map((a) => (
-                  <tr key={a.key}>
-                    <td className="w-40 truncate pr-2 text-right text-[11px] text-muted-foreground">
-                      <span className="flex items-center justify-end gap-1.5">
-                        <span className={siteDotClass(a.provider)} aria-hidden="true" />
-                        {a.name}
-                      </span>
-                    </td>
-                    {visibleDays.map((d) => (
-                      <td key={d.date}>
-                        <span
-                          title={`${a.name} · ${d.date}：${a.signedDays.has(d.date) ? "已签到" : "未签到 / 无数据"}`}
-                          className={cn("block size-3 rounded-[3px]", a.signedDays.has(d.date) ? "bg-checkin-done/80" : "bg-muted")}
-                        />
-                      </td>
-                    ))}
-                  </tr>
+                  <HeatmapRow key={a.key} name={a.name} provider={a.provider} signedDays={a.signedDays} days={visibleDays} />
                 ))}
               </tbody>
             </table>

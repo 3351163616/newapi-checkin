@@ -5,9 +5,11 @@ import { Link } from "react-router-dom";
 import { CalendarCheck, Coins, Flame, Wallet } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { ErrorState, LoadingState } from "@/shared/components/data-state";
 import { KpiCard } from "@/shared/components/kpi-card";
+import { KpiSkeleton } from "@/shared/components/skeleton";
 import { PageHeader } from "@/shared/components/page-header";
 import { siteDotClass } from "@/shared/lib/site-color";
 import { cn } from "@/shared/lib/cn";
@@ -69,10 +71,18 @@ export function DashboardPage() {
       <PageHeader title="总览" description="跨站点的余额、消耗与签到状态聚合" />
 
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {historyQ.isLoading ? (
+          <>
+            <KpiSkeleton /><KpiSkeleton /><KpiSkeleton /><KpiSkeleton />
+          </>
+        ) : (
+          <>
         <KpiCard label="总余额" value={money(totalBalance)} sub="全部站点合计" icon={Coins} iconClass="text-site-0" href="/accounts" delay={0} />
         <KpiCard label="今日消耗" value={money(todaySpend)} sub="相对当日首次快照" icon={Flame} iconClass="text-site-1" href="/usage" delay={60} />
         <KpiCard label="今日签到" value={chipAccounts.length > 0 ? `${signedCount} / ${chipAccounts.length}` : "--"} sub="已签到 / 总数" icon={CalendarCheck} iconClass="text-checkin-done" href="/checkin" delay={120} />
         <KpiCard label="账号 / 站点" value={`${stats?.accounts.length ?? 0} / ${stats?.providers.length ?? 0}`} sub="覆盖的站点与账号" icon={Wallet} iconClass="text-site-3" href="/sites" delay={180} />
+          </>
+        )}
       </section>
 
       <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(280px,1fr)]">
@@ -161,6 +171,91 @@ export function DashboardPage() {
           </div>
         </section>
       </div>
+
+      <section className="rounded-lg bg-card p-4 sm:p-5">
+        <div className="flex min-h-8 items-center justify-between gap-3">
+          <h2 className="text-sm font-medium">账号余额明细</h2>
+          <Button variant="secondary" size="sm" asChild>
+            <Link to="/accounts">账号管理</Link>
+          </Button>
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">来自每日快照的最新数据，无需手动查询</p>
+        <div className="mt-3">
+          {stats && stats.accounts.length > 0 ? (
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead>站点</TableHead>
+                  <TableHead>账号</TableHead>
+                  <TableHead className="text-right">余额</TableHead>
+                  <TableHead className="text-right">今日用量</TableHead>
+                  <TableHead className="text-right">日均消耗</TableHead>
+                  <TableHead className="text-right">预计剩余</TableHead>
+                  <TableHead>状态</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {stats.accounts.map((a, i) => {
+                  const level = healthLevel(a);
+                  const lastDay = stats.days[stats.days.length - 1];
+                  const todayUsed = lastDay && a.key in historyQ.data?.history[lastDay.date]! ? (historyQ.data!.history[lastDay.date]![a.key].used - historyQ.data!.history[lastDay.date]![a.key].used0) : null;
+                  return (
+                    <TableRow key={a.key} className="animate-in fade-in slide-in-from-bottom-1 fill-mode-both duration-300" style={{ animationDelay: `${Math.min(i, 10) * 30}ms` }}>
+                      <TableCell>
+                        <span className="flex items-center gap-1.5 text-xs">
+                          <span className={siteDotClass(a.provider)} aria-hidden="true" />
+                          {a.provider}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-xs font-medium">{a.name}</TableCell>
+                      <TableCell className={cn("text-right font-data text-xs tabular-nums", a.balance < 10 && "text-balance-low")}>{money(a.balance)}</TableCell>
+                      <TableCell className="text-right font-data text-xs tabular-nums">{todayUsed === null ? "--" : money(Math.max(0, todayUsed))}</TableCell>
+                      <TableCell className="text-right font-data text-xs tabular-nums">{money(a.burnRate7)}</TableCell>
+                      <TableCell className="text-right font-data text-xs tabular-nums">{a.daysLeft === null ? "∞" : `${Math.max(0, Math.floor(a.daysLeft))} 天`}</TableCell>
+                      <TableCell>
+                        <span className={cn("text-xs", healthTextClass[level])}>{healthLabel[level]}</span>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          ) : historyQ.isLoading ? (
+            <LoadingState className="min-h-24" />
+          ) : (
+            <p className="text-xs text-muted-foreground">暂无用量数据——先跑一次「查询余额」生成快照</p>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-lg bg-card p-4 sm:p-5">
+        <div className="flex min-h-8 items-center justify-between gap-3">
+          <h2 className="text-sm font-medium">最近签到日志</h2>
+          <Button variant="secondary" size="sm" asChild>
+            <Link to="/checkin">签到中心</Link>
+          </Button>
+        </div>
+        <div className="mt-3 grid gap-2 xl:grid-cols-2">
+          {[
+            { label: "AgentRouter", logs: loginStatusQ.data?.status.logs ?? [], tone: "text-site-1" },
+            { label: "Cookie 账号", logs: cookieStatusQ.data?.status.logs ?? [], tone: "text-site-0" },
+          ].map((src) => (
+            <div key={src.label} className="max-h-44 space-y-0.5 overflow-y-auto rounded-md bg-muted/40 p-2">
+              <p className={cn("sticky top-0 bg-muted/80 px-1 py-0.5 text-[11px] font-medium", src.tone)}>{src.label}</p>
+              {src.logs.length > 0 ? (
+                src.logs.slice(-8).reverse().map((l, i) => (
+                  <p key={`${src.label}-${l.time}-${i}`} className="animate-in fade-in px-1 font-data text-[11px] text-muted-foreground duration-200" style={{ animationDelay: `${i * 30}ms` }}>
+                    <span className="mr-1.5 opacity-60">{l.time}</span>
+                    {l.message}
+                  </p>
+                ))
+              ) : (
+                <p className="px-1 text-[11px] text-muted-foreground">暂无日志</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
