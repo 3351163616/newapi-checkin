@@ -5,6 +5,7 @@ AnyRouter 余额查询服务
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import random
@@ -17,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # anyrouter.top 与 agentrouter.org 现均需经本地代理（mihomo 7890）访问，且需浏览器级 TLS 指纹
 _LOCAL_PROXY = 'http://127.0.0.1:7890'
@@ -26,7 +27,7 @@ _AGENTROUTER_PROXY = _LOCAL_PROXY
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 
@@ -2000,10 +2001,39 @@ async def monitor_loop(config: MonitorStartRequest):
 	add_monitor_log('监控已停止')
 
 
+# ── 前端入口 ────────────────────────────────────────────────────────────────
+# frontend/ 是 Vite + React 工程，构建产物落在 frontend/dist/。
+# 有构建产物就服务它，没有就回退到 templates/index.html（旧的单文件前端），
+# 这样没装 Node 的环境 clone 下来依然开箱即用。
+FRONTEND_DIST = Path(__file__).parent / 'frontend' / 'dist'
+LEGACY_INDEX = Path(__file__).parent / 'templates' / 'index.html'
+
+
+def frontend_index() -> Path | None:
+	"""当前该用哪个前端入口。构建产物优先，其次旧前端，都没有则 None。
+
+	每次调用都重新判断（不缓存）—— 这样 `pnpm build` 完不必重启服务，
+	与旧前端「改完刷新即可」的开发体验保持一致。
+	"""
+	dist_index = FRONTEND_DIST / 'index.html'
+	if dist_index.is_file():
+		return dist_index
+	if LEGACY_INDEX.is_file():
+		return LEGACY_INDEX
+	return None
+
+
 @app.get('/', response_class=HTMLResponse)
 async def index():
-	with open('templates/index.html', encoding='utf-8') as f:
-		return f.read()
+	entry = frontend_index()
+	if entry is None:
+		return HTMLResponse(
+			'<h1>前端资源缺失</h1><p>既没有 <code>frontend/dist/index.html</code>，'
+			'也没有 <code>templates/index.html</code>。</p>'
+			'<p>请在 <code>frontend/</code> 下执行 <code>pnpm install &amp;&amp; pnpm build</code>。</p>',
+			status_code=503,
+		)
+	return entry.read_text(encoding='utf-8')
 
 
 @app.get('/api/config')
@@ -4329,6 +4359,109 @@ async def manual_snapshot():
 	"""手动触发快照（用于测试或补录）"""
 	await take_daily_snapshot()
 	return {'success': True, 'message': '快照已执行'}
+
+
+def mask_proxy_url(url: str) -> str:
+	"""把代理 URL 里的认证凭据打码。
+
+	代理可能写成 http://user:pass@host:port，原样吐给前端会经由 devtools、
+	截图或录屏泄露出去。主机和端口保留 —— 那才是排障要看的东西。
+
+	只在 authority 段（`://` 之后、第一个 `/` 之前）动手，并且按**最后一个** `@`
+	切分：密码本身可能含 `@`（`user:p@ssw0rd@host`），按第一个 `@` 切会把
+	`ssw0rd` 原样留下 —— 半截密码照样是泄露。host 段不允许出现 `@`，
+	所以最后一个 `@` 之前的一律是 userinfo。
+	"""
+	if not url:
+		return ''
+	m = re.match(r'^([A-Za-z0-9+.\-]+://)([^/]*)(.*)$', url)
+	if not m:
+		return url
+	scheme, authority, rest = m.groups()
+	if '@' in authority:
+		authority = '***:***@' + authority.rsplit('@', 1)[1]
+	return scheme + authority + rest
+
+
+async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
+	"""探测 TCP 端口是否可连。用于判断本地代理有没有真的在跑。"""
+	try:
+		_, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+		writer.close()
+		with contextlib.suppress(Exception):
+			await writer.wait_closed()
+		return True
+	except Exception:
+		return False
+
+
+@app.get('/api/system/proxy-info')
+async def get_proxy_info(probe: bool = False):
+	"""只读展示代理相关配置，供前端「设置」页做诊断。
+
+	这些值来自环境变量 / .env，前端改不了（改完要重启服务），所以纯只读。
+	之所以值得暴露：访问 anyrouter / agentrouter 必须走本地代理，代理没起来时
+	表现为一句藏在服务端日志里的 `[WAF] Failed to connect to 127.0.0.1:7890`，
+	用户在界面上完全看不到，只会觉得"查询莫名其妙失败"。
+
+	带 ?probe=true 时会实际连一下代理端口确认是否在跑。
+	"""
+	source = 'default'
+	if os.environ.get('HTTPS_PROXY'):
+		source = 'HTTPS_PROXY'
+	elif os.environ.get('HTTP_PROXY'):
+		source = 'HTTP_PROXY'
+
+	reachable = None
+	if probe:
+		parsed = urlparse(_PROXY)
+		if parsed.hostname and parsed.port:
+			reachable = await probe_tcp(parsed.hostname, parsed.port)
+
+	return {
+		'success': True,
+		'proxy': {
+			'url': mask_proxy_url(_PROXY),
+			'source': source,
+			'has_credentials': '@' in _PROXY.split('://', 1)[-1].split('/', 1)[0],
+			'reachable': reachable,
+		},
+		'mihomo': {
+			'group': MIHOMO_GROUP,
+			# 组名为空时不做出口轮换，是有意的安全降级而非故障
+			'rotation_enabled': bool(MIHOMO_GROUP),
+			'config_path': str(MIHOMO_CONFIG_FILE),
+			'config_exists': MIHOMO_CONFIG_FILE.is_file(),
+		},
+	}
+
+
+# ── 前端静态资源与 SPA 路由回退 ──────────────────────────────────────────────
+# 必须注册在所有 /api 路由之后：FastAPI 按注册顺序匹配，这个 catch-all 放前面
+# 会把所有接口都吃掉。
+@app.get('/{full_path:path}')
+async def frontend_catch_all(full_path: str):
+	"""服务构建产物里的静态文件，其余路径交还给前端路由。
+
+	新前端用 react-router 的 BrowserRouter，/dashboard、/accounts 这类路径在服务端
+	并不存在，直接访问或刷新会 404，所以要回退到 index.html 由前端接管。
+	"""
+	# 未匹配到任何已注册接口的 /api 路径，按 API 语义返回 JSON 而不是 HTML，
+	# 否则前端的 fetch 会拿到一坨 HTML 然后在 JSON.parse 处炸掉，难以排查。
+	if full_path == 'api' or full_path.startswith('api/'):
+		return JSONResponse({'success': False, 'error': f'未知接口: /{full_path}'}, status_code=404)
+
+	# 命中构建产物里的真实文件就直接返回（assets/*.js、favicon 等）
+	if FRONTEND_DIST.is_dir():
+		candidate = (FRONTEND_DIST / full_path).resolve()
+		# 防目录穿越：解析后必须仍在 dist 内
+		if candidate.is_file() and candidate.is_relative_to(FRONTEND_DIST.resolve()):
+			return FileResponse(candidate)
+
+	entry = frontend_index()
+	if entry is None:
+		return JSONResponse({'success': False, 'error': '前端资源缺失'}, status_code=503)
+	return HTMLResponse(entry.read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':
