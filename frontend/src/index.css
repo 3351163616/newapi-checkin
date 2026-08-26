@@ -1,0 +1,221 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ────────────────────────────────────────────────────────────────────────────
+   设计 token
+   架构移植自 grok2api v3.1.5 的 src/index.css：oklch 色彩空间、UI 部分走
+   neutral 灰阶（chroma = 0）、:root / .dark 双主题、@theme inline 映射。
+
+   在其之上扩展了本项目的业务语义色。手法沿用 grok2api 的 --quota-product-N：
+   界面本身保持灰阶克制，只把颜色让给需要靠颜色区分的数据。
+   ──────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --radius: 0.5rem;
+  --background: oklch(0.995 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(0.975 0.002 90);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.12 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.965 0.002 90);
+  --secondary-foreground: oklch(0.2 0 0);
+  --muted: oklch(0.965 0.002 90);
+  --muted-foreground: oklch(0.55 0 0);
+  --accent: oklch(0.95 0.003 90);
+  --accent-foreground: oklch(0.16 0 0);
+  --destructive: oklch(0.58 0.22 27);
+  --border: oklch(0.91 0 0);
+  --input: oklch(0.9 0 0);
+  --ring: var(--border);
+  --sidebar: oklch(0.995 0 0);
+  --sidebar-foreground: oklch(0.18 0 0);
+  --sidebar-primary: oklch(0.12 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.96 0 0);
+  --sidebar-accent-foreground: oklch(0.14 0 0);
+  --sidebar-border: oklch(0.93 0 0);
+
+  /* 签到三态。色相锁定 155/80/25，站点色一律避开这三个，避免语义混淆 */
+  --checkin-done: oklch(0.6 0.15 155);
+  --checkin-pending: oklch(0.7 0.15 80);
+  --checkin-failed: oklch(0.58 0.19 25);
+
+  /* 余额告警 */
+  --balance-low: oklch(0.65 0.18 45);
+
+  /* 站点标识色。色相 235/285/320/195/265/350，与上面的语义色相互不干扰 */
+  --site-0: oklch(0.62 0.15 235);
+  --site-1: oklch(0.6 0.16 285);
+  --site-2: oklch(0.62 0.16 320);
+  --site-3: oklch(0.62 0.13 195);
+  --site-4: oklch(0.6 0.15 265);
+  --site-5: oklch(0.62 0.17 350);
+}
+
+.dark {
+  /* 暗夜模式：深蓝灰，刻意避开纯黑 —— 纯黑在 OLED 上发灰、在 LCD 上发闷，
+     且与任何元素都无法形成边界。0.15 亮度 + 极低蓝相既"黑"又透气。 */
+  --background: oklch(0.15 0.005 250);
+  --foreground: oklch(0.96 0 0);
+  --card: oklch(0.19 0.005 250);
+  --card-foreground: oklch(0.96 0 0);
+  --popover: oklch(0.185 0.005 250);
+  --popover-foreground: oklch(0.96 0 0);
+  --primary: oklch(0.97 0 0);
+  --primary-foreground: oklch(0.14 0 0);
+  --secondary: oklch(0.23 0.004 250);
+  --secondary-foreground: oklch(0.95 0 0);
+  --muted: oklch(0.23 0.004 250);
+  --muted-foreground: oklch(0.66 0 0);
+  --accent: oklch(0.26 0.004 250);
+  --accent-foreground: oklch(0.97 0 0);
+  --destructive: oklch(0.65 0.2 28);
+  --border: oklch(0.29 0.005 250);
+  --input: oklch(0.32 0.005 250);
+  --ring: var(--border);
+  --sidebar: oklch(0.17 0.005 250);
+  --sidebar-foreground: oklch(0.93 0 0);
+  --sidebar-primary: oklch(0.97 0 0);
+  --sidebar-primary-foreground: oklch(0.14 0 0);
+  --sidebar-accent: oklch(0.24 0.004 250);
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(0.27 0.005 250);
+
+  /* 深色底下提亮度，与 grok2api 的 light→dark 调整规律一致 */
+  --checkin-done: oklch(0.72 0.13 155);
+  --checkin-pending: oklch(0.8 0.13 80);
+  --checkin-failed: oklch(0.7 0.16 25);
+
+  --balance-low: oklch(0.75 0.15 45);
+
+  --site-0: oklch(0.74 0.12 235);
+  --site-1: oklch(0.72 0.13 285);
+  --site-2: oklch(0.74 0.13 320);
+  --site-3: oklch(0.74 0.11 195);
+  --site-4: oklch(0.72 0.12 265);
+  --site-5: oklch(0.74 0.14 350);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  --color-checkin-done: var(--checkin-done);
+  --color-checkin-pending: var(--checkin-pending);
+  --color-checkin-failed: var(--checkin-failed);
+  --color-balance-low: var(--balance-low);
+
+  --color-site-0: var(--site-0);
+  --color-site-1: var(--site-1);
+  --color-site-2: var(--site-2);
+  --color-site-3: var(--site-3);
+  --color-site-4: var(--site-4);
+  --color-site-5: var(--site-5);
+
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+}
+
+* {
+  border-color: var(--border);
+}
+
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    border-radius: 5px;
+    background: var(--border);
+  }
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+html {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  letter-spacing: 0;
+  text-rendering: optimizeLegibility;
+}
+
+/* 密钥 / token / 账号 ID 这类数据内容用等宽：能对齐、能防 0/O 与 l/1 混淆。
+   仅限数据本身，UI 文本一律走 Inter。 */
+.font-data {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-variant-ligatures: none;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--primary) 24%, transparent);
+}
+
+:focus-visible {
+  outline-color: var(--ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
