@@ -70,7 +70,8 @@ export function KeysPage() {
   const tokenQ = useQuery({ queryKey: ["accounts", "token"], queryFn: fetchTokenAccounts });
   const cookieQ = useQuery({ queryKey: ["accounts", "cookie"], queryFn: fetchSavedConfig });
   const loginQ = useQuery({ queryKey: ["accounts", "login"], queryFn: fetchLoginAccounts });
-  const sites = sitesQ.data ?? [];
+  // useMemo 稳定引用：避免兜底空数组每次渲染新建引用，扰动下游 useQuery 的依赖判断
+  const sites = useMemo(() => sitesQ.data ?? [], [sitesQ.data]);
   const siteAccountsQ = useQuery({
     queryKey: ["accounts", "site-accounts", sites.map((s) => s.id)] as const,
     queryFn: async () => {

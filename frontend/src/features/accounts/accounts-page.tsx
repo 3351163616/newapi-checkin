@@ -21,7 +21,7 @@ import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { siteDotClass } from "@/shared/lib/site-color";
 import { cn } from "@/shared/lib/cn";
 import type { AccountRef } from "@/shared/lib/account-ref";
-import type { CookieAccount, LoginAccount, QueryResult, QueryResultSuccess, SiteAccount, TokenAccount } from "@/types";
+import type { QueryResult, QueryResultSuccess, SiteAccount } from "@/types";
 
 import {
   fetchLoginAccounts,
@@ -119,7 +119,9 @@ export function AccountsPage() {
   const cookieQ = useQuery({ queryKey: ["accounts", "cookie"], queryFn: fetchSavedConfig });
   const tokenQ = useQuery({ queryKey: ["accounts", "token"], queryFn: fetchTokenAccounts });
   const loginQ = useQuery({ queryKey: ["accounts", "login"], queryFn: fetchLoginAccounts });
-  const sites = sitesQ.data ?? [];
+  // useMemo 稳定引用：data 未就绪时的兜底空数组若每次渲染都新建，下游 useMemo/useQuery 的
+  // 结构化依赖会被判为「每次都变」，引发无意义的重算与请求重建
+  const sites = useMemo(() => sitesQ.data ?? [], [sitesQ.data]);
   const siteAccountsQ = useQuery({
     queryKey: ["accounts", "site-accounts", sites.map((s) => s.id)] as const,
     queryFn: async () => {
@@ -746,5 +748,3 @@ export function AccountsPage() {
     </div>
   );
 }
-
-export type { CookieAccount, LoginAccount, TokenAccount };

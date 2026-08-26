@@ -90,17 +90,24 @@ function unwrapEnvelope<T>(payload: unknown, status: number): T {
     if (payload.success === false) {
       throw new ApiError(status, extractErrorMessage(payload, status));
     }
-    const { success, ...rest } = payload;
+    // _success 是刻意丢弃的信封字段（下划线前缀供 eslint 的 varsIgnorePattern 识别）
+    const { success: _success, ...rest } = payload;
     return rest as T;
   }
   return payload as T;
 }
 
 export interface ApiRequestOptions {
+  /** 外部中止信号（如 React Query queryFn 收到的 signal），切走页面时取消在途请求 */
   signal?: AbortSignal;
+  /**
+   * 超时毫秒数；不传则不限时 —— 本项目有多个分钟级的慢端点（余额查询 / 一键全签），
+   * 一刀切的默认超时会把它们误杀，所以由调用方按端点快慢自行指定。
+   */
+  timeoutMs?: number;
 }
 
-async function request<T>(path: string, init: RequestInit): Promise<T> {
+async function request<T>(path: string, init: RequestInit, options: ApiRequestOptions): Promise<T> {
   const headers = new Headers(init.headers);
   const token = getAuthToken();
   if (token) {
@@ -110,14 +117,27 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
+  // 外部 signal 与超时 signal 合并：任一触发都中止请求
+  const signals: AbortSignal[] = [];
+  if (options.signal) signals.push(options.signal);
+  if (options.timeoutMs !== undefined) signals.push(AbortSignal.timeout(options.timeoutMs));
+  const signal = signals.length > 0 ? AbortSignal.any(signals) : undefined;
+
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
-  } catch {
+    response = await fetch(`${API_BASE}${path}`, { ...init, headers, signal });
+  } catch (error) {
+    if (options.signal?.aborted) {
+      // 调用方主动取消：保持 AbortError 语义，让 React Query 正确识别「已取消」而非失败
+      throw error instanceof Error ? error : new DOMException("Aborted", "AbortError");
+    }
+    if (signal?.aborted) {
+      throw new ApiError(0, "请求超时，请重试");
+    }
     throw new ApiError(0, "网络错误，请检查连接后重试");
   }
 
-  let payload: unknown = null;
+  let payload: unknown;
   try {
     payload = await response.json();
   } catch {
@@ -134,13 +154,16 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
 }
 
 export function apiGet<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
-  return request<T>(path, { method: "GET", signal: options.signal });
+  return request<T>(path, { method: "GET" }, options);
 }
 
 export function apiPost<T>(path: string, body?: unknown, options: ApiRequestOptions = {}): Promise<T> {
-  return request<T>(path, {
-    method: "POST",
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: options.signal,
-  });
+  return request<T>(
+    path,
+    {
+      method: "POST",
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    options
+  );
 }

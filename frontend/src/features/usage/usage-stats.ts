@@ -62,12 +62,13 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
     const day = history.history[date]!;
     let balance = 0;
     let spend = 0;
-    let gain = 0;
     for (const entry of Object.values(day)) {
       balance += entry.quota - entry.used;
       spend += Math.max(0, entry.used - entry.used0);
     }
-    return { date, balance: round2(balance), spend: round2(spend), gain: round2(gain) };
+    // gain 先置 0：精确的逐日签到收益在下面用 computeDailyGains 回填
+    // （按天聚合时拿不到前一日的 quota，在这里算不出增量）
+    return { date, balance: round2(balance), spend: round2(spend), gain: 0 };
   });
 
   // ── 按账号聚合 ──
@@ -79,7 +80,6 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
   for (const key of accountKeys) {
     const [provider, ...rest] = key.split(":");
     const name = rest.join(":");
-    let balance = 0;
     let spend = 0;
     let gain = 0;
     let prevQuota: number | null = null;
@@ -103,7 +103,7 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
     }
 
     const last = lastDay[key]!;
-    balance = round2(last.quota - last.used);
+    const balance = round2(last.quota - last.used);
     const last7 = spends.slice(-7);
     const last30 = spends.slice(-30);
     const burn7 = last7.length > 0 ? last7.reduce((a, b) => a + b, 0) / last7.length : 0;

@@ -198,7 +198,8 @@ export function DashboardPage() {
                 {stats.accounts.map((a, i) => {
                   const level = healthLevel(a);
                   const lastDay = stats.days[stats.days.length - 1];
-                  const todayUsed = lastDay && a.key in historyQ.data?.history[lastDay.date]! ? (historyQ.data!.history[lastDay.date]![a.key].used - historyQ.data!.history[lastDay.date]![a.key].used0) : null;
+                  const dayEntry = lastDay ? historyQ.data?.history[lastDay.date]?.[a.key] : undefined;
+                  const todayUsed = dayEntry ? dayEntry.used - dayEntry.used0 : null;
                   return (
                     <TableRow key={a.key} className="animate-in fade-in slide-in-from-bottom-1 fill-mode-both duration-300" style={{ animationDelay: `${Math.min(i, 10) * 30}ms` }}>
                       <TableCell>

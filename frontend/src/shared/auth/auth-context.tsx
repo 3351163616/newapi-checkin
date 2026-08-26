@@ -33,6 +33,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // 旧请求晚于新请求返回时会把状态带回过时的结果。
   const restoreRequestSeq = useRef(0);
 
+  /**
+   * 纯查询：问后端 token 是否有效，返回应迁移到的状态，全程不碰 setState。
+   * 401 时 client.ts 已经清过 token 并广播过 onUnauthorized（订阅方在下面的 effect 里）。
+   * 永不 reject，调用方无需 catch。
+   */
+  const fetchAuthStatus = useCallback(async (): Promise<AuthStatus> => {
+    try {
+      const result = await apiGet<CheckAuthResponse>("/check-auth");
+      if (result.authenticated) return "authenticated";
+      clearAuthToken();
+      return "anonymous";
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) return "anonymous";
+      // 网络错误或服务端异常：token 未必失效，别清掉，留给用户重试
+      return "unavailable";
+    }
+  }, []);
+
+  /** 应用一次查询结果；只采信「最后发起的那一次」，旧请求晚到不会带回过时状态 */
+  const applyFetchedStatus = useCallback((promise: Promise<AuthStatus>) => {
+    const seq = ++restoreRequestSeq.current;
+    void promise.then((next) => {
+      if (seq === restoreRequestSeq.current) setStatus(next);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!getAuthToken()) return; // 无 token：初始状态已是 anonymous，无需动作
+    applyFetchedStatus(fetchAuthStatus());
+    return onUnauthorized(() => setStatus("anonymous"));
+  }, [applyFetchedStatus, fetchAuthStatus]);
+
+  /** 用户手动触发（「无法连接服务器」的重试按钮）：先切到 restoring 给 UI 反馈再查询 */
   const restoreSession = useCallback(async (): Promise<void> => {
     const token = getAuthToken();
     if (!token) {
@@ -40,32 +73,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     setStatus("restoring");
-    const seq = ++restoreRequestSeq.current;
-    try {
-      const result = await apiGet<CheckAuthResponse>("/check-auth");
-      if (seq !== restoreRequestSeq.current) return;
-      if (result.authenticated) {
-        setStatus("authenticated");
-      } else {
-        clearAuthToken();
-        setStatus("anonymous");
-      }
-    } catch (error) {
-      if (seq !== restoreRequestSeq.current) return;
-      if (error instanceof ApiError && error.status === 401) {
-        // client.ts 在 401 时已经清过 token 并广播过 onUnauthorized，这里只是同步状态
-        setStatus("anonymous");
-      } else {
-        // 网络错误或服务端异常：token 未必失效，别清掉，留给用户重试
-        setStatus("unavailable");
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    void restoreSession();
-    return onUnauthorized(() => setStatus("anonymous"));
-  }, [restoreSession]);
+    applyFetchedStatus(fetchAuthStatus());
+  }, [applyFetchedStatus, fetchAuthStatus]);
 
   const login = useCallback(async (username: string, password: string): Promise<void> => {
     const result = await apiPost<LoginResponse>("/login", { username, password });

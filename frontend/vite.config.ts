@@ -25,5 +25,22 @@ export default defineConfig({
     // 产物直接交给 balance_server.py 托管
     outDir: "dist",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        /**
+         * vendor 分包：react/react-dom/react-router/radix 这些几乎不变的运行时单独成块，
+         * 业务代码迭代发版时它们的 hash 保持稳定，浏览器缓存不至于整包失效。
+         * 页面级拆分已由 deferred-pages.tsx 的路由懒加载完成（recharts 等重依赖只在
+         * dashboard/usage 的异步 chunk 里），这里只补「框架层」这一刀。
+         */
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("lucide-react")) return "vendor-icons";
+          if (id.includes("react") || id.includes("radix-ui") || id.includes("sonner")) return "vendor-react";
+          if (id.includes("recharts") || id.includes("victory-vendor") || id.includes("d3-")) return "vendor-charts";
+          return "vendor";
+        },
+      },
+    },
   },
 });

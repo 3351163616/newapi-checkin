@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { ErrorState, LoadingState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
 import { apiGet, apiPost } from "@/shared/api/client";
-import type { CookieAccount, MonitorStatus, SavedConfig } from "@/types";
+import type { CookieAccount, MonitorEmailConfig, MonitorStatus, SavedConfig } from "@/types";
 
 import { errorMessage } from "@/features/checkin/checkin-format";
 
@@ -29,6 +29,108 @@ const emailSchema = z.object({
   email_to: z.string().email("收件邮箱格式不对"),
 });
 
+interface StartMonitorValues {
+  email: MonitorEmailConfig;
+  interval_hours: number;
+  threshold: number;
+}
+
+/**
+ * 监控告警表单。初始值来自 saved_config.json（SMTP 密码刻意不落盘，见 SavedEmailConfig 注释，
+ * 所以每次启动监控都要重新输入授权码）。
+ *
+ * 由父组件在 configQ 数据就绪后才挂载（条件渲染），useState 初始化器天然拿到正确初值——
+ * 不要在父组件里用「render 中 setState 回填 + hydrated 标志」的老办法，那会让整棵表单
+ * 白渲染一轮（React 会丢弃带 setState 的那次渲染立即重放）。
+ */
+function MonitorForm({
+  config,
+  monitor,
+  submitting,
+  onSubmit,
+}: {
+  config: SavedConfig;
+  monitor: MonitorStatus | undefined;
+  submitting: boolean;
+  onSubmit: (values: StartMonitorValues) => void;
+}) {
+  const [smtpServer, setSmtpServer] = useState(config.email?.smtp_server ?? "");
+  const [smtpPort, setSmtpPort] = useState(String(config.email?.smtp_port ?? 465));
+  const [emailUser, setEmailUser] = useState(config.email?.email_user ?? "");
+  const [emailPass, setEmailPass] = useState("");
+  const [emailTo, setEmailTo] = useState(config.email?.email_to ?? "");
+  const [interval, setIntervalHours] = useState(String(config.monitor?.interval ?? 6));
+  const [threshold, setThreshold] = useState(String(config.monitor?.threshold ?? 10));
+  const [showPass, setShowPass] = useState(false);
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const parsed = emailSchema.safeParse({ smtp_server: smtpServer, smtp_port: smtpPort, email_user: emailUser, email_pass: emailPass, email_to: emailTo });
+    if (!parsed.success) {
+      toast.error(parsed.error.issues[0]?.message ?? "表单有误");
+      return;
+    }
+    onSubmit({ email: parsed.data, interval_hours: Number(interval) || 6, threshold: Number(threshold) || 10 });
+  }
+
+  return (
+    <form className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" onSubmit={handleSubmit}>
+      <div className="space-y-1">
+        <Label htmlFor="smtp-server" className="text-xs">SMTP 服务器</Label>
+        <Input id="smtp-server" value={smtpServer} onChange={(e) => setSmtpServer(e.target.value)} className="h-8 text-xs" placeholder="smtp.example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="smtp-port" className="text-xs">端口</Label>
+        <Input id="smtp-port" value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-user" className="text-xs">发件邮箱</Label>
+        <Input id="email-user" value={emailUser} onChange={(e) => setEmailUser(e.target.value)} className="h-8 text-xs" placeholder="bot@example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-pass" className="text-xs">密码 / 授权码</Label>
+        <div className="relative">
+          <Input
+            id="email-pass"
+            type={showPass ? "text" : "password"}
+            autoComplete="new-password"
+            value={emailPass}
+            onChange={(e) => setEmailPass(e.target.value)}
+            className="h-8 pr-8 text-xs"
+            placeholder="••••••••"
+          />
+          <button
+            type="button"
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            onClick={() => setShowPass((v) => !v)}
+            aria-label={showPass ? "隐藏密码" : "显示密码"}
+          >
+            {showPass ? <EyeOff className="size-3.5" aria-hidden="true" /> : <Eye className="size-3.5" aria-hidden="true" />}
+          </button>
+        </div>
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-to" className="text-xs">收件邮箱</Label>
+        <Input id="email-to" value={emailTo} onChange={(e) => setEmailTo(e.target.value)} className="h-8 text-xs" placeholder="you@example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="monitor-interval" className="text-xs">检查间隔（小时）</Label>
+        <Input id="monitor-interval" value={interval} onChange={(e) => setIntervalHours(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="monitor-threshold" className="text-xs">告警阈值（$）</Label>
+        <Input id="monitor-threshold" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="h-8 font-data text-xs" inputMode="decimal" />
+      </div>
+      <div className="flex items-end">
+        <Button type="submit" className="w-full sm:w-auto" disabled={submitting || monitor?.running}>
+          {submitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
+          启动监控
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
 
@@ -40,39 +142,11 @@ export function SettingsPage() {
   });
   const proxyQ = useQuery({ queryKey: ["system", "proxy-info"], queryFn: () => apiGet<ProxyInfo>("/system/proxy-info"), retry: false });
   const [probingProxy, setProbingProxy] = useState(false);
-
-  const [smtpServer, setSmtpServer] = useState("");
-  const [smtpPort, setSmtpPort] = useState("465");
-  const [emailUser, setEmailUser] = useState("");
-  const [emailPass, setEmailPass] = useState("");
-  const [emailTo, setEmailTo] = useState("");
-  const [interval, setIntervalHours] = useState("6");
-  const [threshold, setThreshold] = useState("10");
-  const [showPass, setShowPass] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [hydrated, setHydrated] = useState(false);
-
-  if (configQ.data && !hydrated) {
-    const cfg = configQ.data;
-    setSmtpServer(cfg.email?.smtp_server ?? "");
-    setSmtpPort(String(cfg.email?.smtp_port ?? 465));
-    setEmailUser(cfg.email?.email_user ?? "");
-    setEmailTo(cfg.email?.email_to ?? "");
-    setIntervalHours(String(cfg.monitor?.interval ?? 6));
-    setThreshold(String(cfg.monitor?.threshold ?? 10));
-    setHydrated(true);
-  }
 
   const monitor = monitorQ.data;
 
-  async function onSubmit(event: FormEvent) {
-    event.preventDefault();
-    if (submitting) return;
-    const parsed = emailSchema.safeParse({ smtp_server: smtpServer, smtp_port: smtpPort, email_user: emailUser, email_pass: emailPass, email_to: emailTo });
-    if (!parsed.success) {
-      toast.error(parsed.error.issues[0]?.message ?? "表单有误");
-      return;
-    }
+  async function startMonitor(values: StartMonitorValues) {
     const accounts: CookieAccount[] = configQ.data?.accounts ?? [];
     if (accounts.length === 0) {
       toast.error("没有 cookie 账号可监控——先去「账号管理」添加");
@@ -82,9 +156,9 @@ export function SettingsPage() {
     try {
       await apiPost("/monitor/start", {
         accounts,
-        email: parsed.data,
-        interval_hours: Number(interval) || 6,
-        threshold: Number(threshold) || 10,
+        email: values.email,
+        interval_hours: values.interval_hours,
+        threshold: values.threshold,
       });
       await queryClient.invalidateQueries({ queryKey: ["monitor"] });
       toast.success("监控已启动");
@@ -149,60 +223,15 @@ export function SettingsPage() {
           </p>
         ) : null}
 
-        <form className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" onSubmit={onSubmit}>
-          <div className="space-y-1">
-            <Label htmlFor="smtp-server" className="text-xs">SMTP 服务器</Label>
-            <Input id="smtp-server" value={smtpServer} onChange={(e) => setSmtpServer(e.target.value)} className="h-8 text-xs" placeholder="smtp.example.com" />
+        {configQ.isPending ? (
+          <LoadingState className="min-h-24" />
+        ) : configQ.data ? (
+          <MonitorForm config={configQ.data} monitor={monitor} submitting={submitting} onSubmit={(v) => void startMonitor(v)} />
+        ) : (
+          <div className="mt-4">
+            <ErrorState message={errorMessage(configQ.error, "配置加载失败")} onRetry={() => void configQ.refetch()} />
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="smtp-port" className="text-xs">端口</Label>
-            <Input id="smtp-port" value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="email-user" className="text-xs">发件邮箱</Label>
-            <Input id="email-user" value={emailUser} onChange={(e) => setEmailUser(e.target.value)} className="h-8 text-xs" placeholder="bot@example.com" />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="email-pass" className="text-xs">密码 / 授权码</Label>
-            <div className="relative">
-              <Input
-                id="email-pass"
-                type={showPass ? "text" : "password"}
-                autoComplete="new-password"
-                value={emailPass}
-                onChange={(e) => setEmailPass(e.target.value)}
-                className="h-8 pr-8 text-xs"
-                placeholder="••••••••"
-              />
-              <button
-                type="button"
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                onClick={() => setShowPass((v) => !v)}
-                aria-label={showPass ? "隐藏密码" : "显示密码"}
-              >
-                {showPass ? <EyeOff className="size-3.5" aria-hidden="true" /> : <Eye className="size-3.5" aria-hidden="true" />}
-              </button>
-            </div>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="email-to" className="text-xs">收件邮箱</Label>
-            <Input id="email-to" value={emailTo} onChange={(e) => setEmailTo(e.target.value)} className="h-8 text-xs" placeholder="you@example.com" />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="monitor-interval" className="text-xs">检查间隔（小时）</Label>
-            <Input id="monitor-interval" value={interval} onChange={(e) => setIntervalHours(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="monitor-threshold" className="text-xs">告警阈值（$）</Label>
-            <Input id="monitor-threshold" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="h-8 font-data text-xs" inputMode="decimal" />
-          </div>
-          <div className="flex items-end">
-            <Button type="submit" className="w-full sm:w-auto" disabled={submitting || monitor?.running}>
-              {submitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
-              启动监控
-            </Button>
-          </div>
-        </form>
+        )}
 
         {monitor?.logs && monitor.logs.length > 0 ? (
           <div className="mt-4 max-h-32 space-y-0.5 overflow-y-auto rounded-md bg-muted/40 p-2">
