@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AnyRouter 余额查询</title>
+    <title>New API Balance Manager</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -72,7 +72,7 @@
     <div id="loginOverlay" class="fixed inset-0 z-[100] flex items-center justify-center bg-dark-900">
       <div class="bg-dark-800 rounded-xl p-8 shadow-2xl w-full max-w-md mx-4">
         <div class="text-center mb-8">
-          <h1 class="text-2xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">AnyRouter 余额查询</h1>
+          <h1 class="text-2xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">New API Balance Manager</h1>
           <p class="text-gray-400 mt-2">请登录以继续</p>
         </div>
         <form id="loginForm" class="space-y-5">
@@ -109,8 +109,8 @@
     <div class="container mx-auto px-4 py-8 max-w-6xl flex-1 flex flex-col">
       <!-- Header -->
       <div class="text-center mb-10 relative">
-        <h1 class="text-4xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">AnyRouter 余额查询</h1>
-        <p class="text-gray-400 mt-2">批量查询账号余额，支持 JSON 格式输入</p>
+        <h1 class="text-4xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">New API Balance Manager</h1>
+        <p class="text-gray-400 mt-2">批量管理 new-api 系站点账号：余额 · 签到 · 用量 · 密钥</p>
         <!-- 设置按钮 -->
         <button onclick="openMonitorModal()" class="absolute right-0 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-purple-400 transition" title="监控设置">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -898,7 +898,7 @@
 
       <!-- Footer -->
       <div class="text-center mt-6 py-4 text-gray-500 text-sm">
-        <p>Powered by Playwright + FastAPI</p>
+        <p>Powered by curl_cffi + FastAPI</p>
       </div>
     </div>
 
