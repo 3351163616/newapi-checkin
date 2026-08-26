@@ -6,6 +6,7 @@ AnyRouter 余额查询服务
 import asyncio
 import base64
 import contextlib
+import hmac
 import json
 import os
 import random
@@ -15,7 +16,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -49,7 +50,17 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-app = FastAPI(title='New API Balance Manager')
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+	"""应用生命周期。startup 逻辑在文件尾部的 startup_event() 里（此处引用后定义的函数没问题，
+	真正执行时机是事件循环启动后）。@app.on_event('startup') 已弃用，统一走 lifespan。
+	"""
+	await startup_event()
+	yield
+
+
+app = FastAPI(title='New API Balance Manager', lifespan=_lifespan)
 
 # 认证配置：从环境变量或 .env 读取（.env 已被 gitignore，别提交真实密码）。
 # 未设置 AUTH_PASSWORD 时自动生成随机密码写回 .env —— 开箱即用且每次部署都不同。
@@ -60,7 +71,7 @@ if not AUTH_PASSWORD:
 	try:
 		with (Path(__file__).parent / '.env').open('a', encoding='utf-8') as f:
 			f.write(f'\nAUTH_PASSWORD={AUTH_PASSWORD}\n')
-		print(f'[AUTH] .env 未设置 AUTH_PASSWORD，已自动生成并写入 .env。用户名: {AUTH_USERNAME}，密码: {AUTH_PASSWORD}')
+		print(f'[AUTH] .env 未设置 AUTH_PASSWORD，已自动生成并写入 .env（密码看 .env 文件，别让它进日志）。用户名: {AUTH_USERNAME}')
 	except OSError:
 		print(f'[AUTH] 未设置 AUTH_PASSWORD 且 .env 不可写，本次使用随机密码（重启会变）: {AUTH_PASSWORD}')
 TOKEN_EXPIRE_SECONDS = 2592000  # 30 天
@@ -75,7 +86,10 @@ class LoginRequest(BaseModel):
 
 @app.post('/api/login')
 async def login(req: LoginRequest):
-	if req.username != AUTH_USERNAME or req.password != AUTH_PASSWORD:
+	# hmac.compare_digest 常数时间比较，消除密码校验的时序侧信道
+	if not hmac.compare_digest(req.username.encode(), AUTH_USERNAME.encode()) or not hmac.compare_digest(
+		req.password.encode(), AUTH_PASSWORD.encode()
+	):
 		return {'success': False, 'message': '用户名或密码错误'}
 	token = str(uuid.uuid4())
 	active_tokens[token] = time.time() + TOKEN_EXPIRE_SECONDS
@@ -118,6 +132,43 @@ async def auth_middleware(request: Request, call_next):
 		active_tokens.pop(token, None)
 		return JSONResponse(status_code=401, content={'success': False, 'error': '登录已过期'})
 	return await call_next(request)
+
+
+# ── 通用工具 ────────────────────────────────────────────────────────────────
+
+def _atomic_write_json(path: Path, data, indent: int | None = None) -> None:
+	"""原子写 JSON：先写临时文件再 os.replace。
+
+	直接 write_text 覆盖原文件，进程在写入中途崩溃/断电会留下半个 JSON；
+	os.replace 在同一文件系统上是原子的，最坏情况也只是旧文件完好无损。
+	"""
+	tmp = path.with_name(path.name + '.tmp')
+	tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding='utf-8')
+	os.replace(tmp, path)
+
+
+def _read_json_models(path: Path, model, tag: str) -> list:
+	"""读取「JSON 数组 + pydantic 模型」配置文件的公共样板；文件不存在或损坏都返回空列表"""
+	if not path.exists():
+		return []
+	try:
+		data = json.loads(path.read_text(encoding='utf-8'))
+		return [model(**item) for item in data]
+	except Exception as e:
+		print(f'[{tag}] 加载 {path.name} 失败: {e}')
+		return []
+
+
+# 后台任务强引用：事件循环对 task 只持弱引用，不保存随时可能被 GC 静默杀掉
+_background_tasks: set = set()
+
+
+def _spawn(coro):
+	"""create_task 并持有引用，结束后自动清理。所有长生命周期调度器都该走这里。"""
+	task = asyncio.create_task(coro)
+	_background_tasks.add(task)
+	task.add_done_callback(_background_tasks.discard)
+	return task
 
 
 # 配置文件路径
@@ -366,6 +417,7 @@ checkin_state: dict = {
 	'started_at': None,  # 本轮开始时间
 	'finished_at': None,  # 本轮结束时间
 	'trigger': None,  # 触发方式：manual / auto
+	'mode': None,  # 本轮模式：slow（默认，逐个间隔签）/ fast（出口轮换批量签）；进骨架才能随状态文件持久化
 	'total': 0,  # 账号总数
 	'done': 0,  # 已处理数（含成功/失败）
 	'order': [],  # 本轮随机顺序的账号名
@@ -414,6 +466,49 @@ def _blank_checkin_state() -> dict:
 	}
 
 
+# ── 签到状态的通用操作 ──
+# AgentRouter / AnyRouter / 各 new-api 站点三套签到状态机的日志、持久化、恢复逻辑完全同构，
+# 差异只有「状态字典、文件路径、日志前缀」三元组，统一在这里实现，各站点的同名函数只是薄封装。
+
+
+def _checkin_add_log(st: dict, tag: str, msg: str):
+	"""添加签到日志到状态字典，最多保留 100 条"""
+	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	st['logs'].append({'time': ts, 'message': msg})
+	if len(st['logs']) > 100:
+		st['logs'] = st['logs'][-100:]
+	print(f'[{tag} {ts}] {msg}')
+
+
+def _checkin_save(st: dict, path: Path, tag: str):
+	"""持久化签到状态到文件（排除不可序列化的 task）"""
+	try:
+		data = {k: v for k, v in st.items() if k != 'task'}
+		_atomic_write_json(path, data, indent=2)
+	except Exception as e:
+		print(f'[{tag}] 状态保存失败: {e}')
+
+
+def _checkin_load(st: dict, path: Path, tag: str):
+	"""服务启动时从文件恢复签到状态（仅用于前端展示历史进度），并强制复位运行标记"""
+	if not path.exists():
+		return
+	try:
+		data = json.loads(path.read_text(encoding='utf-8'))
+		for k, v in data.items():
+			if k in st and k != 'task':
+				st[k] = v
+		# 重启后不可能仍在运行，强制复位运行标记与进度指针
+		st['running'] = False
+		st['task'] = None
+		if 'current' in st:
+			st['current'] = None
+		if 'next_at' in st:
+			st['next_at'] = None
+	except Exception as e:
+		print(f'[{tag}] 状态恢复失败: {e}')
+
+
 def _api_url(path: str) -> str:
 	"""返回 API 地址"""
 	return ANYROUTER_CONFIG['domain'] + path
@@ -436,7 +531,7 @@ async def anyrouter_request(method: str, url: str, headers: dict, cookies: dict 
 		sess = _get_cffi_session('anyrouter', proxies)
 		return sess.request(method.upper(), url, headers=headers, cookies=ck, json=json_body)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do, send)
 	if resp.status_code != 200:
 		return resp
@@ -537,55 +632,105 @@ def _solve_acw_sc_v2(arg1: str) -> str:
 	return v
 
 
+_waf_lock = asyncio.Lock()
+
+
 async def get_waf_cookies() -> dict | None:
-	"""获取 WAF cookies（curl_cffi 求解 acw_sc__v2 挑战），带缓存。
+	"""获取 WAF cookies（curl_cffi 求解 acw_sc__v2 挑战），带缓存 + singleflight。
 
 	阿里云 WAF 现已按 TLS 指纹（JA3）拦截无头 Chromium，导致 Playwright 直接握手失败
 	（net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH），拿不到 cookie。改用 curl_cffi 模拟
 	Chrome 指纹访问登录页，提取 acw_tc/cdn_sec_tc 并解析 arg1 计算 acw_sc__v2 即可通过校验。
+
+	加锁做 singleflight：缓存过期瞬间，warmup/查询/签到等并发调用只放一个去打挑战页，
+	其余等结果 —— 挑战页请求是要省着用的配额。
 	"""
 	cached = waf_cache.get('anyrouter')
 	if cached and cached['expires'] > time.time():
 		return cached['cookies']
 
-	config = ANYROUTER_CONFIG
-	login_url = f'{config["domain"]}{config["login_path"]}'
-	required = config['waf_cookie_names']
+	async with _waf_lock:
+		# 双检：排队等锁期间可能已有同伴刷新了缓存
+		cached = waf_cache.get('anyrouter')
+		if cached and cached['expires'] > time.time():
+			return cached['cookies']
 
-	def _do() -> dict:
-		from curl_cffi import requests as cffi_requests
+		config = ANYROUTER_CONFIG
+		login_url = f'{config["domain"]}{config["login_path"]}'
+		required = config['waf_cookie_names']
 
-		# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
-		# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
-		sess = cffi_requests.Session(
-			impersonate='chrome131',
-			proxies={'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY},
-			timeout=30,
-		)
-		resp = sess.get(login_url, headers={'User-Agent': USER_AGENT})
-		waf_cookies = {}
-		for name in required:
-			val = sess.cookies.get(name)
-			if val:
-				waf_cookies[name] = val
-		m = _WAF_CHALLENGE_RE.search(resp.text)
-		if m:
-			waf_cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
-		return waf_cookies
+		def _do() -> dict:
+			from curl_cffi import requests as cffi_requests
 
-	try:
-		loop = asyncio.get_event_loop()
-		waf_cookies = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		if waf_cookies:
-			waf_cache['anyrouter'] = {
-				'cookies': waf_cookies,
-				'expires': time.time() + WAF_CACHE_TTL,
-			}
+			# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
+			# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
+			sess = cffi_requests.Session(
+				impersonate='chrome131',
+				proxies={'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY},
+				timeout=30,
+			)
+			resp = sess.get(login_url, headers={'User-Agent': USER_AGENT})
+			waf_cookies = {}
+			for name in required:
+				val = sess.cookies.get(name)
+				if val:
+					waf_cookies[name] = val
+			m = _WAF_CHALLENGE_RE.search(resp.text)
+			if m:
+				waf_cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
 			return waf_cookies
-		return None
-	except Exception as e:
-		print(f'[WAF] Error: {e}')
-		return None
+
+		try:
+			loop = asyncio.get_running_loop()
+			waf_cookies = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+			if waf_cookies:
+				waf_cache['anyrouter'] = {
+					'cookies': waf_cookies,
+					'expires': time.time() + WAF_CACHE_TTL,
+				}
+				return waf_cookies
+			return None
+		except Exception as e:
+			print(f'[WAF] Error: {e}')
+			return None
+
+
+async def _query_balance_impl(name: str, headers: dict, cookies: dict) -> dict:
+	"""余额查询的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
+	url = _api_url(ANYROUTER_CONFIG['user_info_path'])
+	max_retries = 3
+
+	for attempt in range(max_retries):
+		try:
+			resp = await anyrouter_request('GET', url, headers, cookies=cookies)
+			blocked = anyrouter_block_reason(resp)
+			if blocked:
+				kind, why = blocked
+				return {'name': name, 'success': False, 'error': why, 'blocked': kind}
+			data = resp.json()
+			if data.get('success'):
+				user_data = data.get('data', {})
+				return {
+					'name': name,
+					'success': True,
+					'quota': round(user_data.get('quota', 0) / 500000, 2),
+					'used': round(user_data.get('used_quota', 0) / 500000, 2),
+					'username': user_data.get('username', ''),
+				}
+			return {
+				'name': name,
+				'success': False,
+				'error': f'API 返回失败: {data.get("message", "Unknown")}',
+			}
+		except Exception as e:
+			if attempt < max_retries - 1:
+				await asyncio.sleep(1.5 * (attempt + 1))
+				continue
+			return {
+				'name': name,
+				'success': False,
+				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
+			}
 
 
 async def query_balance(account: AccountItem, waf_cookies: dict) -> dict:
@@ -601,41 +746,7 @@ async def query_balance(account: AccountItem, waf_cookies: dict) -> dict:
 		'Origin': config['domain'],
 		config['api_user_key']: account.api_user,
 	}
-
-	url = _api_url(config['user_info_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('GET', url, headers, cookies=all_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'error': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				return {
-					'name': account.name,
-					'success': True,
-					'quota': round(user_data.get('quota', 0) / 500000, 2),
-					'used': round(user_data.get('used_quota', 0) / 500000, 2),
-					'username': user_data.get('username', ''),
-				}
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'API 返回失败: {data.get("message", "Unknown")}',
-			}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
-			}
+	return await _query_balance_impl(account.name, headers, all_cookies)
 
 
 async def query_balance_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
@@ -651,41 +762,37 @@ async def query_balance_with_token(account: TokenAccountItem, waf_cookies: dict)
 		'Authorization': f'Bearer {account.access_token}',
 		config['api_user_key']: account.user_id,
 	}
+	return await _query_balance_impl(account.name, headers, waf_cookies)
 
-	url = _api_url(config['user_info_path'])
+
+async def _sign_in_impl(name: str, headers: dict, cookies: dict) -> dict:
+	"""签到的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
+	url = _api_url(ANYROUTER_CONFIG['sign_in_path'])
 	max_retries = 3
 
 	for attempt in range(max_retries):
 		try:
-			resp = await anyrouter_request('GET', url, headers, cookies=waf_cookies)
+			resp = await anyrouter_request('POST', url, headers, cookies=cookies)
 			blocked = anyrouter_block_reason(resp)
 			if blocked:
 				kind, why = blocked
-				return {'name': account.name, 'success': False, 'error': why, 'blocked': kind}
+				return {'name': name, 'success': False, 'message': why, 'blocked': kind}
 			data = resp.json()
 			if data.get('success'):
-				user_data = data.get('data', {})
+				msg = data.get('message', '')
+				# 空消息表示签到成功，有消息可能是"今日已签到"等
 				return {
-					'name': account.name,
+					'name': name,
 					'success': True,
-					'quota': round(user_data.get('quota', 0) / 500000, 2),
-					'used': round(user_data.get('used_quota', 0) / 500000, 2),
-					'username': user_data.get('username', ''),
+					'message': msg if msg else '签到成功 +$25',
+					'already_signed': bool(msg),
 				}
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'API 返回失败: {data.get("message", "Unknown")}',
-			}
+			return {'name': name, 'success': False, 'message': data.get('message', '签到失败')}
 		except Exception as e:
 			if attempt < max_retries - 1:
 				await asyncio.sleep(1.5 * (attempt + 1))
 				continue
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
-			}
+			return {'name': name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
 
 
 async def sign_in(account: AccountItem, waf_cookies: dict) -> dict:
@@ -702,33 +809,7 @@ async def sign_in(account: AccountItem, waf_cookies: dict) -> dict:
 		config['api_user_key']: account.api_user,
 		'Cache-Control': 'no-store',
 	}
-
-	url = _api_url(config['sign_in_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('POST', url, headers, cookies=all_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'message': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				msg = data.get('message', '')
-				# 空消息表示签到成功，有消息可能是"今日已签到"等
-				return {
-					'name': account.name,
-					'success': True,
-					'message': msg if msg else '签到成功 +$25',
-					'already_signed': bool(msg),
-				}
-			return {'name': account.name, 'success': False, 'message': data.get('message', '签到失败')}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
+	return await _sign_in_impl(account.name, headers, all_cookies)
 
 
 async def sign_in_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
@@ -745,44 +826,12 @@ async def sign_in_with_token(account: TokenAccountItem, waf_cookies: dict) -> di
 		config['api_user_key']: account.user_id,
 		'Cache-Control': 'no-store',
 	}
-
-	url = _api_url(config['sign_in_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('POST', url, headers, cookies=waf_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'message': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				msg = data.get('message', '')
-				return {
-					'name': account.name,
-					'success': True,
-					'message': msg if msg else '签到成功 +$25',
-					'already_signed': bool(msg),
-				}
-			return {'name': account.name, 'success': False, 'message': data.get('message', '签到失败')}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
+	return await _sign_in_impl(account.name, headers, waf_cookies)
 
 
 def load_token_accounts() -> list[TokenAccountItem]:
 	"""从 new_accounts_config.json 加载 access_token 账号列表"""
-	if not NEW_ACCOUNTS_FILE.exists():
-		return []
-	try:
-		data = json.loads(NEW_ACCOUNTS_FILE.read_text(encoding='utf-8'))
-		return [TokenAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[TOKEN] 加载 new_accounts_config.json 失败: {e}')
-		return []
+	return _read_json_models(NEW_ACCOUNTS_FILE, TokenAccountItem, 'TOKEN')
 
 
 def agentrouter_block_reason(resp) -> str | None:
@@ -828,7 +877,7 @@ async def agentrouter_real_balance(cookies: dict, user_id: str) -> tuple[dict | 
 		)
 
 	try:
-		loop = asyncio.get_event_loop()
+		loop = asyncio.get_running_loop()
 		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 		blocked = agentrouter_block_reason(resp)
 		if blocked:
@@ -862,13 +911,15 @@ async def query_balance_login(account: LoginAccountItem) -> dict:
 	max_retries = 3
 
 	def _do():
-		sess = _get_cffi_session('agentrouter', proxies)
+		# key 必须带出口代数：出口轮换后复用旧代数的 Session 会继续从旧 IP 出去，
+		# 与 _ar_session_key 注释里描述的轮换机制直接矛盾（其余 agentrouter 调用点都带了）
+		sess = _get_cffi_session(_ar_session_key('agentrouter'), proxies)
 		resp = sess.post(login_url, json=body, timeout=15)
 		return resp, dict(sess.cookies)
 
 	for attempt in range(max_retries):
 		try:
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 			# 429 的响应体是空的，先认出来，否则 resp.json() 抛的 JSONDecodeError 完全看不出是限流
 			if resp.status_code == 429:
@@ -929,7 +980,7 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 
 	for attempt in range(max_retries):
 		try:
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 			if resp.status_code == 429:
 				return {'name': account.name, 'success': False, 'message': '登录被站点限流（429），请等几分钟再试'}
@@ -973,14 +1024,7 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 
 def load_login_accounts() -> list[LoginAccountItem]:
 	"""从 agentrouter_accounts.json 加载登录方式账号列表"""
-	if not AGENTROUTER_ACCOUNTS_FILE.exists():
-		return []
-	try:
-		data = json.loads(AGENTROUTER_ACCOUNTS_FILE.read_text(encoding='utf-8'))
-		return [LoginAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[LOGIN] 加载 agentrouter_accounts.json 失败: {e}')
-		return []
+	return _read_json_models(AGENTROUTER_ACCOUNTS_FILE, LoginAccountItem, 'LOGIN')
 
 
 # ========== 通用 new-api 站点（access_token 方式）==========
@@ -992,24 +1036,17 @@ def load_newapi_sites() -> list[NewapiSite]:
 	"""读取 newapi_sites.json；文件不存在时用 NEWAPI_SEED_SITES 初始化后再读。"""
 	if not NEWAPI_SITES_FILE.exists():
 		try:
-			NEWAPI_SITES_FILE.write_text(json.dumps(NEWAPI_SEED_SITES, ensure_ascii=False, indent=2), encoding='utf-8')
+			_atomic_write_json(NEWAPI_SITES_FILE, NEWAPI_SEED_SITES, indent=2)
 			print(f'[SITE] 已初始化 newapi_sites.json（{len(NEWAPI_SEED_SITES)} 个站点）')
 		except Exception as e:
 			print(f'[SITE] 初始化 newapi_sites.json 失败: {e}')
 			return [NewapiSite(**s) for s in NEWAPI_SEED_SITES]
-	try:
-		data = json.loads(NEWAPI_SITES_FILE.read_text(encoding='utf-8'))
-		return [NewapiSite(**item) for item in data]
-	except Exception as e:
-		print(f'[SITE] 加载 newapi_sites.json 失败: {e}')
-		return []
+	return _read_json_models(NEWAPI_SITES_FILE, NewapiSite, 'SITE')
 
 
 def save_newapi_sites(sites: list[NewapiSite]):
 	"""写回站点清单"""
-	NEWAPI_SITES_FILE.write_text(
-		json.dumps([s.model_dump() for s in sites], ensure_ascii=False, indent=2), encoding='utf-8'
-	)
+	_atomic_write_json(NEWAPI_SITES_FILE, [s.model_dump() for s in sites], indent=2)
 
 
 def get_newapi_site(site_id: str) -> NewapiSite | None:
@@ -1022,22 +1059,12 @@ def get_newapi_site(site_id: str) -> NewapiSite | None:
 
 def load_newapi_accounts(site: NewapiSite) -> list[NewapiAccountItem]:
 	"""从站点自己的 accounts_file 加载账号列表"""
-	path = site.accounts_path()
-	if not path.exists():
-		return []
-	try:
-		data = json.loads(path.read_text(encoding='utf-8'))
-		return [NewapiAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[{site.id.upper()}] 加载 {path.name} 失败: {e}')
-		return []
+	return _read_json_models(site.accounts_path(), NewapiAccountItem, site.id.upper())
 
 
 def save_newapi_accounts(site: NewapiSite, accounts: list[NewapiAccountItem]):
 	"""保存账号列表到站点自己的 accounts_file"""
-	site.accounts_path().write_text(
-		json.dumps([a.model_dump() for a in accounts], ensure_ascii=False, indent=2), encoding='utf-8'
-	)
+	_atomic_write_json(site.accounts_path(), [a.model_dump() for a in accounts], indent=2)
 
 
 def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
@@ -1065,7 +1092,7 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 		sess = _get_cffi_session(f'newapi:{site.id}')
 		return sess.request(method.upper(), url, headers=headers, json=json_body)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
 
 
@@ -1087,7 +1114,7 @@ async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, head
 			proxies=proxies, impersonate='chrome131', timeout=20,
 		)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
 
 
@@ -1210,39 +1237,17 @@ async def newapi_checkin_info(site: NewapiSite, account: NewapiAccountItem) -> d
 
 
 def add_checkin_log(msg: str):
-	"""添加签到日志，最多保留 100 条"""
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	checkin_state['logs'].append({'time': ts, 'message': msg})
-	if len(checkin_state['logs']) > 100:
-		checkin_state['logs'] = checkin_state['logs'][-100:]
-	print(f'[CHECKIN {ts}] {msg}')
+	_checkin_add_log(checkin_state, 'CHECKIN', msg)
 
 
 def save_checkin_state():
-	"""持久化签到状态到文件（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in checkin_state.items() if k != 'task'}
-		CHECKIN_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[CHECKIN] 状态保存失败: {e}')
+	"""持久化签到状态到文件"""
+	_checkin_save(checkin_state, CHECKIN_STATE_FILE, 'CHECKIN')
 
 
 def load_checkin_state():
 	"""服务启动时从文件恢复签到状态（仅用于前端展示历史进度）"""
-	if not CHECKIN_STATE_FILE.exists():
-		return
-	try:
-		data = json.loads(CHECKIN_STATE_FILE.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in checkin_state and k != 'task':
-				checkin_state[k] = v
-		# 重启后不可能仍在运行，强制复位运行标记
-		checkin_state['running'] = False
-		checkin_state['task'] = None
-		checkin_state['current'] = None
-		checkin_state['next_at'] = None
-	except Exception as e:
-		print(f'[CHECKIN] 状态恢复失败: {e}')
+	_checkin_load(checkin_state, CHECKIN_STATE_FILE, 'CHECKIN')
 
 
 async def run_login_checkin(trigger: str = 'manual'):
@@ -1407,10 +1412,8 @@ def load_checkin_settings():
 			if changed:
 				save_newapi_sites(sites)
 				print(f'[CHECKIN] 已把旧的自动签到开关迁移到 newapi_sites.json: {legacy}')
-			# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
-			CHECKIN_SETTINGS_FILE.write_text(
-				json.dumps(checkin_settings, ensure_ascii=False, indent=2), encoding='utf-8'
-			)
+		# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
 	except Exception as e:
 		print(f'[CHECKIN] 自动签到设置读取失败: {e}')
 
@@ -1418,7 +1421,7 @@ def load_checkin_settings():
 def save_checkin_settings():
 	"""持久化自动签到开关"""
 	try:
-		CHECKIN_SETTINGS_FILE.write_text(json.dumps(checkin_settings, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
 	except Exception as e:
 		print(f'[CHECKIN] 自动签到设置保存失败: {e}')
 
@@ -1430,25 +1433,30 @@ async def daily_checkin_scheduler():
 	关闭后仅跳过自动触发，手动签到不受影响。新增站点会自动纳入，无需改这里。
 	"""
 	while True:
-		wait_seconds = seconds_until_midnight()
-		print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
-		await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
-		if checkin_settings['agentrouter_auto']:
-			if not checkin_state['running']:
-				start_login_checkin(trigger='auto')
-		else:
-			print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
-		if checkin_settings['anyrouter_auto']:
-			if not anyrouter_checkin_state['running']:
-				start_anyrouter_checkin(trigger='auto')
-		else:
-			print('[ANYROUTER] AnyRouter 每日自动签到已关闭，跳过')
-		for site in load_newapi_sites():
-			if not site.auto_checkin:
-				print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
-				continue
-			if not newapi_state(site)['running']:
-				start_newapi_checkin(site, trigger='auto')
+		try:
+			wait_seconds = seconds_until_midnight()
+			print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
+			await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
+			if checkin_settings['agentrouter_auto']:
+				if not checkin_state['running']:
+					start_login_checkin(trigger='auto')
+			else:
+				print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
+			if checkin_settings['anyrouter_auto']:
+				if not anyrouter_checkin_state['running']:
+					start_anyrouter_checkin(trigger='auto')
+			else:
+				print('[ANYROUTER] AnyRouter 每日自动签到已关闭，跳过')
+			for site in load_newapi_sites():
+				if not site.auto_checkin:
+					print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
+					continue
+				if not newapi_state(site)['running']:
+					start_newapi_checkin(site, trigger='auto')
+		except Exception as e:
+			# 调度器是长生命周期任务：单轮出错只记日志，绝不能让异常杀死整个循环
+			print(f'[CHECKIN] 签到调度出错（下一轮继续）: {e}')
+			await asyncio.sleep(60)
 
 
 # ========== AnyRouter（cookie/session 方式）签到与续期 ==========
@@ -1517,36 +1525,17 @@ def _session_is_authenticated(session: str) -> bool | None:
 
 
 def add_anyrouter_checkin_log(msg: str):
-	"""添加 AnyRouter 签到日志，最多保留 100 条"""
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	anyrouter_checkin_state['logs'].append({'time': ts, 'message': msg})
-	if len(anyrouter_checkin_state['logs']) > 100:
-		anyrouter_checkin_state['logs'] = anyrouter_checkin_state['logs'][-100:]
-	print(f'[ANYROUTER {ts}] {msg}')
+	_checkin_add_log(anyrouter_checkin_state, 'ANYROUTER', msg)
 
 
 def save_anyrouter_checkin_state():
-	"""持久化 AnyRouter 签到状态（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in anyrouter_checkin_state.items() if k != 'task'}
-		ANYROUTER_CHECKIN_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[ANYROUTER] 状态保存失败: {e}')
+	"""持久化 AnyRouter 签到状态"""
+	_checkin_save(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
 
 
 def load_anyrouter_checkin_state():
 	"""服务启动时恢复 AnyRouter 签到状态（仅用于前端展示历史进度）"""
-	if not ANYROUTER_CHECKIN_STATE_FILE.exists():
-		return
-	try:
-		data = json.loads(ANYROUTER_CHECKIN_STATE_FILE.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in anyrouter_checkin_state and k != 'task':
-				anyrouter_checkin_state[k] = v
-		anyrouter_checkin_state['running'] = False
-		anyrouter_checkin_state['task'] = None
-	except Exception as e:
-		print(f'[ANYROUTER] 状态恢复失败: {e}')
+	_checkin_load(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
 
 
 async def run_anyrouter_checkin(trigger: str = 'manual'):
@@ -1659,39 +1648,17 @@ def newapi_state(site: NewapiSite) -> dict:
 
 
 def add_newapi_checkin_log(site: NewapiSite, msg: str):
-	"""添加签到日志，最多保留 100 条"""
-	st = newapi_state(site)
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	st['logs'].append({'time': ts, 'message': msg})
-	if len(st['logs']) > 100:
-		st['logs'] = st['logs'][-100:]
-	print(f'[{site.id.upper()} {ts}] {msg}')
+	_checkin_add_log(newapi_state(site), site.id.upper(), msg)
 
 
 def save_newapi_checkin_state(site: NewapiSite):
-	"""持久化签到状态（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in newapi_state(site).items() if k != 'task'}
-		site.state_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[{site.id.upper()}] 状态保存失败: {e}')
+	"""持久化签到状态"""
+	_checkin_save(newapi_state(site), site.state_path(), site.id.upper())
 
 
 def load_newapi_checkin_state(site: NewapiSite):
 	"""服务启动时恢复签到状态（仅用于前端展示历史进度）"""
-	path = site.state_path()
-	st = newapi_state(site)
-	if not path.exists():
-		return
-	try:
-		data = json.loads(path.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in st and k != 'task':
-				st[k] = v
-		st['running'] = False
-		st['task'] = None
-	except Exception as e:
-		print(f'[{site.id.upper()}] 状态恢复失败: {e}')
+	_checkin_load(newapi_state(site), site.state_path(), site.id.upper())
 
 
 async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
@@ -1813,7 +1780,7 @@ def save_renewed_sessions(updates: dict):
 		for a in accounts:
 			if a.get('name') in updates:
 				a.setdefault('cookies', {})['session'] = updates[a['name']]
-		CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CONFIG_FILE, data, indent=2)
 	except Exception as e:
 		print(f'[ANYROUTER] 写回续期 session 失败: {e}')
 
@@ -1897,13 +1864,14 @@ def add_monitor_log(msg: str):
 
 
 def send_alert_email(email_cfg: EmailConfig, subject: str, body: str):
-	"""发送告警邮件"""
+	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）"""
 	msg = MIMEText(body, 'plain', 'utf-8')
 	msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
 	msg['To'] = email_cfg.email_to
 	msg['Subject'] = subject
 
-	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port) as server:
+	# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
+	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
 		server.login(email_cfg.email_user, email_cfg.email_pass)
 		server.send_message(msg)
 
@@ -1979,7 +1947,11 @@ async def monitor_loop(config: MonitorStartRequest):
 					body = '\n'.join(lines)
 
 					try:
-						send_alert_email(config.email, subject, body)
+						# smtplib 是纯同步 IO，直呼会冻结整个事件循环（所有 API/签到全卡住），
+						# 扔进默认线程池执行
+						await asyncio.get_running_loop().run_in_executor(
+							None, send_alert_email, config.email, subject, body
+						)
 						add_monitor_log(f'告警邮件已发送：{len(low_balance)} 个账号')
 					except Exception as e:
 						add_monitor_log(f'邮件发送失败：{str(e)[:80]}')
@@ -2052,7 +2024,7 @@ async def get_config():
 async def save_config(req: dict):
 	"""保存配置"""
 	try:
-		CONFIG_FILE.write_text(json.dumps(req, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CONFIG_FILE, req, indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2138,9 +2110,7 @@ async def save_token_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [TokenAccountItem(**acc) for acc in raw_accounts]
-		NEW_ACCOUNTS_FILE.write_text(
-			json.dumps([acc.model_dump() for acc in validated], ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2241,9 +2211,7 @@ async def save_login_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [LoginAccountItem(**acc) for acc in raw_accounts]
-		AGENTROUTER_ACCOUNTS_FILE.write_text(
-			json.dumps([acc.model_dump() for acc in validated], ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2350,16 +2318,22 @@ async def login_checkin_fast():
 	aborted = False
 	if pending:
 		async with _balances_query_lock:
-			results, aborted = await _run_with_rotation(pending, _sign_in_one, on_result=_on_result)
+			# 停止按钮置 running=False，轮换调度每轮开始前检查它 —— fast 模式从此可停
+			results, aborted = await _run_with_rotation(
+				pending, _sign_in_one, on_result=_on_result, should_stop=lambda: not checkin_state['running']
+			)
 	else:
 		add_checkin_log('全部账号今日都已签到，无需签到')
 
+	stopped = not checkin_state['running']  # 停止按钮已把 running 置 False
 	checkin_state['running'] = False
 	checkin_state['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 	signed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') in ('signed', 'already'))
 	failed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') == 'failed')
 	add_checkin_log(
-		f'一键全签结束：{signed}/{checkin_state["total"]} 已签到，失败 {failed}' + ('（WAF 惩罚期提前中止）' if aborted else '')
+		f'一键全签结束：{signed}/{checkin_state["total"]} 已签到，失败 {failed}'
+		+ ('（WAF 惩罚期提前中止）' if aborted else '')
+		+ ('（手动停止）' if stopped else '')
 	)
 	save_checkin_state()
 	return {
@@ -2577,7 +2551,7 @@ async def _query_egress_ip() -> str | None:
 				continue
 		return None
 
-	return await asyncio.get_event_loop().run_in_executor(_UPSTREAM_POOL, _do)
+	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
 
 
 async def _probe_exit_passes_waf() -> bool:
@@ -2609,31 +2583,25 @@ async def _probe_exit_passes_waf() -> bool:
 		except Exception:
 			return False
 
-	return await asyncio.get_event_loop().run_in_executor(_UPSTREAM_POOL, _do)
+	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
 
 
-class ExitRotator:
-	"""查询期间轮换 mihomo 出口 IP，结束后恢复原节点。
+class _MihomoGroupSwitcher:
+	"""mihomo 代理组切换的公共底座：controller 定位、API 封装、原节点记忆与恢复。
 
-	候选是组里**全部真实节点**（不限地区）：按实际出口 IP 去重后逐个用匿名探针实测能否过
-	agentrouter 的 WAF，能过的都进轮换池（2026-08-22 实测约 10 个独立 IP：香港原生/新加坡/
-	日本专线/韩国家宽/美国原生与专线）。探测结果缓存 WAF_PASS_CACHE_TTL —— 探测要 1~2 分钟，
-	而且探测本身也在消耗各 IP 的 WAF 配额。
-
-	controller 读不到 / 凑不出能过的节点时 start() 返回 False，查询退化为「不换 IP 只分批」。
-	探测要切节点（期间影响用户经 7890 的其它流量），限时 150 秒。
+	ExitRotator（余额/全签的 WAF 出口轮换）与 _KeysExitRotator（取密钥撞限流换出口）
+	共用这套机制，差别只在「怎么挑下一个节点」的策略（子类实现）。
 	"""
 
 	def __init__(self):
 		self._base, self._secret = None, None
 		self._original = None
 		self._nodes: list[str] = []
-		self._ips: list[str] = []
 		self._idx = -1
 		self._touched = False
 
 	async def _api(self, method: str, path: str, body: dict | None = None):
-		resp = await asyncio.get_event_loop().run_in_executor(
+		resp = await asyncio.get_running_loop().run_in_executor(
 			_UPSTREAM_POOL, _mihomo_call, method, f'{self._base}{path}', self._secret, body,
 		)
 		if resp is None or resp.status_code >= 300:
@@ -2650,6 +2618,30 @@ class ExitRotator:
 		if ok is not None:
 			self._touched = True
 		return ok is not None
+
+	async def restore(self) -> None:
+		if self._touched and self._original:
+			if await self._select(self._original):
+				global _exit_generation
+				_exit_generation += 1  # 恢复原节点后同样要重新建连
+			self._touched = False
+
+
+class ExitRotator(_MihomoGroupSwitcher):
+	"""查询期间轮换 mihomo 出口 IP，结束后恢复原节点。
+
+	候选是组里**全部真实节点**（不限地区）：按实际出口 IP 去重后逐个用匿名探针实测能否过
+	agentrouter 的 WAF，能过的都进轮换池（2026-08-22 实测约 10 个独立 IP：香港原生/新加坡/
+	日本专线/韩国家宽/美国原生与专线）。探测结果缓存 WAF_PASS_CACHE_TTL —— 探测要 1~2 分钟，
+	而且探测本身也在消耗各 IP 的 WAF 配额。
+
+	controller 读不到 / 凑不出能过的节点时 start() 返回 False，查询退化为「不换 IP 只分批」。
+	探测要切节点（期间影响用户经 7890 的其它流量），限时 150 秒。
+	"""
+
+	def __init__(self):
+		super().__init__()
+		self._ips: list[str] = []
 
 	@property
 	def ip_count(self) -> int:
@@ -2716,13 +2708,6 @@ class ExitRotator:
 		"""当前用的是第几个出口 IP（-1 表示还没切过）"""
 		return self._idx
 
-	async def restore(self) -> None:
-		if self._touched and self._original:
-			if await self._select(self._original):
-				global _exit_generation
-				_exit_generation += 1  # 恢复原节点后同样要重新建连
-			self._touched = False
-
 
 _FATAL_LOGIN_MARKS = ('密码', '封禁', '限流', '429')
 
@@ -2763,7 +2748,9 @@ async def _login_balance_one(account: LoginAccountItem, force: bool) -> dict:
 	}
 
 
-async def _run_with_rotation(accounts: list, work, initial_force: bool = False, on_result=None) -> tuple[list[dict], bool]:
+async def _run_with_rotation(
+	accounts: list, work, initial_force: bool = False, on_result=None, should_stop=None
+) -> tuple[list[dict], bool]:
 	"""分批 + 轮换出口 IP 地跑 work(account, force)，返回 (与 accounts 同序的结果, 是否提前中止)。
 
 	调度规则（都是 2026-08-22 实测出的 WAF 行为）：
@@ -2774,7 +2761,8 @@ async def _run_with_rotation(accounts: list, work, initial_force: bool = False, 
 	- 只在真的轮换成功时才重试 —— 没有新 IP，同一 IP 上重试也过不去（实测）。
 
 	work 返回的 dict 用 success / fatal / error(message) 表达结果，fatal=True 的失败换 IP 也没用；
-	on_result 在每个账号到达终态时回调，签到流程用它更新进度面板。
+	on_result 在每个账号到达终态时回调，签到流程用它更新进度面板；
+	should_stop 每轮开始前询问一次，返回 True 就停 —— fast 全签靠它响应停止按钮。
 	"""
 	rotator = ExitRotator()
 	rotated = await rotator.start()
@@ -2789,6 +2777,11 @@ async def _run_with_rotation(accounts: list, work, initial_force: bool = False, 
 	aborted = False
 	try:
 		while todo and time.time() < deadline and not aborted:
+			if should_stop and should_stop():
+				for a, _ in todo:
+					final[a.name] = {'name': a.name, 'success': False, 'error': '已手动停止', 'message': '已手动停止'}
+				todo.clear()
+				break
 			if rotated:
 				# 挑一个还有预算的出口 IP；全热就冷却一轮（不消耗账号）
 				for _ in range(len(ip_use)):
@@ -3331,7 +3324,7 @@ def save_keys_list_cache():
 		now = time.time()
 		for k in [k for k, v in _keys_list_cache.items() if now - v.get('ts', 0) > KEYS_CACHE_MAX_AGE]:
 			_keys_list_cache.pop(k, None)
-		KEYS_CACHE_FILE.write_text(json.dumps(_keys_list_cache, ensure_ascii=False), encoding='utf-8')
+		_atomic_write_json(KEYS_CACHE_FILE, _keys_list_cache)
 	except Exception as e:
 		print(f'[KEYS] 列表缓存写盘失败: {e}')
 
@@ -3363,9 +3356,7 @@ def load_agentrouter_sessions():
 
 def save_agentrouter_sessions():
 	try:
-		AGENTROUTER_SESSION_FILE.write_text(
-			json.dumps(_agentrouter_key_sessions, ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(AGENTROUTER_SESSION_FILE, _agentrouter_key_sessions, indent=2)
 	except Exception as e:
 		print(f'[AGENTROUTER] 保存 session 缓存失败: {e}')
 
@@ -3406,7 +3397,7 @@ async def _agentrouter_session(account: LoginAccountItem, force: bool = False) -
 		)
 		return resp, dict(sess.cookies)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	# 登录接口按 IP 限流，串行 + 间隔，别让批量操作把窗口打满
 	async with _agentrouter_login_lock:
 		resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
@@ -3507,7 +3498,7 @@ async def resolve_key_ctx(ref: str) -> tuple[KeyCtx | None, str | None]:
 					method.upper(), f'{config["domain"]}{path}', headers=_h, cookies=_c, json=json_body, timeout=20
 				)
 
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			return await loop.run_in_executor(_UPSTREAM_POOL, _do)
 
 		return KeyCtx(ref, account.name, 'AgentRouter', _req), None
@@ -3708,7 +3699,7 @@ _keys_reveal_until: dict[str, float] = {}  # 按站点/账号类型的熔断时�
 _keys_reveal_lock = asyncio.Lock()  # 同时只允许一轮「取全量」——它会切 mihomo 节点
 
 
-class _KeysExitRotator:
+class _KeysExitRotator(_MihomoGroupSwitcher):
 	"""取密钥撞限流时的轻量出口轮换。
 
 	与 ExitRotator（agentrouter 专用，要探 WAF、能过的才进池）不同：这里撞的是站点自己的
@@ -3717,25 +3708,8 @@ class _KeysExitRotator:
 	"""
 
 	def __init__(self):
-		self._base, self._secret = None, None
-		self._original = None
-		self._nodes: list[str] = []
-		self._idx = -1
-		self._touched = False
+		super().__init__()
 		self.tried_ips: set[str] = set()
-
-	async def _api(self, method: str, path: str, body: dict | None = None):
-		resp = await asyncio.get_event_loop().run_in_executor(
-			_UPSTREAM_POOL, _mihomo_call, method, f'{self._base}{path}', self._secret, body,
-		)
-		if resp is None or resp.status_code >= 300:
-			return None
-		if method == 'GET':
-			try:
-				return resp.json()
-			except Exception:
-				return None
-		return {}
 
 	async def prepare(self) -> bool:
 		"""读节点列表、记住原节点。mihomo 不可用时返回 False（调用方就不轮换）。"""
@@ -3754,9 +3728,8 @@ class _KeysExitRotator:
 		"""切到下一个没用过的节点（按实际出口 IP 去重 —— 多个节点共用出口很常见）。"""
 		while self._idx + 1 < len(self._nodes):
 			self._idx += 1
-			if await self._api('PUT', f'/proxies/{quote(MIHOMO_GROUP)}', {'name': self._nodes[self._idx]}) is None:
+			if not await self._select(self._nodes[self._idx]):
 				continue
-			self._touched = True
 			ip = await _query_egress_ip()
 			if ip:
 				if ip in self.tried_ips:
@@ -3764,10 +3737,6 @@ class _KeysExitRotator:
 				self.tried_ips.add(ip)
 			return True
 		return False
-
-	async def restore(self):
-		if self._touched and self._original:
-			await self._api('PUT', f'/proxies/{quote(MIHOMO_GROUP)}', {'name': self._original})
 
 
 def _reveal_scope(ctx: KeyCtx) -> str:
@@ -4001,19 +3970,45 @@ async def monitor_status():
 
 # ========== 每日用量统计 ==========
 
+# 用量数据内存缓存。record_account_usage 每记一个账号都读写一次文件，
+# 29 个账号就是 29 次全量 IO 且随历史变肥；缓存后进程内合并，落盘走写穿。
+# 按路径做 key 是为了测试里 monkeypatch USAGE_FILE 指到 tmp_path 时能正确失效。
+_usage_cache: dict | None = None
+_usage_cache_path: Path | None = None
+
+
 def load_usage_data() -> dict:
-	"""读取用量历史数据"""
+	"""读取用量历史数据（带内存缓存；本服务是单进程独占该文件的，无外部写入方）"""
+	global _usage_cache, _usage_cache_path
+	if _usage_cache is not None and _usage_cache_path == USAGE_FILE:
+		return _usage_cache
+	_usage_cache_path = USAGE_FILE
 	if USAGE_FILE.exists():
 		try:
-			return json.loads(USAGE_FILE.read_text(encoding='utf-8'))
-		except Exception:
-			return {}
-	return {}
+			_usage_cache = json.loads(USAGE_FILE.read_text(encoding='utf-8'))
+		except Exception as e:
+			# 绝不能读失败后拿空 dict 继续跑 —— 下一次保存会把 90 天历史一次抹掉。
+			# 把坏文件留档再从空开始，历史还在备份里可人工抢救。
+			backup = USAGE_FILE.with_name(f'{USAGE_FILE.name}.corrupt-{datetime.now():%Y%m%d-%H%M%S}')
+			try:
+				os.replace(USAGE_FILE, backup)
+				print(f'[USAGE] daily_usage.json 损坏，已备份为 {backup.name} 后从空开始: {e}')
+			except OSError:
+				print(f'[USAGE] daily_usage.json 损坏且备份失败（拒绝覆盖）: {e}')
+				_usage_cache_path = None
+				raise
+			_usage_cache = {}
+	else:
+		_usage_cache = {}
+	return _usage_cache
 
 
 def save_usage_data(data: dict):
-	"""保存用量历史数据"""
-	USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+	"""保存用量历史数据（原子写 + 同步内存缓存）"""
+	global _usage_cache, _usage_cache_path
+	_atomic_write_json(USAGE_FILE, data, indent=2)
+	_usage_cache = data
+	_usage_cache_path = USAGE_FILE
 
 
 def usage_key(provider: str, name: str) -> str:
@@ -4211,33 +4206,29 @@ async def take_daily_snapshot():
 
 
 def seconds_until_midnight() -> float:
-	"""计算距离下一个 0 点的秒数"""
+	"""计算距离下一个 0 点的秒数。
+
+	用 timedelta 跨天，不要手动 day+1 —— 那样每月最后一天必抛 ValueError，
+	会把依赖它的两个每日调度器一起带死。
+	"""
 	now = datetime.now()
-	tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
-	if tomorrow <= now:
-		tomorrow = tomorrow.replace(day=now.day + 1)
-	# 处理月末
-	try:
-		tomorrow = now.replace(day=now.day + 1, hour=0, minute=0, second=0, microsecond=0)
-	except ValueError:
-		# 月末，跳到下个月
-		if now.month == 12:
-			tomorrow = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-		else:
-			tomorrow = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+	tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 	return (tomorrow - now).total_seconds()
 
 
 async def daily_snapshot_scheduler():
 	"""每日快照调度器"""
 	while True:
-		wait_seconds = seconds_until_midnight()
-		print(f'[USAGE] 下次快照将在 {wait_seconds:.0f} 秒后执行')
-		await asyncio.sleep(wait_seconds + 5)  # 多等 5 秒确保过了 0 点
-		await take_daily_snapshot()
+		try:
+			wait_seconds = seconds_until_midnight()
+			print(f'[USAGE] 下次快照将在 {wait_seconds:.0f} 秒后执行')
+			await asyncio.sleep(wait_seconds + 5)  # 多等 5 秒确保过了 0 点
+			await take_daily_snapshot()
+		except Exception as e:
+			print(f'[USAGE] 快照调度出错（下一轮继续）: {e}')
+			await asyncio.sleep(60)
 
 
-@app.on_event('startup')
 async def startup_event():
 	"""服务启动时初始化定时任务"""
 	# 先把用量快照的 key 迁移成「站点:账号名」，再判断今日有没有快照 —— 顺序反了会用旧 key 判断
@@ -4251,8 +4242,8 @@ async def startup_event():
 	usage_data = load_usage_data()
 	if today not in usage_data:
 		print(f'[USAGE] 今日 ({today}) 无快照数据，启动时立即执行快照')
-		asyncio.create_task(take_daily_snapshot())
-	asyncio.create_task(daily_snapshot_scheduler())
+		_spawn(take_daily_snapshot())
+	_spawn(daily_snapshot_scheduler())
 	print('[USAGE] 每日快照调度器已启动')
 
 	# 恢复 Login 签到状态并启动每日签到调度器
@@ -4264,7 +4255,7 @@ async def startup_event():
 		f'AnyRouter={"开" if checkin_settings["anyrouter_auto"] else "关"} {_site_flags}'
 	)
 	load_checkin_state()
-	asyncio.create_task(daily_checkin_scheduler())
+	_spawn(daily_checkin_scheduler())
 	print('[CHECKIN] 每日签到调度器已启动')
 	# 若今日尚未完成签到（服务在 0 点后才启动，或上一轮被重启中断），立即补一轮
 	_accts = checkin_state.get('accounts', {})
@@ -4431,7 +4422,7 @@ async def get_proxy_info(probe: bool = False):
 			# 组名为空时不做出口轮换，是有意的安全降级而非故障
 			'rotation_enabled': bool(MIHOMO_GROUP),
 			'config_path': str(MIHOMO_CONFIG_FILE),
-			'config_exists': MIHOMO_CONFIG_FILE.is_file(),
+			'config_exists': await asyncio.to_thread(MIHOMO_CONFIG_FILE.is_file),
 		},
 	}
 
