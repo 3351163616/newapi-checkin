@@ -1,0 +1,38 @@
+# ===== 运行时数据（含账号凭据 / 个人数据，绝不提交）=====
+new_accounts_config.json
+saved_config.json
+agentrouter_accounts.json
+agentrouter_sessions.json
+*_accounts.json
+*_checkin_state.json
+checkin_state.json
+keys_cache.json
+daily_usage.json
+newapi_sites.json
+checkin_settings.json
+*.bak*
+*.bak
+
+# ===== 本地环境与密钥 =====
+.env
+
+# ===== 日志 =====
+*.log
+
+# ===== 个人开发备忘（不属于开源项目本身）=====
+CLAUDE.md
+ccmd/
+
+# ===== 上游源码副本（仅本地参考，见 README 的上游链接）=====
+new-api/
+
+# ===== Python =====
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# ===== 其它本地工具 =====
+.claude/
+.wrangler/
