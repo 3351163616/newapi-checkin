@@ -30,6 +30,7 @@ const PROVIDER_PALETTE = [
 ];
 
 const money = (v: number | null | undefined) => (v === null || v === undefined ? "--" : `$${v.toFixed(2)}`);
+const signedMoney = (v: number) => `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
 
 const HeatmapRow = memo(function HeatmapRow({ name, provider, signedDays, days }: { name: string; provider: string; signedDays: Set<string>; days: { date: string }[] }) {
   return (
@@ -87,6 +88,11 @@ export function UsagePage() {
   const burn30 = visibleDays.length >= 30 ? visibleDays.slice(-30).reduce((s, d) => s + d.spend, 0) / 30 : null;
   const totalGain = visibleDays.reduce((s, d) => s + d.gain, 0);
   const totalBalance = stats ? stats.days[stats.days.length - 1]?.balance ?? 0 : 0;
+  // 最新两日有快照时给出总余额的日变动，直接回答「余额是否在涨」
+  const balanceDelta =
+    stats && stats.days.length >= 2
+      ? (stats.days[stats.days.length - 1]?.balance ?? 0) - (stats.days[stats.days.length - 2]?.balance ?? 0)
+      : null;
 
   if (historyQ.isError) return <ErrorState message={errorMessage(historyQ.error, "用量历史加载失败")} onRetry={() => void historyQ.refetch()} />;
 
@@ -115,7 +121,16 @@ export function UsagePage() {
           </>
         ) : (
           <>
-        <KpiCard label="总余额" value={money(totalBalance)} sub={stats?.dateRange ? `截至 ${stats.dateRange[1]}` : undefined} icon={Coins} iconClass="text-site-0" delay={0} />
+        <KpiCard
+          label="总余额"
+          value={money(totalBalance)}
+          sub={[balanceDelta !== null ? `较前一日 ${signedMoney(balanceDelta)}` : null, stats?.dateRange ? `截至 ${stats.dateRange[1]}` : undefined]
+            .filter(Boolean)
+            .join(" · ") || undefined}
+          icon={Coins}
+          iconClass="text-site-0"
+          delay={0}
+        />
         <KpiCard
           label="近 7 日日均消耗"
           value={money(burn7)}
@@ -132,7 +147,7 @@ export function UsagePage() {
           iconClass={pop30 !== null && pop30 > 5 ? "text-checkin-failed" : pop30 !== null && pop30 < -5 ? "text-checkin-done" : "text-site-2"}
           delay={120}
         />
-        <KpiCard label={`签到收益（${period} 天）`} value={money(totalGain)} sub="按 quota 日增量统计" icon={TrendingUp} iconClass="text-checkin-done" delay={180} />
+        <KpiCard label={`签到入账（${period} 天）`} value={money(totalGain)} sub="余额增量 + 消耗回补，精确口径" icon={TrendingUp} iconClass="text-checkin-done" delay={180} />
           </>
         )}
       </section>
@@ -182,6 +197,7 @@ export function UsagePage() {
                   <TableRow className="hover:bg-transparent">
                     <TableHead>账号</TableHead>
                     <TableHead className="text-right">余额</TableHead>
+                    <TableHead className="text-right">较昨日</TableHead>
                     <TableHead className="text-right">日均</TableHead>
                     <TableHead className="text-right">预计剩余</TableHead>
                   </TableRow>
@@ -196,6 +212,9 @@ export function UsagePage() {
                         </span>
                       </TableCell>
                       <TableCell className={cn("text-right font-data text-xs", a.balance < 10 && "text-balance-low")}>{money(a.balance)}</TableCell>
+                      <TableCell className={cn("text-right font-data text-xs", a.lastDelta !== null && a.lastDelta > 0 && "text-checkin-done")}>
+                        {a.lastDelta === null ? "--" : signedMoney(a.lastDelta)}
+                      </TableCell>
                       <TableCell className="text-right font-data text-xs">{money(a.burnRate7)}</TableCell>
                       <TableCell className={cn("text-right font-data text-xs", a.daysLeft !== null && a.daysLeft < 7 && "text-balance-low")}>
                         {a.daysLeft === null ? "∞" : `${Math.max(0, Math.floor(a.daysLeft))} 天`}

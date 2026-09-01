@@ -3,11 +3,14 @@
  * { "YYYY-MM-DD": { "provider:账号名": {used, quota, used0} } }，输出各种视图形状。
  * 与展示组件严格分离——方便单测，也方便灌 mock 数据验证视觉效果。
  *
- * 关键口径（与后端 balance_server.py:4066-4092 对齐）：
- * - 余额 = quota - used（美元）
+ * 关键口径（后端 query_* 存的原始字段，见 balance_server.py query_balance_newapi 等）：
+ * - quota = 剩余余额（new-api user.self 的 quota 字段，已按站点汇率折成美元）；used = 累计消耗
+ * - 余额 = quota。不要减 used——那是把累计消耗重复扣一遍（agentrouter 账号会算成负数）
  * - 每日消耗 = used - used0（当天基线）
- * - 签到收益：后端没有持久化签到历史（checkin_state.date 每轮覆盖），从 quota 的
- *   日增量反推——某天 quota 比前一天高 = 那天签到成功。这是近似值，UI 必须标注。
+ * - 签到/充值入账（精确）：消耗会同时压低余额、推高 used，所以真实入账 =
+ *   Δquota + Δused（相邻两天都有快照才计，断档视为新基线）。只把正数计入收益；
+ *   「签到了但被当天消耗吃掉」时入账≈0、余额变动为负，签到本身仍是成功的——
+ *   结合 signedDays（有入账的天）与 lastDelta（余额变动）即可区分这两种情况。
  */
 
 import type { UsageHistory, UsageDayMap } from "@/types";
@@ -18,7 +21,7 @@ export interface DayPoint {
   balance: number;
   /** 全账号当日消耗合计 */
   spend: number;
-  /** 全账号签到收益合计（quota 日增量） */
+  /** 全账号签到/充值入账合计（Δquota + Δused） */
   gain: number;
 }
 
@@ -34,11 +37,13 @@ export interface AccountStat {
   burnRate7: number;
   /** 近 30 日日均消耗 */
   burnRate30: number;
-  /** 签到收益合计（quota 日增量） */
+  /** 签到/充值入账合计（Δquota + Δused） */
   gain: number;
+  /** 最新一日余额变动（quota 相对前一日；首日或断档时为 null） */
+  lastDelta: number | null;
   /** 按近 7 日速率推算的剩余天数；消耗为 0 或无数据时为 null */
   daysLeft: number | null;
-  /** 热力图：每一天是否签到成功（按 quota 增量反推） */
+  /** 热力图：每一天是否有入账（签到奖励或充值，按 Δquota + Δused > 0 判定） */
   signedDays: Set<string>;
 }
 
@@ -63,11 +68,11 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
     let balance = 0;
     let spend = 0;
     for (const entry of Object.values(day)) {
-      balance += entry.quota - entry.used;
+      balance += entry.quota;
       spend += Math.max(0, entry.used - entry.used0);
     }
-    // gain 先置 0：精确的逐日签到收益在下面用 computeDailyGains 回填
-    // （按天聚合时拿不到前一日的 quota，在这里算不出增量）
+    // gain 先置 0：逐日入账在下面用 computeDailyGains 回填
+    // （按天聚合时拿不到前一日的快照，在这里算不出增量）
     return { date, balance: round2(balance), spend: round2(spend), gain: 0 };
   });
 
@@ -83,27 +88,38 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
     let spend = 0;
     let gain = 0;
     let prevQuota: number | null = null;
+    let prevUsed: number | null = null;
+    let lastDelta: number | null = null;
     const signedDays = new Set<string>();
     const spends: number[] = [];
 
     for (const date of dates) {
       const entry = history.history[date]![key];
       if (!entry) {
+        // 断档：无「昨日」可比，余额变动与入账都以本日为新基线
         prevQuota = null;
+        prevUsed = null;
+        lastDelta = null;
         continue;
       }
-      if (prevQuota !== null && entry.quota > prevQuota) {
-        gain += entry.quota - prevQuota;
-        signedDays.add(date);
+      if (prevQuota !== null && prevUsed !== null) {
+        // 真实入账 = 余额增量 + 消耗回补（两者同源，见文件头口径说明）
+        const credit = entry.quota - prevQuota + (entry.used - prevUsed);
+        if (credit > 0.005) {
+          gain += credit;
+          signedDays.add(date);
+        }
+        lastDelta = round2(entry.quota - prevQuota);
       }
       prevQuota = entry.quota;
+      prevUsed = entry.used;
       const daySpend = Math.max(0, entry.used - entry.used0);
       spend += daySpend;
       spends.push(daySpend);
     }
 
     const last = lastDay[key]!;
-    const balance = round2(last.quota - last.used);
+    const balance = round2(last.quota);
     const last7 = spends.slice(-7);
     const last30 = spends.slice(-30);
     const burn7 = last7.length > 0 ? last7.reduce((a, b) => a + b, 0) / last7.length : 0;
@@ -118,6 +134,7 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
       burnRate7: round2(burn7),
       burnRate30: round2(burn30),
       gain: round2(gain),
+      lastDelta,
       daysLeft: burn7 > 0.005 ? round2(balance / burn7) : null,
       signedDays,
     });
@@ -125,7 +142,7 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
     providerTotals.set(provider, (providerTotals.get(provider) ?? 0) + balance);
   }
 
-  // 签到收益回填到天数序列（按天聚合时拿不到前一日的 quota，这里单独算精确日增量）
+  // 逐日入账回填到天数序列（按天聚合时拿不到前一日快照，这里单独算）
   const gainsByDay = computeDailyGains(history.history, dates);
   for (const point of days) point.gain = gainsByDay.get(point.date) ?? 0;
 
@@ -140,16 +157,22 @@ export function computeUsageStats(history: UsageHistory, lowBalanceThreshold = 1
   };
 }
 
-/** 逐日签到收益（精确值）：当天各账号 quota 相对前一日（断档则视为新基线，不计收益）的增量合计 */
+/** 逐日入账（精确值）：各账号 quota+used 相对前一记录日（仅当日历相邻、断档不计）的真实增量合计 */
 export function computeDailyGains(history: Record<string, UsageDayMap>, dates: string[]): Map<string, number> {
   const gains = new Map<string, number>();
-  const prevQuotaByKey = new Map<string, number>();
-  for (const date of dates) {
+  const prevByKey = new Map<string, { quota: number; used: number; date: string }>();
+  for (let i = 0; i < dates.length; i++) {
+    const date = dates[i]!;
+    const prevDate = i > 0 ? dates[i - 1]! : null;
     let dayGain = 0;
     for (const [key, entry] of Object.entries(history[date]!)) {
-      const prev = prevQuotaByKey.get(key);
-      if (prev !== undefined && entry.quota > prev) dayGain += entry.quota - prev;
-      prevQuotaByKey.set(key, entry.quota);
+      const prev = prevByKey.get(key);
+      // 只有上一记录日恰好是前一天才算增量，否则是跨断档比较，会把多天的变化记到一天
+      if (prev && prevDate !== null && prev.date === prevDate) {
+        const credit = entry.quota - prev.quota + (entry.used - prev.used);
+        if (credit > 0.005) dayGain += credit;
+      }
+      prevByKey.set(key, { quota: entry.quota, used: entry.used, date });
     }
     gains.set(date, round2(dayGain));
   }
