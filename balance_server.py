@@ -2145,7 +2145,9 @@ async def index():
 			'<p>请在 <code>frontend/</code> 下执行 <code>pnpm install &amp;&amp; pnpm build</code>。</p>',
 			status_code=503,
 		)
-	return entry.read_text(encoding='utf-8')
+	# no-cache：每次都向服务器确认入口有没有更新。部署换版本后浏览器立刻拿新
+	# index.html，不会攥着旧产物的 hash 清单去请求已不存在的 chunk
+	return HTMLResponse(entry.read_text(encoding='utf-8'), headers={'Cache-Control': 'no-cache'})
 
 
 @app.get('/api/config')
@@ -4777,12 +4779,21 @@ async def frontend_catch_all(full_path: str):
 		candidate = (FRONTEND_DIST / full_path).resolve()
 		# 防目录穿越：解析后必须仍在 dist 内
 		if candidate.is_file() and candidate.is_relative_to(FRONTEND_DIST.resolve()):
-			return FileResponse(candidate)
+			# assets/ 下是带 content hash 的产物，内容变了文件名必变，可永久缓存
+			headers = {'Cache-Control': 'public, max-age=31536000, immutable'} if full_path.startswith('assets/') else None
+			return FileResponse(candidate, headers=headers)
+
+	# 长得像静态文件的路径缺了文件就老实 404，绝不能回退 index.html——浏览器会把
+	# HTML 当 JS 模块解析，报「Failed to fetch dynamically imported module」，看似
+	# 代码坏了，实际是旧标签页在请求旧 hash 的 chunk（部署后尚未刷新的页面）
+	last_segment = full_path.rsplit('/', 1)[-1]
+	if '.' in last_segment:
+		return JSONResponse({'success': False, 'error': f'静态资源不存在: /{full_path}'}, status_code=404)
 
 	entry = frontend_index()
 	if entry is None:
 		return JSONResponse({'success': False, 'error': '前端资源缺失'}, status_code=503)
-	return HTMLResponse(entry.read_text(encoding='utf-8'))
+	return HTMLResponse(entry.read_text(encoding='utf-8'), headers={'Cache-Control': 'no-cache'})
 
 
 if __name__ == '__main__':

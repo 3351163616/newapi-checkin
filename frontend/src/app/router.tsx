@@ -2,14 +2,17 @@ import { Navigate, createBrowserRouter } from "react-router-dom";
 
 import { AnonymousBoundary, AuthBoundary } from "@/app/auth-boundary";
 import { DeferredAccountsPage, DeferredAppShell, DeferredCheckinPage, DeferredDashboardPage, DeferredKeysPage, DeferredSettingsPage, DeferredSitesPage, DeferredUsagePage } from "@/app/deferred-pages";
+import { RouteError } from "@/app/route-error";
 import { LoginPage } from "@/features/auth/login-page";
 
 export const router = createBrowserRouter([
   {
+    errorElement: <RouteError />,
     element: <AnonymousBoundary />,
     children: [{ path: "/login", element: <LoginPage /> }],
   },
   {
+    errorElement: <RouteError />,
     element: <AuthBoundary />,
     children: [
       {
