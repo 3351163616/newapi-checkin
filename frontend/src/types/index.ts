@@ -79,6 +79,8 @@ export interface NewapiSite {
   auto_checkin: boolean;
   accounts_file: string;
   state_file: string;
+  /** 三态健康状态：ok（有可用账号）/ invalid（全部失败）/ unknown（无账号或未检查） */
+  status?: { status: "ok" | "invalid" | "unknown"; error?: string; checked_at?: number };
 }
 
 /** POST /api/sites 的写入体：只有 id/label/domain 是 pydantic 必填，其余字段有默认值 */
@@ -86,6 +88,7 @@ export type NewapiSiteInput = Pick<NewapiSite, "id" | "label" | "domain"> & Part
 
 export interface SitesResponse {
   sites: NewapiSite[];
+  collect_key_ready?: boolean;
 }
 
 /** POST /api/sites/probe 探测结果 */

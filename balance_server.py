@@ -28,6 +28,7 @@ _AGENTROUTER_PROXY = _LOCAL_PROXY
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -66,6 +67,10 @@ app = FastAPI(title='New API Balance Manager', lifespan=_lifespan)
 # 未设置 AUTH_PASSWORD 时自动生成随机密码写回 .env —— 开箱即用且每次部署都不同。
 AUTH_USERNAME = os.environ.get('AUTH_USERNAME') or 'admin'
 AUTH_PASSWORD = os.environ.get('AUTH_PASSWORD') or ''
+
+# 书签采集密钥：/api/collect 的防滥用口令（登录后从「站点管理」复制书签脚本时内嵌）
+# 未设置时采集端点禁用
+COLLECT_KEY = os.environ.get('COLLECT_KEY') or ''
 if not AUTH_PASSWORD:
 	AUTH_PASSWORD = uuid.uuid4().hex + uuid.uuid4().hex[:8]
 	try:
@@ -121,7 +126,8 @@ async def check_auth(request: Request):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
 	path = request.url.path
-	if path in ('/', '/api/login', '/api/logout', '/api/check-auth') or not path.startswith('/api'):
+	# /api/collect 免登录：书签脚本在站点页面上下文调用，靠 COLLECT_KEY 防滥用
+	if path in ('/', '/api/login', '/api/logout', '/api/check-auth', '/api/collect') or not path.startswith('/api'):
 		return await call_next(request)
 	auth_header = request.headers.get('Authorization', '')
 	if not auth_header.startswith('Bearer '):
@@ -344,6 +350,40 @@ class NewapiAccountItem(BaseModel):
 	name: str
 	access_token: str
 	user_id: str
+
+
+class CollectRequest(BaseModel):
+	"""书签脚本上报的账号信息（方案 A：登录站点后一键采集 token）"""
+
+	site_url: str
+	access_token: str
+	user_id: str = ''
+	name: str = ''
+	key: str = ''
+
+
+# ── 站点健康状态（三态：ok / invalid / unknown）────────────────────────
+_SITE_STATUS_FILE = Path(__file__).parent / 'site_status.json'
+_site_status: dict[str, dict] = {}
+
+
+def _load_site_status() -> None:
+	global _site_status
+	try:
+		_site_status = json.loads(_SITE_STATUS_FILE.read_text(encoding='utf-8'))
+	except Exception:
+		_site_status = {}
+
+
+def _set_site_status(site_id: str, status: str, error: str = '') -> None:
+	_site_status[site_id] = {'status': status, 'error': error, 'checked_at': int(time.time())}
+	try:
+		_SITE_STATUS_FILE.write_text(json.dumps(_site_status, ensure_ascii=False, indent=2), encoding='utf-8')
+	except Exception:
+		pass
+
+
+_load_site_status()
 
 
 class NewapiSite(BaseModel):
@@ -3024,8 +3064,123 @@ def _site_or_error(site_id: str) -> tuple[NewapiSite | None, dict | None]:
 
 @app.get('/api/sites')
 async def get_sites():
-	"""返回所有通用 new-api 站点配置，供前端渲染切换器与站点管理"""
-	return {'success': True, 'sites': [s.model_dump() for s in load_newapi_sites()]}
+	"""返回所有通用 new-api 站点配置，附带三态健康状态"""
+	return {
+		'success': True,
+		'sites': [
+			{**s.model_dump(), 'status': _site_status.get(s.id, {'status': 'unknown', 'error': ''})}
+			for s in load_newapi_sites()
+		],
+		'collect_key_ready': bool(COLLECT_KEY),
+	}
+
+
+@app.get('/api/collect/key')
+async def collect_key():
+	"""返回书签采集密钥（前端生成书签脚本用），未启用时返回空"""
+	return {'success': True, 'key': COLLECT_KEY}
+
+
+@app.options('/api/collect')
+async def collect_preflight(request: Request):
+	"""CORS 预检：书签脚本从站点页面跨域调用，需放行"""
+	return Response(
+		status_code=204,
+		headers={
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Methods': 'POST, OPTIONS',
+			'Access-Control-Allow-Headers': 'Content-Type',
+			'Access-Control-Max-Age': '86400',
+		},
+	)
+
+
+@app.post('/api/collect')
+async def collect_token(req: CollectRequest, request: Request):
+	"""书签脚本采集端点：按 site_url 匹配站点，验证 token 后写入配置。
+
+	书签脚本运行在站点页面上下文（可读该站 localStorage），因此需要 CORS 放行；
+	`key` 与 COLLECT_KEY 一致才接受（防他人往配置里塞 token）。
+	"""
+	# CORS：预检与真实请求都放行（仅此端点）
+	origin = request.headers.get('origin', '*')
+	if request.method == 'OPTIONS':
+		return Response(
+			status_code=204,
+			headers={
+				'Access-Control-Allow-Origin': '*',
+				'Access-Control-Allow-Methods': 'POST, OPTIONS',
+				'Access-Control-Allow-Headers': 'Content-Type',
+				'Access-Control-Max-Age': '86400',
+			},
+		)
+
+	if not COLLECT_KEY:
+		return JSONResponse(
+			status_code=503,
+			content={'success': False, 'error': '采集功能未启用（服务器未配置 COLLECT_KEY）'},
+			headers={'Access-Control-Allow-Origin': origin},
+		)
+	if not req.key or not hmac.compare_digest(req.key, COLLECT_KEY):
+		return JSONResponse(
+			status_code=401,
+			content={'success': False, 'error': '采集密钥无效'},
+			headers={'Access-Control-Allow-Origin': origin},
+		)
+
+	site = next(
+		(s for s in load_newapi_sites() if s.domain.rstrip('/') == req.site_url.rstrip('/')),
+		None,
+	)
+	if site is None:
+		return {'success': False, 'error': f'站点 {req.site_url} 未接入（先在「站点管理」添加）'}
+
+	# 验证 token：带 Chrome 指纹调 user/self
+	verify_account = NewapiAccountItem(name='__verify__', access_token=req.access_token, user_id=req.user_id or '')
+	try:
+		resp = await anyrouter_request('GET', f'{site.domain}{site.user_info_path}', _newapi_headers(site, verify_account))
+		body = resp.text or ''
+		status = resp.status_code
+	except Exception as e:
+		_set_site_status(site.id, 'invalid', f'验证请求异常: {type(e).__name__}')
+		return {'success': False, 'error': f'验证请求异常: {type(e).__name__}: {str(e)[:80]}'}
+
+	if status in (401, 403) or '无权' in body or 'token' in body.lower() and status != 200:
+		_set_site_status(site.id, 'invalid', f'HTTP {status}')
+		return {'success': False, 'error': f'token 无效（HTTP {status}）'}
+
+	try:
+		data = json.loads(body)
+	except Exception:
+		_set_site_status(site.id, 'invalid', f'响应非 JSON（HTTP {status}）')
+		return {'success': False, 'error': f'站点返回非 JSON（HTTP {status}），可能被风控拦截'}
+
+	if isinstance(data, dict) and data.get('success') is False:
+		msg = str(data.get('error') or data.get('message') or '未知错误')[:100]
+		_set_site_status(site.id, 'invalid', msg)
+		return {'success': False, 'error': f'站点拒绝: {msg}'}
+
+	# new-api 的 user/self 返回 {success, data: {id, username, ...}}，id 在 data 里
+	inner = data.get('data', {}) if isinstance(data, dict) else {}
+	user_id = str(req.user_id or inner.get('id') or data.get('id') or '')
+	if not user_id:
+		return {'success': False, 'error': '未能从响应取到 user id，请确认账号有效后重试'}
+
+	# 写入配置：同名或同 user_id 覆盖，否则追加
+	accounts = load_newapi_accounts(site)
+	username = inner.get('username') or inner.get('display_name') or req.name or 'user'
+	name = username
+	existing = [a for a in accounts if a.user_id == user_id or a.name == name]
+	replaced = bool(existing)
+	if existing:
+		accounts = [a for a in accounts if a not in existing]
+	accounts.append(NewapiAccountItem(name=name, access_token=req.access_token, user_id=user_id))
+	save_newapi_accounts(site, accounts)
+	_set_site_status(site.id, 'ok', '')
+	return {
+		'success': True,
+		'message': f'{site.label} 账号 {name} 已更新（{"覆盖" if replaced else "新增"}）',
+	}
 
 
 @app.post('/api/sites')
@@ -3128,6 +3283,11 @@ async def query_site(site_id: str):
 
 	results = await asyncio.gather(*[_limited(a) for a in accounts])
 	ok = [r for r in results if r.get('success')]
+	if ok:
+		_set_site_status(site.id, 'ok', '')
+	else:
+		errors = '; '.join(str(r.get('error', ''))[:60] for r in results if not r.get('success'))
+		_set_site_status(site.id, 'invalid', errors[:200])
 	return {
 		'success': True,
 		'results': results,
@@ -4167,7 +4327,10 @@ async def take_daily_snapshot():
 	# 由 record_account_usage() 增量写入今日快照，避免重复请求登录接口。
 
 	# 3. 通用 new-api 站点账号（不走 WAF/代理，各站点独立并发查询）
+	#    auto_checkin=false 的站点视为「服务器不再碰它」：不签到也不查快照（避免风控/封号）
 	for site in load_newapi_sites():
+		if not site.auto_checkin:
+			continue
 		site_accounts = load_newapi_accounts(site)
 		if not site_accounts:
 			continue

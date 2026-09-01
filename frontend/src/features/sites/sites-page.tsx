@@ -1,26 +1,55 @@
 import { useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Globe, Loader2, Plus, Radar, ShieldCheck, Trash2 } from "lucide-react";
+import { CheckCircle2, Circle, ClipboardCopy, Globe, Loader2, Plus, Radar, ShieldCheck, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { EmptyState, ErrorState, LoadingState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
-import { apiPost } from "@/shared/api/client";
+import { apiGet, apiPost } from "@/shared/api/client";
 import { getSiteTurnstile } from "@/features/checkin/checkin-api";
 import { siteDotClass } from "@/shared/lib/site-color";
 import type { NewapiSite, SiteProbeResponse, SitesResponse } from "@/types";
 
-import { fetchSiteAccounts, fetchSites } from "@/features/accounts/accounts-api";
+import { fetchSiteAccounts, fetchSitesFull } from "@/features/accounts/accounts-api";
 import { errorMessage } from "@/features/checkin/checkin-format";
+
+/** 生成书签采集脚本：登录任意站点后点一下，自动读取 localStorage 的 token 并上报回填 */
+function buildBookmarklet(key: string, origin: string) {
+  const k = JSON.stringify(key);
+  const e = JSON.stringify(`${origin}/api/collect`);
+  return `javascript:(function(){var k=${k},e=${e};var t="";var ks=["access_token","accessToken","new_api_token","new-api-token","user_token","token"];for(var i=0;i<ks.length&&!t;i++){try{var v=localStorage.getItem(ks[i]);if(v&&v.length>8&&v.indexOf("{")<0)t=v}catch(x){}}if(!t){for(var j=0;j<localStorage.length&&!t;j++){var kk=localStorage.key(j),vv=localStorage.getItem(kk);if(vv&&vv.length<5000&&(vv.indexOf("access_token")>-1||vv.indexOf("accessToken")>-1)){try{var o=JSON.parse(vv);if(o.access_token)t=o.access_token}catch(x){}}}}if(!t){alert("未找到 token，请确认已登录");return}fetch(e,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({site_url:location.origin,access_token:t,user_id:""})}).then(function(r){return r.json()}).then(function(d){alert(d.success?"[OK] "+d.message:"[失败] "+(d.error||""))}).catch(function(){alert("连接采集服务失败")})})();`;
+}
+
+function StatusDot({ site }: { site: NewapiSite }) {
+  const st = site.status?.status ?? "unknown";
+  const err = site.status?.error;
+  const common = "size-3.5 shrink-0";
+  if (st === "ok") {
+    return <CheckCircle2 className={`${common} text-checkin-done`} aria-label="账号可用" />;
+  }
+  if (st === "invalid") {
+    return (
+      <span className="shrink-0" title={err ? `最近检查失败：${err}` : "账号不可用"}>
+        <XCircle className="size-3.5 text-destructive" aria-label="账号不可用" />
+      </span>
+    );
+  }
+  return (
+    <span className="shrink-0" title="无账号或未检查">
+      <Circle className="size-3.5 text-muted-foreground/40" aria-label="无账号" />
+    </span>
+  );
+}
 
 export function SitesPage() {
   const queryClient = useQueryClient();
-  const sitesQ = useQuery({ queryKey: ["accounts", "sites"], queryFn: fetchSites });
-  const sites = sitesQ.data ?? [];
+  const sitesQ = useQuery({ queryKey: ["accounts", "sites"], queryFn: fetchSitesFull });
+  const sites = sitesQ.data?.sites ?? [];
 
   const countsQ = useQuery({
     queryKey: ["accounts", "site-accounts", sites.map((s) => s.id)] as const,
@@ -37,8 +66,25 @@ export function SitesPage() {
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<{ domain: string; ok: boolean; system_name: string; version: string; checkin_enabled: boolean; turnstile_check: boolean; quota_per_unit: number } | null>(null);
   const [adding, setAdding] = useState(false);
+  const [collectOpen, setCollectOpen] = useState(false);
+  const collectKeyQ = useQuery({
+    queryKey: ["sites", "collect-key"],
+    queryFn: async () => (await apiGet<{ success: boolean; key: string }>("/collect/key")).key,
+    enabled: collectOpen,
+  });
 
   if (sitesQ.isError) return <ErrorState message={errorMessage(sitesQ.error, "站点列表加载失败")} onRetry={() => void sitesQ.refetch()} />;
+
+  const bookmarklet = collectKeyQ.data ? buildBookmarklet(collectKeyQ.data, window.location.origin) : "";
+
+  async function copyBookmarklet() {
+    try {
+      await navigator.clipboard.writeText(bookmarklet);
+      toast.success("已复制采集脚本——在浏览器书签栏新建书签，地址栏粘贴即可");
+    } catch {
+      toast.error("复制失败，请手动选中下方脚本复制");
+    }
+  }
 
   async function onProbe() {
     if (!newDomain.trim()) {
@@ -104,7 +150,16 @@ export function SitesPage() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="站点管理" description="接入任意 new-api 同构站点" />
+      <PageHeader
+        title="站点管理"
+        description="接入任意 new-api 同构站点"
+        actions={
+          <Button variant="outline" onClick={() => setCollectOpen(true)}>
+            <ClipboardCopy className="size-3.5" aria-hidden="true" />
+            采集 Token
+          </Button>
+        }
+      />
 
       <section className="rounded-lg bg-card p-4 sm:p-5">
         <h2 className="text-sm font-medium">接入新站点</h2>
@@ -160,6 +215,49 @@ export function SitesPage() {
           ))}
         </div>
       )}
+
+      <Sheet open={collectOpen} onOpenChange={setCollectOpen}>
+        <SheetContent className="w-full sm:max-w-lg">
+          <SheetHeader>
+            <SheetTitle>采集 Token</SheetTitle>
+            <SheetDescription>
+              登录站点后一键回填 access_token：登录 → 点书签 → 自动验证并写入配置。
+            </SheetDescription>
+          </SheetHeader>
+          <div className="mt-4 space-y-4 text-sm">
+            {sitesQ.data?.collect_key_ready === false ? (
+              <p className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
+                服务器未启用采集功能（缺少 COLLECT_KEY 环境变量）——在服务器 .env 里加一行 COLLECT_KEY=任意随机字符串后重启服务。
+              </p>
+            ) : null}
+            <ol className="list-decimal space-y-1 pl-5 text-xs text-muted-foreground">
+              <li>把下面的脚本存为浏览器书签（书签栏右键 → 添加网页 → 名称随意，地址粘贴脚本）</li>
+              <li>打开目标站点控制台并登录（页面需已登录，token 存在浏览器本地）</li>
+              <li>在站点页面上点击这个书签，脚本自动读取 token 并回填到本系统</li>
+              <li>回到本页面查看状态点：<CheckCircle2 className="inline size-3 text-checkin-done" aria-hidden="true" /> 绿 = 可用，<XCircle className="inline size-3 text-destructive" aria-hidden="true" /> 红 = 失败，<Circle className="inline size-3 text-muted-foreground/40" aria-hidden="true" /> 灰 = 无账号</li>
+            </ol>
+            {collectKeyQ.isLoading ? (
+              <p className="text-xs text-muted-foreground">加载中…</p>
+            ) : collectKeyQ.data ? (
+              <div className="space-y-2">
+                <textarea
+                  readOnly
+                  value={bookmarklet}
+                  rows={7}
+                  className="w-full resize-none rounded-md border bg-muted/40 p-2 font-data text-[11px] leading-relaxed"
+                  onFocus={(e) => e.currentTarget.select()}
+                />
+                <Button size="sm" onClick={() => void copyBookmarklet()}>
+                  <ClipboardCopy className="size-3.5" aria-hidden="true" />
+                  复制脚本
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">采集密钥加载失败，请刷新重试。</p>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }
@@ -181,6 +279,7 @@ function SiteCard({ site, count, index, onDelete }: { site: NewapiSite; count: n
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className={siteDotClass(site.id)} aria-hidden="true" />
+            <StatusDot site={site} />
             <h3 className="truncate text-sm font-medium">{site.label}</h3>
             <span className="font-data shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{site.id}</span>
           </div>
@@ -194,6 +293,11 @@ function SiteCard({ site, count, index, onDelete }: { site: NewapiSite; count: n
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
         <Badge variant="secondary" className="text-[11px]">{count} 个账号</Badge>
+        {site.status?.status === "invalid" && site.status.error ? (
+          <Badge variant="outline" className="max-w-full truncate border-destructive/40 text-[11px] text-destructive" title={site.status.error}>
+            {site.status.error}
+          </Badge>
+        ) : null}
         {turnstile ? (
           turnstile.enabled ? (
             <Badge variant="secondary" className="text-[11px] text-checkin-pending">Turnstile · 浏览器脚本</Badge>

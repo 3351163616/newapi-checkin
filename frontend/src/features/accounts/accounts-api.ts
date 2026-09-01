@@ -30,6 +30,11 @@ export function fetchSites(): Promise<NewapiSite[]> {
   return apiGet<SitesResponse>("/sites").then((r) => r.sites);
 }
 
+/** GET /api/sites（带 collect_key_ready）——站点管理页用 */
+export function fetchSitesFull(): Promise<SitesResponse> {
+  return apiGet<SitesResponse>("/sites");
+}
+
 /** GET /api/config —— accounts 字段是 cookie 账号；email/monitor 由设置页拥有，这里只读不动 */
 export function fetchSavedConfig(): Promise<SavedConfig | null> {
   return apiGet<SavedConfigResponse>("/config").then((r) => r.data);
