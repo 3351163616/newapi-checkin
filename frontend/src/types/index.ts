@@ -89,6 +89,8 @@ export type NewapiSiteInput = Pick<NewapiSite, "id" | "label" | "domain"> & Part
 export interface SitesResponse {
   sites: NewapiSite[];
   collect_key_ready?: boolean;
+  /** 仅 GET /api/sites?with_counts=1 返回：站点 id → 账号数 */
+  counts?: Record<string, number>;
 }
 
 /** POST /api/sites/probe 探测结果 */

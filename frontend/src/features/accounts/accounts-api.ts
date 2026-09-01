@@ -30,9 +30,9 @@ export function fetchSites(): Promise<NewapiSite[]> {
   return apiGet<SitesResponse>("/sites").then((r) => r.sites);
 }
 
-/** GET /api/sites（带 collect_key_ready）——站点管理页用 */
+/** GET /api/sites?with_counts=1（带 collect_key_ready 和各站点账号数）——站点管理页用 */
 export function fetchSitesFull(): Promise<SitesResponse> {
-  return apiGet<SitesResponse>("/sites");
+  return apiGet<SitesResponse>("/sites?with_counts=1");
 }
 
 /** GET /api/config —— accounts 字段是 cookie 账号；email/monitor 由设置页拥有，这里只读不动 */

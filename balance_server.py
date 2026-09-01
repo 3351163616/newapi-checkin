@@ -151,15 +151,39 @@ def _atomic_write_json(path: Path, data, indent: int | None = None) -> None:
 	tmp = path.with_name(path.name + '.tmp')
 	tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding='utf-8')
 	os.replace(tmp, path)
+	# 本进程是这些配置文件唯一的写入方，写完直接丢缓存，下次读按新 mtime 重建
+	_json_cache.pop(path, None)
+
+
+# 配置文件读多写少（几乎每个 API 请求都要 load 一遍账号/站点清单），
+# 按 (mtime_ns, size) 缓存解析结果：文件没变就只做一次 stat，不再反复读盘 + json.loads。
+# 进程外手动改文件也会因 mtime 变化自动失效。
+_json_cache: dict[Path, tuple[tuple[int, int], object]] = {}
+
+
+def _read_json_cached(path: Path) -> object:
+	"""读 JSON 并走 mtime 缓存；文件不存在抛 FileNotFoundError，损坏抛 JSONDecodeError"""
+	try:
+		st = path.stat()
+	except OSError as e:
+		_json_cache.pop(path, None)
+		raise FileNotFoundError(str(path)) from e
+	stamp = (st.st_mtime_ns, st.st_size)
+	cached = _json_cache.get(path)
+	if cached is not None and cached[0] == stamp:
+		return cached[1]
+	data = json.loads(path.read_text(encoding='utf-8'))
+	_json_cache[path] = (stamp, data)
+	return data
 
 
 def _read_json_models(path: Path, model, tag: str) -> list:
 	"""读取「JSON 数组 + pydantic 模型」配置文件的公共样板；文件不存在或损坏都返回空列表"""
-	if not path.exists():
-		return []
 	try:
-		data = json.loads(path.read_text(encoding='utf-8'))
+		data = _read_json_cached(path)
 		return [model(**item) for item in data]
+	except FileNotFoundError:
+		return []
 	except Exception as e:
 		print(f'[{tag}] 加载 {path.name} 失败: {e}')
 		return []
@@ -431,10 +455,29 @@ class EmailConfig(BaseModel):
 
 
 class MonitorStartRequest(BaseModel):
-	accounts: list[AccountItem]
+	# accounts 为空时后端自动收集全部账号（token + 站点 + cookie）监控，且循环每轮
+	# 重新收集——监控期间增删账号即时生效；传入时为 [{kind: cookie|token|site, ...}]
+	# 的宽松字典（兼容旧前端传 CookieAccount[]），固定用这份快照
+	accounts: list[dict] = []
 	email: EmailConfig
 	interval_hours: float = 6
 	threshold: float = 10.0
+
+
+def _collect_monitor_accounts() -> list[dict]:
+	"""收集全部可监控账号：token（anyrouter）+ 各站点 + cookie"""
+	accounts: list[dict] = []
+	for a in load_token_accounts():
+		accounts.append({'kind': 'token', 'name': a.name, 'access_token': a.access_token, 'user_id': a.user_id})
+	for site in load_newapi_sites():
+		for a in load_newapi_accounts(site):
+			accounts.append({
+				'kind': 'site', 'site_id': site.id, 'name': a.name,
+				'access_token': a.access_token, 'user_id': a.user_id,
+			})
+	for a in load_cookie_accounts():
+		accounts.append({'kind': 'cookie', 'name': a.name, 'cookies': a.cookies, 'api_user': a.api_user})
+	return accounts
 
 
 # 监控状态
@@ -1507,7 +1550,7 @@ def load_cookie_accounts() -> list[AccountItem]:
 	if not CONFIG_FILE.exists():
 		return []
 	try:
-		data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+		data = _read_json_cached(CONFIG_FILE)
 		accounts = data.get('accounts', []) if isinstance(data, dict) else data
 		return [AccountItem(**a) for a in accounts]
 	except Exception as e:
@@ -1916,37 +1959,94 @@ def send_alert_email(email_cfg: EmailConfig, subject: str, body: str):
 		server.send_message(msg)
 
 
-async def monitor_loop(config: MonitorStartRequest):
-	"""监控主循环"""
+def _monitor_alert_key(acc: dict) -> str:
+	"""告警去重键：不同站点的账号可能同名，只用名字会互相吞掉告警"""
+	return f"{acc.get('kind', 'cookie')}:{acc.get('site_id', '')}/{acc.get('name', '?')}"
+
+
+async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
+	"""监控主循环
+
+	自动收集模式（请求里 accounts=[]）每轮重新收集账号，监控期间新增/删除账号
+	即时生效；显式传入账号列表则固定用这份快照。
+	"""
+	auto_accounts = not config.accounts
 	interval_seconds = config.interval_hours * 3600
 	add_monitor_log(
-		f'监控启动：间隔 {config.interval_hours}h，阈值 ${config.threshold}，共 {len(config.accounts)} 个账号'
+		f'监控启动：间隔 {config.interval_hours}h，阈值 ${config.threshold}，共 {len(accounts)} 个账号'
 	)
 
 	while monitor_state['running']:
 		monitor_state['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		add_monitor_log('开始检测余额...')
 
-		try:
-			waf_cookies = await _get_waf_cookies_if_needed()
-			if not waf_cookies :
-				add_monitor_log('WAF cookies 获取失败，跳过本次检测')
-			else:
+		if auto_accounts:
+			accounts = _collect_monitor_accounts()
+			monitor_state['config']['account_count'] = len(accounts)
+		add_monitor_log(f'开始检测余额...（{len(accounts)} 个账号）')
+
+		if not accounts:
+			add_monitor_log('没有可监控的账号，本轮跳过')
+		else:
+			try:
+				waf_cookies = await _get_waf_cookies_if_needed()
 				sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
 
-				async def limited_query(acc):
+				async def limited_query(acc: dict):
 					async with sem:
-						return await query_balance(acc, waf_cookies)
+						kind = acc.get('kind', 'cookie')
+						if kind == 'site':
+							site = get_newapi_site(acc.get('site_id', ''))
+							if site is None:
+								return {'name': acc.get('name', '?'), 'success': False, 'error': '站点不存在'}
+							return await query_balance_newapi(
+								site,
+								NewapiAccountItem(
+									name=acc.get('name', '?'),
+									access_token=acc.get('access_token', ''),
+									user_id=acc.get('user_id', ''),
+								),
+							)
+						if kind == 'token':
+							return await query_balance_with_token(
+								TokenAccountItem(
+									name=acc.get('name', '?'),
+									access_token=acc.get('access_token', ''),
+									user_id=acc.get('user_id', ''),
+								),
+								waf_cookies,
+							)
+						# cookie 方式（anyrouter）：需要 WAF cookies
+						if not waf_cookies:
+							return {'name': acc.get('name', '?'), 'success': False, 'error': 'WAF cookies 获取失败'}
+						return await query_balance(
+							AccountItem(
+								name=acc.get('name', '?'),
+								cookies=acc.get('cookies', {}) or {},
+								api_user=acc.get('api_user', ''),
+							),
+							waf_cookies,
+						)
 
-				tasks = [limited_query(acc) for acc in config.accounts]
-				results = await asyncio.gather(*tasks)
+				tasks = [limited_query(acc) for acc in accounts]
+				# return_exceptions=True：单个账号查询抛异常只算它自己失败，
+				# 不让 gather 把整轮结果全部作废
+				results = await asyncio.gather(*tasks, return_exceptions=True)
 
 				low_balance = []
 				all_balances = []  # 所有账号余额
 				total_quota = 0
 				total_used = 0
 
-				for r in results:
+				# results 顺序与 accounts 一致，配对取告警键
+				for acc, r in zip(accounts, results):
+					name = acc.get('name', '?')
+					alert_key = _monitor_alert_key(acc)
+
+					if isinstance(r, BaseException):
+						add_monitor_log(f'{name}: 查询异常 - {type(r).__name__}: {str(r)[:80]}')
+						all_balances.append({'name': name, 'success': False, 'error': str(r)[:120]})
+						continue
+
 					if not r.get('success'):
 						add_monitor_log(f'{r["name"]}: 查询失败 - {r.get("error", "")}')
 						all_balances.append({'name': r['name'], 'success': False, 'error': r.get('error', '')})
@@ -1957,13 +2057,13 @@ async def monitor_loop(config: MonitorStartRequest):
 					total_used += r['used']
 
 					if r['quota'] < config.threshold:
-						if r['name'] not in monitor_state['alerted_accounts']:
+						if alert_key not in monitor_state['alerted_accounts']:
 							low_balance.append(r)
-							monitor_state['alerted_accounts'].add(r['name'])
+							monitor_state['alerted_accounts'].add(alert_key)
 							add_monitor_log(f'{r["name"]}: 余额 ${r["quota"]} 低于阈值 ${config.threshold}')
 					else:
 						# 余额恢复，移除告警标记，下次再低于阈值会重新告警
-						monitor_state['alerted_accounts'].discard(r['name'])
+						monitor_state['alerted_accounts'].discard(alert_key)
 
 				if low_balance:
 					subject = f'⚠️ AnyRouter 余额告警：{len(low_balance)} 个账号余额不足'
@@ -1997,8 +2097,8 @@ async def monitor_loop(config: MonitorStartRequest):
 						add_monitor_log(f'邮件发送失败：{str(e)[:80]}')
 				else:
 					add_monitor_log('所有账号余额正常')
-		except Exception as e:
-			add_monitor_log(f'检测出错：{str(e)[:80]}')
+			except Exception as e:
+				add_monitor_log(f'检测出错：{str(e)[:80]}')
 
 		# 计算下次检测时间
 		next_time = datetime.now().timestamp() + interval_seconds
@@ -2053,8 +2153,7 @@ async def get_config():
 	"""读取保存的配置"""
 	if CONFIG_FILE.exists():
 		try:
-			data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-			return {'success': True, 'data': data}
+			return {'success': True, 'data': _read_json_cached(CONFIG_FILE)}
 		except Exception as e:
 			return {'success': False, 'error': str(e)}
 	return {'success': True, 'data': None}
@@ -3063,22 +3162,83 @@ def _site_or_error(site_id: str) -> tuple[NewapiSite | None, dict | None]:
 
 
 @app.get('/api/sites')
-async def get_sites():
-	"""返回所有通用 new-api 站点配置，附带三态健康状态"""
-	return {
+async def get_sites(with_counts: bool = False):
+	"""返回所有通用 new-api 站点配置，附带三态健康状态
+
+	with_counts=true 时附带各站点账号数（站点管理页用）——读盘走 mtime 缓存，
+	顺带返回比前端对每个站点各发一次 /site/{id}/accounts 便宜得多。
+	"""
+	sites = load_newapi_sites()
+	resp: dict = {
 		'success': True,
 		'sites': [
 			{**s.model_dump(), 'status': _site_status.get(s.id, {'status': 'unknown', 'error': ''})}
-			for s in load_newapi_sites()
+			for s in sites
 		],
 		'collect_key_ready': bool(COLLECT_KEY),
 	}
+	if with_counts:
+		resp['counts'] = {s.id: len(load_newapi_accounts(s)) for s in sites}
+	return resp
 
 
 @app.get('/api/collect/key')
 async def collect_key():
 	"""返回书签采集密钥（前端生成书签脚本用），未启用时返回空"""
 	return {'success': True, 'key': COLLECT_KEY}
+
+
+def _token_rejected(status: int, body: str) -> bool:
+	"""识别 new-api 的 token 拒绝响应：401/403、正文含「无权」，或 4xx 且正文提到 token。
+
+	只认 4xx：5xx/限流页正文也常带 "token" 字样，不能据此判 token 无效。
+	"""
+	return status in (401, 403) or '无权' in body or ('token' in body.lower() and 400 <= status < 500)
+
+
+async def _collect_anyrouter_token(req: CollectRequest) -> dict:
+	"""anyrouter.top 的采集：验证后写入 new_accounts_config.json（provider=anyrouter）"""
+	headers = {
+		'User-Agent': USER_AGENT,
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Referer': ANYROUTER_CONFIG['domain'],
+		'Origin': ANYROUTER_CONFIG['domain'],
+		'Authorization': f'Bearer {req.access_token}',
+		ANYROUTER_CONFIG['api_user_key']: req.user_id or '0',
+	}
+	try:
+		resp = await anyrouter_request('GET', _api_url(ANYROUTER_CONFIG['user_info_path']), headers)
+		body = resp.text or ''
+		status = resp.status_code
+	except Exception as e:
+		return {'success': False, 'error': f'验证请求异常: {type(e).__name__}: {str(e)[:80]}'}
+
+	if _token_rejected(status, body):
+		return {'success': False, 'error': f'token 无效（HTTP {status}）'}
+
+	try:
+		data = json.loads(body)
+	except Exception:
+		return {'success': False, 'error': f'站点返回非 JSON（HTTP {status}）'}
+
+	if isinstance(data, dict) and data.get('success') is False:
+		msg = str(data.get('error') or data.get('message') or '未知错误')[:100]
+		return {'success': False, 'error': f'站点拒绝: {msg}'}
+
+	inner = data.get('data', {}) if isinstance(data, dict) else {}
+	user_id = str(req.user_id or inner.get('id') or data.get('id') or '')
+	if not user_id:
+		return {'success': False, 'error': '未能从响应取到 user id，请确认账号有效后重试'}
+
+	username = inner.get('username') or data.get('username') or req.name or 'user'
+	accounts = load_token_accounts()
+	replaced = any(a.user_id == user_id or a.name == username for a in accounts)
+	accounts = [a for a in accounts if a.user_id != user_id and a.name != username]
+	accounts.append(TokenAccountItem(name=username, access_token=req.access_token, user_id=user_id, provider='anyrouter'))
+	_atomic_write_json(NEW_ACCOUNTS_FILE, [a.model_dump() for a in accounts], indent=2)
+	_set_site_status('anyrouter', 'ok', '')
+	return {'success': True, 'message': f'AnyRouter 账号 {username} 已更新（{"覆盖" if replaced else "新增"}）'}
 
 
 @app.options('/api/collect')
@@ -3133,6 +3293,9 @@ async def collect_token(req: CollectRequest, request: Request):
 		None,
 	)
 	if site is None:
+		# anyrouter.top 是专用账号（provider=anyrouter，存 new_accounts_config.json），单独处理
+		if req.site_url.rstrip('/') == ANYROUTER_CONFIG['domain']:
+			return await _collect_anyrouter_token(req)
 		return {'success': False, 'error': f'站点 {req.site_url} 未接入（先在「站点管理」添加）'}
 
 	# 验证 token：带 Chrome 指纹调 user/self
@@ -3145,7 +3308,7 @@ async def collect_token(req: CollectRequest, request: Request):
 		_set_site_status(site.id, 'invalid', f'验证请求异常: {type(e).__name__}')
 		return {'success': False, 'error': f'验证请求异常: {type(e).__name__}: {str(e)[:80]}'}
 
-	if status in (401, 403) or '无权' in body or 'token' in body.lower() and status != 200:
+	if _token_rejected(status, body):
 		_set_site_status(site.id, 'invalid', f'HTTP {status}')
 		return {'success': False, 'error': f'token 无效（HTTP {status}）'}
 
@@ -4082,9 +4245,13 @@ async def keys_delete(req: dict):
 
 @app.post('/api/monitor/start')
 async def monitor_start(req: MonitorStartRequest):
-	"""启动余额监控"""
+	"""启动余额监控（accounts 为空时自动收集全部 token/站点/cookie 账号）"""
 	if monitor_state['running']:
 		return {'success': False, 'error': '监控已在运行中'}
+
+	accounts = req.accounts or _collect_monitor_accounts()
+	if not accounts:
+		return {'success': False, 'error': '没有可监控的账号'}
 
 	monitor_state['running'] = True
 	monitor_state['alerted_accounts'] = set()
@@ -4092,12 +4259,12 @@ async def monitor_start(req: MonitorStartRequest):
 	monitor_state['config'] = {
 		'interval_hours': req.interval_hours,
 		'threshold': req.threshold,
-		'account_count': len(req.accounts),
+		'account_count': len(accounts),
 		'email_to': req.email.email_to,
 	}
 
-	monitor_state['task'] = asyncio.create_task(monitor_loop(req))
-	return {'success': True, 'message': '监控已启动'}
+	monitor_state['task'] = asyncio.create_task(monitor_loop(req, accounts))
+	return {'success': True, 'message': f'监控已启动（{len(accounts)} 个账号）'}
 
 
 @app.post('/api/monitor/stop')
@@ -4293,7 +4460,7 @@ async def take_daily_snapshot():
 	# 1. 读取旧格式账号配置 (saved_config.json)
 	if waf_cookies and CONFIG_FILE.exists():
 		try:
-			config_data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+			config_data = _read_json_cached(CONFIG_FILE)
 			accounts_raw = config_data.get('accounts', [])
 			if accounts_raw:
 				accounts = [AccountItem(**acc) for acc in accounts_raw]

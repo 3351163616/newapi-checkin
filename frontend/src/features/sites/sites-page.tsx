@@ -15,14 +15,14 @@ import { getSiteTurnstile } from "@/features/checkin/checkin-api";
 import { siteDotClass } from "@/shared/lib/site-color";
 import type { NewapiSite, SiteProbeResponse, SitesResponse } from "@/types";
 
-import { fetchSiteAccounts, fetchSitesFull } from "@/features/accounts/accounts-api";
+import { fetchSitesFull } from "@/features/accounts/accounts-api";
 import { errorMessage } from "@/features/checkin/checkin-format";
 
-/** 生成书签采集脚本：登录任意站点后点一下，自动读取 localStorage 的 token 并上报回填 */
+/** 生成书签采集脚本：登录任意站点后点一下，自动读取 localStorage 的 token（及 user id）并上报回填 */
 function buildBookmarklet(key: string, origin: string) {
   const k = JSON.stringify(key);
   const e = JSON.stringify(`${origin}/api/collect`);
-  return `javascript:(function(){var k=${k},e=${e};var t="";var ks=["access_token","accessToken","new_api_token","new-api-token","user_token","token"];for(var i=0;i<ks.length&&!t;i++){try{var v=localStorage.getItem(ks[i]);if(v&&v.length>8&&v.indexOf("{")<0)t=v}catch(x){}}if(!t){for(var j=0;j<localStorage.length&&!t;j++){var kk=localStorage.key(j),vv=localStorage.getItem(kk);if(vv&&vv.length<5000&&(vv.indexOf("access_token")>-1||vv.indexOf("accessToken")>-1)){try{var o=JSON.parse(vv);if(o.access_token)t=o.access_token}catch(x){}}}}if(!t){alert("未找到 token，请确认已登录");return}fetch(e,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({site_url:location.origin,access_token:t,user_id:""})}).then(function(r){return r.json()}).then(function(d){alert(d.success?"[OK] "+d.message:"[失败] "+(d.error||""))}).catch(function(){alert("连接采集服务失败")})})();`;
+  return `javascript:(function(){var k=${k},e=${e};var t="",u="";var ks=["access_token","accessToken","new_api_token","new-api-token","user_token","token"];for(var i=0;i<ks.length&&!t;i++){try{var v=localStorage.getItem(ks[i]);if(v&&v.length>8&&v.indexOf("{")<0)t=v}catch(x){}}if(!t){for(var j=0;j<localStorage.length&&!t;j++){var kk=localStorage.key(j),vv=localStorage.getItem(kk);if(vv&&vv.length<5000&&(vv.indexOf("access_token")>-1||vv.indexOf("accessToken")>-1)){try{var o=JSON.parse(vv);if(o.access_token)t=o.access_token;if(!u)u=o.user_id||o.id||""}catch(x){}}}}if(!u){var uk=["user","userInfo","user_info","new-api-user","userData"];for(var i=0;i<uk.length&&!u;i++){try{var uv=localStorage.getItem(uk[i]);if(uv){var uo=JSON.parse(uv);u=uo.id||uo.user_id||uo.user?.id||""}}catch(x){}}}if(!t){alert("未找到 token，请确认已登录");return}fetch(e,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({site_url:location.origin,access_token:t,user_id:u})}).then(function(r){return r.json()}).then(function(d){alert(d.success?"[OK] "+d.message:"[失败] "+(d.error||""))}).catch(function(){alert("连接采集服务失败")})})();`;
 }
 
 function StatusDot({ site }: { site: NewapiSite }) {
@@ -48,17 +48,12 @@ function StatusDot({ site }: { site: NewapiSite }) {
 
 export function SitesPage() {
   const queryClient = useQueryClient();
-  const sitesQ = useQuery({ queryKey: ["accounts", "sites"], queryFn: fetchSitesFull });
+  // 注意：queryKey 不能与 fetchSites（返回数组）共用 ["accounts","sites"]，
+  // 否则会命中其他页面缓存的旧数组，data.sites 恒为 undefined
+  const sitesQ = useQuery({ queryKey: ["sites", "manage"], queryFn: fetchSitesFull });
   const sites = sitesQ.data?.sites ?? [];
-
-  const countsQ = useQuery({
-    queryKey: ["accounts", "site-accounts", sites.map((s) => s.id)] as const,
-    queryFn: async () => {
-      const entries = await Promise.all(sites.map(async (s) => [s.id, (await fetchSiteAccounts(s.id)).length] as const));
-      return Object.fromEntries(entries) as Record<string, number>;
-    },
-    enabled: sitesQ.isSuccess && sites.length > 0,
-  });
+  // 账号数由后端 with_counts=1 顺带返回（读盘有 mtime 缓存），不再逐站点发请求
+  const counts = sitesQ.data?.counts;
 
   const [newId, setNewId] = useState("");
   const [newLabel, setNewLabel] = useState("");
@@ -124,6 +119,8 @@ export function SitesPage() {
     try {
       const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim().replace(/^https?:\/\//, "") };
       await apiPost<SitesResponse>("/sites", { sites: [...sites, input] });
+      // 本页缓存键是 ["sites", ...]，其他页面的站点列表在 ["accounts","sites"]，两处都要失效
+      await queryClient.invalidateQueries({ queryKey: ["sites"] });
       await queryClient.invalidateQueries({ queryKey: ["accounts", "sites"] });
       toast.success(`已接入 ${input.label}，去「账号管理」添加它的账号`);
       setNewId("");
@@ -141,6 +138,7 @@ export function SitesPage() {
     if (!window.confirm(`删除站点 ${site.label}？\n\n只从站点清单移除，账号数据与签到状态会保留在服务器上——重新添加同 ID 站点即可恢复。`)) return;
     try {
       await apiPost<SitesResponse>("/sites", { sites: sites.filter((s) => s.id !== site.id) });
+      await queryClient.invalidateQueries({ queryKey: ["sites"] });
       await queryClient.invalidateQueries({ queryKey: ["accounts"] });
       toast.success(`已移除 ${site.label}（账号数据已保留）`);
     } catch (err) {
@@ -211,7 +209,7 @@ export function SitesPage() {
       ) : (
         <div className="grid gap-2 sm:grid-cols-2">
           {sites.map((site, i) => (
-            <SiteCard key={site.id} site={site} count={countsQ.data?.[site.id] ?? 0} index={i} onDelete={() => void onDelete(site)} />
+            <SiteCard key={site.id} site={site} count={counts?.[site.id] ?? 0} index={i} onDelete={() => void onDelete(site)} />
           ))}
         </div>
       )}

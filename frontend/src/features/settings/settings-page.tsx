@@ -147,11 +147,8 @@ export function SettingsPage() {
   const monitor = monitorQ.data;
 
   async function startMonitor(values: StartMonitorValues) {
-    const accounts: CookieAccount[] = configQ.data?.accounts ?? [];
-    if (accounts.length === 0) {
-      toast.error("没有 cookie 账号可监控——先去「账号管理」添加");
-      return;
-    }
+    // accounts 传空：后端自动收集全部 token/站点/cookie 账号监控
+    const accounts: CookieAccount[] = [];
     setSubmitting(true);
     try {
       await apiPost("/monitor/start", {
