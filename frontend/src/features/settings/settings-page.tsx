@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Loader2, Radio, RefreshCw, Send } from "lucide-react";
+import { Eye, EyeOff, FlaskConical, Loader2, Radio, RefreshCw, Send, ShieldQuestion } from "lucide-react";
 import { toast } from "sonner";
 import { z } from "zod";
 
@@ -8,12 +8,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ErrorState, LoadingState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
 import { apiGet, apiPost } from "@/shared/api/client";
 import type { CookieAccount, MonitorEmailConfig, MonitorStatus, SavedConfig } from "@/types";
 
 import { errorMessage } from "@/features/checkin/checkin-format";
+import { getTurnstileSolver, saveTurnstileSolver, testSiteProtection, testTurnstileSolver } from "@/features/checkin/checkin-api";
 
 /** GET /api/monitor/status 是全项目唯一不带 {success:...} 信封的端点——apiGet 原样透传整个 payload */
 interface ProxyInfo {
@@ -131,6 +133,185 @@ function MonitorForm({
   );
 }
 
+const SOLVER_LABELS: Record<string, string> = {
+  "2captcha": "2Captcha",
+  yescaptcha: "YesCaptcha",
+  capsolver: "CapSolver",
+  custom: "自定义网关",
+};
+
+/**
+ * 人机校验与防护配置：打码平台（过 Turnstile）+ FlareSolverr（过 CF 边缘质询）。
+ * api_key 后端不回显（只回 configured），表单留空即保持原值。
+ * 「测试过验」会真解一个 token（消耗约 $0.001~0.002），不拿去签到；
+ * 「检测站点防护」裸探测各站点防护层并现场验证突破手段。
+ */
+function SolverSection() {
+  const queryClient = useQueryClient();
+  const solverQ = useQuery({ queryKey: ["checkin", "turnstile-solver"], queryFn: getTurnstileSolver });
+  const solver = solverQ.data?.solver;
+  const [provider, setProvider] = useState<string>("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [flaresolverrUrl, setFlaresolverrUrl] = useState<string | null>(null);
+  const [showKey, setShowKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [probing, setProbing] = useState(false);
+
+  const effectiveProvider = provider || solver?.provider || "2captcha";
+  const presetUrl = solver?.presets?.[effectiveProvider];
+  const effectiveFlare = flaresolverrUrl ?? solver?.flaresolverr_url ?? "";
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const r = await saveTurnstileSolver({ provider: effectiveProvider, api_key: apiKey, base_url: baseUrl, flaresolverr_url: effectiveFlare });
+      if (!r.success) {
+        toast.error(r.error ?? "保存失败");
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["checkin", "turnstile-solver"] });
+      setApiKey("");
+      toast.success(r.message ?? "已保存");
+    } catch (err) {
+      toast.error(errorMessage(err, "保存失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const r = await testTurnstileSolver();
+      if (r.success && r.tested) toast.success(`过验通过：${r.site} · ${r.elapsed}s`);
+      else if (r.success) toast.info(r.message ?? "站点未开启 Turnstile，无需打码");
+      else toast.error(r.error ?? "过验失败");
+    } catch (err) {
+      toast.error(errorMessage(err, "测试失败"));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function handleProtectionTest() {
+    setProbing(true);
+    try {
+      const r = await testSiteProtection();
+      if (!r.success) {
+        toast.error(r.error ?? "探测失败");
+        return;
+      }
+      const parts: string[] = [];
+      if (r.protections.turnstile) parts.push("Turnstile");
+      if (r.protections.cf_challenge) parts.push(r.solved.cf_challenge === null ? "CF 质询（未配 FlareSolverr）" : r.solved.cf_challenge ? "CF 质询（已过）" : "CF 质询（过验失败）");
+      if (r.protections.aliyun_waf) parts.push(r.solved.aliyun_waf ? "阿里云 WAF（已过）" : "阿里云 WAF（过验失败）");
+      toast.success(`${r.site}：${parts.length ? parts.join(" · ") : "无防护"}`);
+    } catch (err) {
+      toast.error(errorMessage(err, "探测失败"));
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  return (
+    <section className="rounded-lg bg-card p-4 sm:p-5">
+      <div className="flex min-h-8 items-center justify-between gap-3">
+        <h2 className="text-sm font-medium">人机校验与防护</h2>
+        {solverQ.isLoading ? null : solver?.configured ? (
+          <Badge variant="secondary" className="text-[11px] text-checkin-done">
+            {SOLVER_LABELS[solver.provider] ?? solver.provider} 已配置
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className="text-[11px] text-muted-foreground">未配置</Badge>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        配置后，开启 Cloudflare Turnstile 人机校验的站点也能在服务器端自动签到（含每天 0 点的自动任务），按求解次数计费。
+        FlareSolverr 用于过 Cloudflare 边缘质询（cf_clearance），需与本服务同出口 IP。
+      </p>
+      {solverQ.isPending ? (
+        <LoadingState className="min-h-20" />
+      ) : solverQ.isError ? (
+        <ErrorState message={errorMessage(solverQ.error, "打码配置加载失败")} onRetry={() => void solverQ.refetch()} />
+      ) : (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="space-y-1">
+            <Label htmlFor="solver-provider" className="text-xs">平台</Label>
+            <Select value={effectiveProvider} onValueChange={setProvider}>
+              <SelectTrigger id="solver-provider" className="h-8 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {Object.keys(SOLVER_LABELS).map((p) => (
+                  <SelectItem key={p} value={p}>{SOLVER_LABELS[p]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="solver-api-key" className="text-xs">API Key（ClientKey）</Label>
+            <div className="relative">
+              <Input
+                id="solver-api-key"
+                type={showKey ? "text" : "password"}
+                autoComplete="new-password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                className="h-8 pr-8 text-xs"
+                placeholder={solver?.configured ? "已配置，留空保持不变" : "平台后台获取"}
+              />
+              <button
+                type="button"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                onClick={() => setShowKey((v) => !v)}
+                aria-label={showKey ? "隐藏密钥" : "显示密钥"}
+              >
+                {showKey ? <EyeOff className="size-3.5" aria-hidden="true" /> : <Eye className="size-3.5" aria-hidden="true" />}
+              </button>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="solver-base-url" className="text-xs">API 域名（自定义网关才需填）</Label>
+            <Input
+              id="solver-base-url"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder={presetUrl ?? "https://your-gateway.example.com"}
+            />
+          </div>
+          <div className="flex items-end gap-2">
+            <Button onClick={() => void handleSave()} disabled={saving}>
+              {saving ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
+              保存
+            </Button>
+            <Button variant="secondary" onClick={() => void handleTest()} disabled={testing}>
+              {testing ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <FlaskConical className="size-3.5" aria-hidden="true" />}
+              测试过验
+            </Button>
+          </div>
+          <div className="space-y-1 sm:col-span-2">
+            <Label htmlFor="solver-flaresolverr" className="text-xs">FlareSolverr 地址（过 CF 边缘质询，可选）</Label>
+            <Input
+              id="solver-flaresolverr"
+              value={effectiveFlare}
+              onChange={(e) => setFlaresolverrUrl(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder="http://127.0.0.1:8191"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button variant="secondary" className="w-full sm:w-auto" onClick={() => void handleProtectionTest()} disabled={probing}>
+              {probing ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <ShieldQuestion className="size-3.5" aria-hidden="true" />}
+              检测站点防护
+            </Button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
 
@@ -241,6 +422,8 @@ export function SettingsPage() {
           </div>
         ) : null}
       </section>
+
+      <SolverSection />
 
       <section className="rounded-lg bg-card p-4 sm:p-5">
         <div className="flex min-h-8 items-center justify-between gap-3">

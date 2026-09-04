@@ -100,6 +100,11 @@ export interface SiteProbeInfo {
   checkin_enabled: boolean;
   turnstile_check: boolean;
   quota_per_unit: number;
+  /** 站点首页的网络层防护（裸探测，保守分类；运行期撞到会自动过验） */
+  protections?: {
+    cf_challenge: boolean;
+    aliyun_waf: boolean;
+  };
 }
 
 export interface SiteProbeResponse {
@@ -115,6 +120,52 @@ export interface TurnstileStatus {
 
 export interface SiteTurnstileResponse {
   turnstile: TurnstileStatus;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Turnstile 打码平台：GET/POST /api/turnstile/solver、POST /api/turnstile/solver/test
+// ─────────────────────────────────────────────────────────────────────────
+
+/** GET /api/turnstile/solver —— api_key 只回是否已配置，后端绝不回显 */
+export interface TurnstileSolverStatus {
+  provider: string;
+  base_url: string;
+  configured: boolean;
+  /** FlareSolverr 地址（过 Cloudflare 边缘质询用），可为空 */
+  flaresolverr_url: string;
+  /** 各预设平台的默认 API 域名（custom 平台不在此列） */
+  presets: Record<string, string>;
+}
+
+export interface TurnstileSolverSaveResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+export interface TurnstileSolverTestResponse {
+  success: boolean;
+  /** false 表示没真正消耗打码（如站点未开 Turnstile，无需测） */
+  tested: boolean;
+  site?: string;
+  /** 求解耗时（秒） */
+  elapsed?: number;
+  token_preview?: string;
+  message?: string;
+  error?: string;
+}
+
+/** POST /api/protection/test —— 站点防护层探测；solved 里 null = 撞到了但没配求解器 */
+export interface ProtectionTestResponse {
+  success: boolean;
+  site: string;
+  domain: string;
+  page_http_status: number | null;
+  page_error?: string;
+  protections: { cf_challenge: boolean; aliyun_waf: boolean; turnstile: boolean };
+  solved: { aliyun_waf?: boolean; cf_challenge?: boolean | null };
+  flaresolverr_configured: boolean;
+  error?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

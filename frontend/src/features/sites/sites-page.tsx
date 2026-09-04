@@ -13,7 +13,7 @@ import { PageHeader } from "@/shared/components/page-header";
 import { apiGet, apiPost } from "@/shared/api/client";
 import { getSiteTurnstile } from "@/features/checkin/checkin-api";
 import { siteDotClass } from "@/shared/lib/site-color";
-import type { NewapiSite, SiteProbeResponse, SitesResponse } from "@/types";
+import type { NewapiSite, SiteProbeInfo, SiteProbeResponse, SitesResponse } from "@/types";
 
 import { fetchSitesFull } from "@/features/accounts/accounts-api";
 import { errorMessage } from "@/features/checkin/checkin-format";
@@ -46,6 +46,14 @@ function StatusDot({ site }: { site: NewapiSite }) {
   );
 }
 
+/** 探测到的站点网络层防护，转成人话；运行期撞到防护会自动过验重试，这里只是预告 */
+function protectionText(p: { cf_challenge: boolean; aliyun_waf: boolean }): string {
+  const parts: string[] = [];
+  if (p.cf_challenge) parts.push("Cloudflare 质询（撞到会自动过验）");
+  if (p.aliyun_waf) parts.push("阿里云 WAF（自动求解）");
+  return parts.length > 0 ? parts.join(" · ") : "无（直连即可）";
+}
+
 export function SitesPage() {
   const queryClient = useQueryClient();
   // 注意：queryKey 不能与 fetchSites（返回数组）共用 ["accounts","sites"]，
@@ -59,7 +67,7 @@ export function SitesPage() {
   const [newLabel, setNewLabel] = useState("");
   const [newDomain, setNewDomain] = useState("");
   const [probing, setProbing] = useState(false);
-  const [probeResult, setProbeResult] = useState<{ domain: string; ok: boolean; system_name: string; version: string; checkin_enabled: boolean; turnstile_check: boolean; quota_per_unit: number } | null>(null);
+  const [probeResult, setProbeResult] = useState<({ domain: string; ok: boolean } & SiteProbeInfo) | null>(null);
   const [adding, setAdding] = useState(false);
   const [collectOpen, setCollectOpen] = useState(false);
   const collectKeyQ = useQuery({
@@ -195,9 +203,12 @@ export function SitesPage() {
             <p className="mt-1 text-muted-foreground">
               签到功能：{probeResult.checkin_enabled ? <span className="text-checkin-done">已开启</span> : "未开启"}
               {" · "}
-              Turnstile 校验：{probeResult.turnstile_check ? <span className="text-checkin-pending">需要（走浏览器脚本签到）</span> : "不需要（可服务器端签到）"}
+              Turnstile 校验：{probeResult.turnstile_check ? <span className="text-checkin-pending">需要（可配打码平台自动过）</span> : "不需要（可服务器端签到）"}
               {` · 1 美元 = ${probeResult.quota_per_unit} 配额`}
             </p>
+            {probeResult.protections ? (
+              <p className="mt-1 text-muted-foreground">网络防护：{protectionText(probeResult.protections)}</p>
+            ) : null}
           </div>
         ) : null}
       </section>

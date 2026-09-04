@@ -258,7 +258,9 @@ AGENTROUTER_ORG_CONFIG = {
 #   2. GET /api/user/checkin 额外返回签到配置与历史（enabled / min_quota / max_quota / stats）
 #   3. 站点在 Cloudflare 后而非阿里云盾，无需 WAF cookies、无需代理、无需 TLS 指纹
 #   4. access_token 可直接签到（anyrouter 的签到只认 session cookie）
-#   5. POST 挂了 Cloudflare Turnstile 中间件时服务器侧签不了；GET 没挂，随时可读状态
+#   5. POST 挂了 Cloudflare Turnstile 中间件时，服务器侧要带 ?turnstile=<token> 才签得了：
+#      配置了打码平台（saved_config.json 的 turnstile_solver 段）就自动代解，没配置则提示
+#      走浏览器脚本；GET 没挂中间件，随时可读状态
 #      （见 new-api 的 router/api-router.go：POST 带 middleware.TurnstileCheck()，GET 不带）
 # AnyRouter 与 AgentRouter 不在此列：前者要过阿里云 WAF + 走代理，后者只能账号密码登录。
 NEWAPI_DEFAULTS = {
@@ -1164,19 +1166,46 @@ def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
 	}
 
 
-async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
+async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None, _auto_bypass: bool = True):
 	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
 
 	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
+
+	撞上 CF 边缘质询或阿里云 WAF 挑战页时，解一次防护 cookies（按域名缓存 5 分钟）后
+	原地重打一次；有缓存就直接带上。cf_clearance 绑 UA，重试时用求解方返回的同一个 UA。
+	挑战页由防护层返回，请求没到过 new-api 源站，重试对签到是安全的（不会重复签）。
 	"""
 	url = site.domain + path
+	prot = protection_cache.get(site.domain.rstrip('/'))
+	if prot and prot['expires'] <= time.time():
+		prot = None
+	send_headers = dict(headers)
+	if prot and prot.get('user_agent'):
+		send_headers['User-Agent'] = prot['user_agent']
 
 	def _do():
 		sess = _get_cffi_session(f'newapi:{site.id}')
-		return sess.request(method.upper(), url, headers=headers, json=json_body)
+		if prot:
+			sess.cookies.update(prot['cookies'])
+		return sess.request(method.upper(), url, headers=send_headers, json=json_body)
 
 	loop = asyncio.get_running_loop()
-	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	if not _auto_bypass:
+		return resp
+	kind = detect_protection(resp)
+	if kind is None:
+		return resp
+	if prot:
+		# 带着缓存的 cookies 仍撞质询：这条缓存已坏（被吊销/过期），作废后强制重解，
+		# 否则 ensure 会命中同一条「新鲜但无效」的缓存，拿同样的坏 cookies 白打一次
+		protection_cache.pop(site.domain.rstrip('/'), None)
+	entry = await ensure_protection_cookies(site, kind)
+	if not entry:
+		print(f'[{site.id.upper()}] 撞上 {kind} 防护但未能过验（CF 质询需在设置页配置 FlareSolverr）')
+		return resp
+	print(f'[{site.id.upper()}] 撞上 {kind} 防护，已过验并自动重试')
+	return await newapi_request(site, method, path, headers, json_body, _auto_bypass=False)
 
 
 async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
@@ -1261,19 +1290,268 @@ async def newapi_turnstile_status(site: NewapiSite) -> dict:
 	return value
 
 
-async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem) -> dict:
+# ========== Turnstile 打码平台（服务器端过 CF 人机校验）==========
+# 站点开着 Turnstile 时，签到 POST 必须带一次性 token。浏览器场景由前端生成的 Console
+# 脚本现场渲染 widget 取 token；服务器侧则接打码平台代解。三家主流平台（2Captcha /
+# YesCaptcha / CapSolver）都兼容 createTask + getTaskResult 协议，差异只有域名和 task.type。
+TURNSTILE_SOLVER_PRESETS = {
+	'2captcha': {'base_url': 'https://api.2captcha.com', 'task_type': 'TurnstileTaskProxyless'},
+	'yescaptcha': {'base_url': 'https://api.yescaptcha.com', 'task_type': 'TurnstileTaskProxyless'},
+	'capsolver': {'base_url': 'https://api.capsolver.com', 'task_type': 'AntiTurnstileTaskProxyLess'},
+}
+# 打码按次计费且平台侧有限速，求解并发固定 3，不跟站点签到并发（10）走
+_TURNSTILE_SOLVER_SEM = asyncio.Semaphore(3)
+TURNSTILE_SOLVER_POLL_INTERVAL = 3  # 秒
+TURNSTILE_SOLVER_TIMEOUT = 150  # 单个 token 求解上限
+
+
+def get_turnstile_solver_config() -> dict:
+	"""读打码平台配置（saved_config.json 的 turnstile_solver 段），缺省即未配置。"""
+	try:
+		cfg = _read_json_cached(CONFIG_FILE)
+	except Exception:
+		cfg = {}
+	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
+	s = s if isinstance(s, dict) else {}
+	provider = (s.get('provider') or '').strip().lower()
+	api_key = (s.get('api_key') or '').strip()
+	base_url = (s.get('base_url') or '').strip().rstrip('/')
+	preset = TURNSTILE_SOLVER_PRESETS.get(provider)
+	return {
+		'provider': provider,
+		'api_key': api_key,
+		'base_url': base_url or (preset['base_url'] if preset else ''),
+		# 自定义网关没指 task.type 时按 2Captcha 协议猜——绝大多数兼容网关都认这个名字
+		'task_type': preset['task_type'] if preset else ('TurnstileTaskProxyless' if base_url else ''),
+	}
+
+
+async def solve_turnstile_token(site_key: str, page_url: str, timeout: int = TURNSTILE_SOLVER_TIMEOUT) -> dict:
+	"""调打码平台解一个 Turnstile token，成功返回 {'success': True, 'token': ...}。
+
+	同一 token 只能用一次（new-api 转发给 CF siteverify 后即作废），每个账号签到前
+	各解一个。CapSolver 的 createTask 可能直接带 solution.token，与轮询 getTaskResult
+	两种返回方式一并兼容。
+	"""
+	cfg = get_turnstile_solver_config()
+	if not (cfg['api_key'] and cfg['base_url'] and cfg['task_type']):
+		return {'success': False, 'error': '打码平台未配置（设置页选择平台并填 api_key）'}
+	if not site_key:
+		return {'success': False, 'error': '缺少 sitekey（站点状态探测失败）'}
+
+	def _post(path: str, payload: dict):
+		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
+		return sess.post(cfg['base_url'] + path, json=payload, timeout=30)
+
+	loop = asyncio.get_running_loop()
+
+	async with _TURNSTILE_SOLVER_SEM:
+		try:
+			resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/createTask', {
+				'clientKey': cfg['api_key'],
+				'task': {'type': cfg['task_type'], 'websiteURL': page_url, 'websiteKey': site_key},
+			})
+			data = resp.json()
+			if data.get('errorId'):
+				return {'success': False, 'error': f"createTask 失败: {data.get('errorCode') or data.get('errorDescription')}"}
+			token = (data.get('solution') or {}).get('token')
+			if token:
+				return {'success': True, 'token': token}
+			task_id = data.get('taskId')
+			if not task_id:
+				return {'success': False, 'error': f'createTask 响应异常: {str(data)[:150]}'}
+
+			deadline = time.monotonic() + timeout
+			while time.monotonic() < deadline:
+				await asyncio.sleep(TURNSTILE_SOLVER_POLL_INTERVAL)
+				resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/getTaskResult', {
+					'clientKey': cfg['api_key'], 'taskId': task_id,
+				})
+				data = resp.json()
+				if data.get('errorId'):
+					return {'success': False, 'error': f"求解失败: {data.get('errorCode') or data.get('errorDescription')}"}
+				if data.get('status') == 'ready':
+					token = (data.get('solution') or {}).get('token')
+					if token:
+						return {'success': True, 'token': token}
+					return {'success': False, 'error': '平台返回 ready 但没有 token'}
+			return {'success': False, 'error': f'求解超时（{timeout}s 未就绪）'}
+		except Exception as e:
+			return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
+
+
+# ========== 通用站点防护层（CF 边缘质询 / 阿里云 WAF）==========
+# new-api 站点常见的网络层防护有两类：Cloudflare 边缘质询（cf-mitigated: challenge，
+# 403/503 +「Just a moment」页）和阿里云 WAF 的 acw_sc__v2 挑战（正文 var arg1='...'）。
+# 后者是纯算法可直接解；前者无浏览器解不了，借自托管开源项目 FlareSolverr 代过——
+# cf_clearance 与出口 IP、User-Agent 双重绑定，FlareSolverr 必须与本服务同出口。
+# newapi_request 撞到防护时自动取 cookies 原地重打一次：挑战页由防护层返回，请求没到过
+# new-api 源站，重试对签到是安全的（不会重复签）。
+
+_CF_CHALLENGE_BODY_RE = re.compile(r'Just a moment|challenge-platform|_cf_chl|cf-chl|Checking your browser', re.I)
+_ALIYUN_WAF_COOKIE_NAMES = ('acw_tc', 'cdn_sec_tc', 'acw_sc__v2')
+
+# 防护 cookies 缓存：{domain: {'cookies': dict, 'user_agent': str|None, 'expires': float}}，TTL 沿用 WAF_CACHE_TTL
+protection_cache: dict = {}
+_protection_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_flaresolverr_url() -> str:
+	"""FlareSolverr 地址（saved_config.json 的 turnstile_solver.flaresolverr_url），未配置返回空串。"""
+	try:
+		cfg = _read_json_cached(CONFIG_FILE)
+	except Exception:
+		cfg = {}
+	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
+	return ((s or {}).get('flaresolverr_url') or '').strip().rstrip('/')
+
+
+def detect_protection(resp) -> str | None:
+	"""识别响应背后的防护层：'cf_challenge' / 'aliyun_waf'；正常返回 None。
+
+	CF 以官方 cf-mitigated 响应头为准，正文特征兜底（质询页变体多，头最可靠）；
+	阿里云 WAF 挑战页在 200 里也可能出现（校验中转页），认 arg1 特征。
+	"""
+	try:
+		headers = resp.headers or {}
+		body = resp.text or ''
+	except Exception:
+		return None
+	if str(headers.get('cf-mitigated', '')).lower() == 'challenge':
+		return 'cf_challenge'
+	if resp.status_code in (403, 503) and _CF_CHALLENGE_BODY_RE.search(body):
+		return 'cf_challenge'
+	if _WAF_CHALLENGE_RE.search(body):
+		return 'aliyun_waf'
+	return None
+
+
+async def solve_aliyun_waf(domain: str) -> dict | None:
+	"""过任意域名的阿里云 WAF 挑战：GET 首页 → 提 arg1 → 算 acw_sc__v2。失败返回 None。
+
+	独立 Session 收挑战页下发的 acw_tc/cdn_sec_tc（acw_sc__v2 与它们配对校验），
+	直连不走代理——这类站点平时不需要代理。
+	"""
+	def _do():
+		from curl_cffi import requests as cffi_requests
+
+		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
+		resp = sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
+		m = _WAF_CHALLENGE_RE.search(resp.text or '')
+		if not m:
+			return None
+		cookies = {}
+		for name in _ALIYUN_WAF_COOKIE_NAMES:
+			val = sess.cookies.get(name)
+			if val:
+				cookies[name] = val
+		cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
+		return {'cookies': cookies, 'user_agent': None}
+
+	loop = asyncio.get_running_loop()
+	try:
+		return await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	except Exception as e:
+		print(f'[PROTECT] {domain} 阿里云 WAF 求解失败: {e}')
+		return None
+
+
+async def solve_cf_challenge(domain: str) -> dict | None:
+	"""用 FlareSolverr 过 Cloudflare 边缘质询，返回 {cookies, user_agent}。
+
+	未配置 FlareSolverr 时直接返回 None——保持旧行为：撞质询就让调用方拿到 403/503。
+	"""
+	base = get_flaresolverr_url()
+	if not base:
+		return None
+
+	def _do():
+		sess = _get_cffi_session(f'flaresolverr:{base}')
+		return sess.post(base + '/v1', json={'cmd': 'request.get', 'url': domain + '/', 'maxTimeout': 60000}, timeout=70)
+
+	loop = asyncio.get_running_loop()
+	try:
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+		data = resp.json()
+		if data.get('status') != 'ok':
+			print(f'[PROTECT] {domain} FlareSolverr 求解失败: {str(data.get("message"))[:120]}')
+			return None
+		solution = data.get('solution') or {}
+		cookies = {c.get('name'): c.get('value') for c in solution.get('cookies', []) if c.get('name')}
+		if not cookies:
+			return None
+		return {'cookies': cookies, 'user_agent': solution.get('userAgent') or None}
+	except Exception as e:
+		print(f'[PROTECT] {domain} FlareSolverr 调用失败: {e}')
+		return None
+
+
+async def ensure_protection_cookies(site: NewapiSite, kind: str) -> dict | None:
+	"""确保某站点的防护 cookies 就绪（5 分钟缓存 + 按域名 singleflight），失败返回 None。
+
+	singleflight 很重要：签到是 10 并发，缓存过期瞬间不能让每个账号各打一次
+	FlareSolverr/WAF 挑战页（前者按次耗时几十秒，后者可能撞 IP 限流）。
+	"""
+	domain = site.domain.rstrip('/')
+	cached = protection_cache.get(domain)
+	if cached and cached['expires'] > time.time():
+		return cached
+	lock = _protection_locks.setdefault(domain, asyncio.Lock())
+	async with lock:
+		cached = protection_cache.get(domain)
+		if cached and cached['expires'] > time.time():
+			return cached
+		if kind == 'aliyun_waf':
+			solved = await solve_aliyun_waf(domain)
+		elif kind == 'cf_challenge':
+			solved = await solve_cf_challenge(domain)
+		else:
+			solved = None
+		if not solved:
+			return None
+		entry = {**solved, 'expires': time.time() + WAF_CACHE_TTL}
+		protection_cache[domain] = entry
+		return entry
+
+
+async def probe_page_protection(domain: str) -> dict:
+	"""裸探测站点首页的防护层（不走 newapi_request 的自动过验），供添加站点时分类展示。"""
+	def _do():
+		from curl_cffi import requests as cffi_requests
+
+		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
+		return sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
+
+	loop = asyncio.get_running_loop()
+	try:
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+		kind = detect_protection(resp)
+		return {
+			'http_status': resp.status_code,
+			'cf_challenge': kind == 'cf_challenge',
+			'aliyun_waf': kind == 'aliyun_waf',
+		}
+	except Exception as e:
+		return {'http_status': None, 'cf_challenge': False, 'aliyun_waf': False, 'error': str(e)[:100]}
+
+
+async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile_token: str | None = None) -> dict:
 	"""为单个账号签到（POST /api/user/checkin，奖励区间由站点配置决定）。
 
 	今日已签时接口返回 200 且 success=false、message='今日已签到'，据此区分 already。
 
-	站点若开着 Turnstile，服务器侧无 token，接口会返回「Turnstile token 为空」——
-	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要走浏览器签到。
+	turnstile_token 传入时签到 URL 带上 ?turnstile=<token> —— new-api 的 TurnstileCheck
+	中间件只认 query 参数，与前端浏览器脚本的传法一致。
+
+	站点开着 Turnstile 且没传 token 时，接口会返回「Turnstile token 为空」——
+	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要先过人机校验。
 	"""
 	headers = _newapi_headers(site, account)
+	path = site.sign_in_path + (f'?turnstile={quote(turnstile_token, safe="")}' if turnstile_token else '')
 	max_retries = 3
 	for attempt in range(max_retries):
 		try:
-			resp = await newapi_request(site, 'POST', site.sign_in_path, headers)
+			resp = await newapi_request(site, 'POST', path, headers)
 			if resp.status_code == 200:
 				data = resp.json()
 				msg = data.get('message', '')
@@ -1749,9 +2027,9 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 
 	签到成功后顺便查一次余额写入今日快照，省去额外的查询请求。
 
-	站点开着 Turnstile 时服务器侧签不了，这里会先探测一次并直接结束，把原因写进日志，
-	避免所有账号各打一次上游只为拿到同一句「Turnstile token 为空」。
-	站长关掉 Turnstile 后无需改代码，此路径自动恢复正常。
+	站点开着 Turnstile 时分两种情况：配置了打码平台 → 先用免费的 GET 预检剔除今日已签
+	账号（token 按次计费，别替已签的白解），再逐账号求解并签到（全自动）；没配置 → 先
+	探测一次并直接结束，把原因写进日志。站长关掉 Turnstile 后无需改代码，此路径自动恢复。
 	"""
 	accounts = load_newapi_accounts(site)
 	st = newapi_state(site)
@@ -1787,23 +2065,71 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 		return
 
 	ts_state = await newapi_turnstile_status(site)
-	if ts_state['enabled']:
-		ts_msg = '站点已开启 Turnstile 人机校验，服务器端无法签到，请在 Web UI 用浏览器脚本签到'
-		now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		for name in st['accounts']:
-			st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
-		add_newapi_checkin_log(site, ts_msg)
-		_finish()
-		return
+	ts_enabled = bool(ts_state['enabled'])
+	ts_site_key = ts_state['site_key'] or ''
+	if ts_enabled:
+		solver_cfg = get_turnstile_solver_config()
+		if not solver_cfg['api_key']:
+			ts_msg = '站点已开启 Turnstile 人机校验且未配置打码平台，服务器端无法签到；请在设置页配置打码平台，或用 Web UI 的浏览器脚本签到'
+			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			for name in st['accounts']:
+				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
+			add_newapi_checkin_log(site, ts_msg)
+			_finish()
+			return
+		if not ts_site_key:
+			# 探测失败时 status 保守返回 enabled=True 但没有 sitekey，没东西可解，只能走浏览器
+			ts_msg = '站点 Turnstile 状态探测失败拿不到 sitekey，无法服务器端求解；请稍后重试或用浏览器脚本签到'
+			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			for name in st['accounts']:
+				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
+			add_newapi_checkin_log(site, ts_msg)
+			_finish()
+			return
+		add_newapi_checkin_log(
+			site, f"站点开启 Turnstile，改用打码平台（{solver_cfg['provider'] or '自定义网关'}）逐账号求解 token"
+		)
+		page_url = site.domain.rstrip('/') + '/login'
 
 	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	if ts_enabled:
+		# Turnstile token 按次计费：先用不挂中间件的 GET 状态把今日已签的剔掉，
+		# 别替已签账号白解 token（与前端浏览器脚本的「先 sync 再生成」同一思路）。
+		# 查询失败的账号按未签处理，宁可多花一次打码也不漏签。
+		async def _preflight(acc: NewapiAccountItem):
+			async with sem:
+				return acc, await newapi_checkin_info(site, acc)
+
+		pending: list[NewapiAccountItem] = []
+		for acc, info in await asyncio.gather(*[_preflight(a) for a in accounts]):
+			if info.get('success') and info.get('checked_in_today'):
+				ts_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+				st['accounts'][acc.name] = {'status': 'already', 'message': '今日已签（打码预检跳过）', 'time': ts_now}
+			else:
+				pending.append(acc)
+		skipped = len(accounts) - len(pending)
+		if skipped:
+			add_newapi_checkin_log(site, f'打码预检：{skipped} 个账号今日已签，跳过求解')
+		if not pending:
+			_finish()
+			return
 
 	async def _one(acc: NewapiAccountItem):
 		async with sem:
 			if not st['running']:
 				return
-			result = await sign_in_newapi(site, acc)
 			ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			token = None
+			if ts_enabled:
+				solved = await solve_turnstile_token(ts_site_key, page_url)
+				if not solved.get('success'):
+					msg = f"过验失败: {solved.get('error', '未知错误')}"
+					st['accounts'][acc.name] = {'status': 'failed', 'message': msg, 'time': ts}
+					add_newapi_checkin_log(site, f'{acc.name}: {msg}')
+					save_newapi_checkin_state(site)
+					return
+				token = solved['token']
+			result = await sign_in_newapi(site, acc, turnstile_token=token)
 			if result.get('success'):
 				status = 'already' if result.get('already_signed') else 'signed'
 				st['accounts'][acc.name] = {'status': status, 'message': result.get('message', '签到成功'), 'time': ts}
@@ -1815,7 +2141,7 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 			add_newapi_checkin_log(site, f'{acc.name}: {st["accounts"][acc.name]["message"]}')
 			save_newapi_checkin_state(site)
 
-	await asyncio.gather(*[_one(a) for a in accounts])
+	await asyncio.gather(*[_one(a) for a in (pending if ts_enabled else accounts)])
 	_finish()
 
 
@@ -3395,6 +3721,7 @@ async def probe_site(req: dict):
 		return {'success': False, 'error': '返回的不是 JSON，可能不是 new-api 站点'}
 	if not data.get('version'):
 		return {'success': False, 'error': '未识别为 new-api 站点（/api/status 里没有 version）'}
+	page = await probe_page_protection(domain)
 	return {
 		'success': True,
 		'info': {
@@ -3403,6 +3730,10 @@ async def probe_site(req: dict):
 			'checkin_enabled': bool(data.get('checkin_enabled')),
 			'turnstile_check': bool(data.get('turnstile_check')),
 			'quota_per_unit': data.get('quota_per_unit') or NEWAPI_DEFAULTS['quota_per_unit'],
+			'protections': {
+				'cf_challenge': bool(page.get('cf_challenge')),
+				'aliyun_waf': bool(page.get('aliyun_waf')),
+			},
 		},
 	}
 
@@ -3490,13 +3821,147 @@ async def site_checkin_start(site_id: str):
 async def site_turnstile(site_id: str):
 	"""返回某站点当前的 Turnstile 状态，供前端决定签到走哪条路。
 
-	enabled=True  → 服务器端签不了，前端展示浏览器脚本 + 同步流程
+	enabled=True  → 服务器端要带 token 才签得了：配置了打码平台就自动求解，
+	                没配置则前端展示浏览器脚本 + 同步流程
 	enabled=False → 站长关掉了校验，前端直接走 /checkin/start 一键签到
 	"""
 	site, err = _site_or_error(site_id)
 	if err:
 		return err
 	return {'success': True, 'turnstile': await newapi_turnstile_status(site)}
+
+
+class TurnstileSolverRequest(BaseModel):
+	"""打码平台 / FlareSolverr 配置。api_key 留空表示保留已保存的值（前端不回显密钥）。"""
+
+	provider: str
+	api_key: str = ''
+	base_url: str = ''
+	flaresolverr_url: str = ''
+
+
+@app.get('/api/turnstile/solver')
+async def turnstile_solver_status():
+	"""打码平台 / FlareSolverr 配置状态。api_key 只回是否已配置，绝不回显。"""
+	cfg = get_turnstile_solver_config()
+	return {
+		'success': True,
+		'solver': {
+			'provider': cfg['provider'],
+			'base_url': cfg['base_url'],
+			'configured': bool(cfg['api_key'] and cfg['base_url'] and cfg['task_type']),
+			'flaresolverr_url': get_flaresolverr_url(),
+			'presets': {name: p['base_url'] for name, p in TURNSTILE_SOLVER_PRESETS.items()},
+		},
+	}
+
+
+@app.post('/api/turnstile/solver')
+async def save_turnstile_solver(req: TurnstileSolverRequest):
+	"""保存打码平台 / FlareSolverr 配置（合并写 saved_config.json，不动其他段）"""
+	provider = req.provider.strip().lower()
+	if provider != 'custom' and provider not in TURNSTILE_SOLVER_PRESETS:
+		return {'success': False, 'error': f'未知平台: {req.provider}（可选 2captcha / yescaptcha / capsolver / custom）'}
+	try:
+		data = dict(_read_json_cached(CONFIG_FILE) or {}) if CONFIG_FILE.exists() else {}
+	except Exception:
+		data = {}
+	saved = data.get('turnstile_solver') or {}
+	data['turnstile_solver'] = {
+		'provider': provider,
+		'api_key': req.api_key.strip() or saved.get('api_key') or '',
+		'base_url': req.base_url.strip(),
+		'flaresolverr_url': req.flaresolverr_url.strip(),
+	}
+	_atomic_write_json(CONFIG_FILE, data, indent=2)
+	return {'success': True, 'message': '打码平台配置已保存'}
+
+
+@app.post('/api/protection/test')
+async def protection_test(site_id: str = ''):
+	"""探测某站点挂了哪些防护层，并现场验证突破手段是否可用。
+
+	首页裸探测只反映「当前这次响应」的防护（部分站点仅对 API 或按负载触发质询），
+	结果是最保守的分类；运行期 newapi_request 撞到防护都会自动过验重试。
+	solved 里 None 表示撞到了但没配求解器（CF 质询需 FlareSolverr）。
+	"""
+	sites = load_newapi_sites()
+	if site_id:
+		site = next((s for s in sites if s.id == site_id), None)
+		if site is None:
+			return {'success': False, 'error': f'未知站点: {site_id}'}
+	else:
+		if not sites:
+			return {'success': False, 'error': '没有站点可探测'}
+		site = sites[0]
+	domain = site.domain.rstrip('/')
+
+	page = await probe_page_protection(domain)
+	ts = await newapi_turnstile_status(site)
+	protections = {
+		'cf_challenge': bool(page.get('cf_challenge')),
+		'aliyun_waf': bool(page.get('aliyun_waf')),
+		'turnstile': bool(ts['enabled']),
+	}
+	solved: dict = {}
+	if protections['aliyun_waf']:
+		solved['aliyun_waf'] = bool(await solve_aliyun_waf(domain))
+	if protections['cf_challenge']:
+		if get_flaresolverr_url():
+			solved['cf_challenge'] = bool(await solve_cf_challenge(domain))
+		else:
+			solved['cf_challenge'] = None
+	return {
+		'success': True,
+		'site': site.label,
+		'domain': site.domain,
+		'page_http_status': page.get('http_status'),
+		'page_error': page.get('error'),
+		'protections': protections,
+		'solved': solved,
+		'flaresolverr_configured': bool(get_flaresolverr_url()),
+	}
+
+
+@app.post('/api/turnstile/solver/test')
+async def test_turnstile_solver(site_id: str = ''):
+	"""实解一个 token 验证打码配置（会消耗一次打码费用，约 $0.001~0.002）。
+
+	不指定站点时自动挑第一个开着 Turnstile 且有 sitekey 的站点。只求解不消费：
+	token 不会拿去签到，纯验证 api_key、余额与网络链路是否可用。
+	"""
+	cfg = get_turnstile_solver_config()
+	if not cfg['api_key']:
+		return {'success': False, 'error': '请先保存 api_key'}
+	sites = load_newapi_sites()
+	site = None
+	site_key = ''
+	if site_id:
+		site = next((s for s in sites if s.id == site_id), None)
+		if site is None:
+			return {'success': False, 'error': f'未知站点: {site_id}'}
+		ts = await newapi_turnstile_status(site)
+		if not ts['enabled']:
+			return {'success': True, 'tested': False, 'message': f'{site.label} 未开启 Turnstile，无需打码'}
+		if not ts['site_key']:
+			return {'success': False, 'error': f'{site.label} 状态探测失败拿不到 sitekey'}
+		site_key = ts['site_key']
+	else:
+		for s in sites:
+			ts = await newapi_turnstile_status(s)
+			if ts['enabled'] and ts['site_key']:
+				site, site_key = s, ts['site_key']
+				break
+		if site is None:
+			return {'success': False, 'error': '没有开着 Turnstile 的站点，没有可用于测试的 sitekey'}
+
+	page_url = site.domain.rstrip('/') + '/login'
+	started = time.monotonic()
+	r = await solve_turnstile_token(site_key, page_url)
+	elapsed = round(time.monotonic() - started, 1)
+	if r.get('success'):
+		return {'success': True, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'token_preview': (r['token'] or '')[:24] + '…'}
+	return {'success': False, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'error': r.get('error')}
 
 
 @app.get('/api/site/{site_id}/checkin/status')

@@ -23,6 +23,10 @@ import type {
   SiteSyncResponse,
   SiteTurnstileResponse,
   TokenAccount,
+  ProtectionTestResponse,
+  TurnstileSolverSaveResponse,
+  TurnstileSolverStatus,
+  TurnstileSolverTestResponse,
 } from "@/types";
 
 export const checkinKeys = {
@@ -127,4 +131,27 @@ export function startSiteCheckin(siteId: string): Promise<CheckinStartResponse> 
 /** 浏览器脚本跑完后核对真实签到状态（GET，不挂 Turnstile），顺带刷新余额快照 */
 export function syncSiteCheckin(siteId: string): Promise<SiteSyncResponse> {
   return apiPost<SiteSyncResponse>(`/site/${encodeURIComponent(siteId)}/checkin/sync`);
+}
+
+// ── Turnstile 打码平台 ───────────────────────────────────────────────────
+
+export function getTurnstileSolver(): Promise<{ success: boolean; solver: TurnstileSolverStatus }> {
+  return apiGet<{ success: boolean; solver: TurnstileSolverStatus }>("/turnstile/solver");
+}
+
+/** api_key 留空 = 保留已保存的值（后端不回显密钥，这里也无法重传） */
+export function saveTurnstileSolver(patch: { provider: string; api_key?: string; base_url?: string; flaresolverr_url?: string }): Promise<TurnstileSolverSaveResponse> {
+  return apiPost<TurnstileSolverSaveResponse>("/turnstile/solver", patch);
+}
+
+/** 实解一个 token 验证配置（消耗一次打码费用，约 $0.001~0.002） */
+export function testTurnstileSolver(siteId?: string): Promise<TurnstileSolverTestResponse> {
+  const q = siteId ? `?site_id=${encodeURIComponent(siteId)}` : "";
+  return apiPost<TurnstileSolverTestResponse>(`/turnstile/solver/test${q}`);
+}
+
+/** 探测站点防护层（CF 质询 / 阿里云 WAF / Turnstile）并现场验证突破手段 */
+export function testSiteProtection(siteId?: string): Promise<ProtectionTestResponse> {
+  const q = siteId ? `?site_id=${encodeURIComponent(siteId)}` : "";
+  return apiPost<ProtectionTestResponse>(`/protection/test${q}`);
 }

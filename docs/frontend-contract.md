@@ -74,6 +74,17 @@
 | POST `/api/site/{id}/checkin/sync` | 3163 | 脚本跑完后核对状态+查余额 | — | `{success,results,checked_in,total,status}` | ✅ |
 | GET `/api/site/{id}/checkin/info` | 3240 | 只读签到状态与奖励区间 | — | `{success,accounts:[{name,enabled,min_reward,max_reward,checked_in_today,total_checkins,total_reward}]}` | ⛔ |
 
+### 人机校验与防护突破（Turnstile 打码 / CF 质询 / 阿里云 WAF）
+
+| GET `/api/turnstile/solver` | 3843 | 打码与 FlareSolverr 配置状态（api_key 只回 configured，不回显） | — | `{success,solver{provider,base_url,configured,flaresolverr_url,presets}}` | ✅ |
+| POST `/api/turnstile/solver` | 3859 | 保存打码 / FlareSolverr 配置（合并写 saved_config.json 的 turnstile_solver 段） | `{provider,api_key?,base_url?,flaresolverr_url?}`，api_key 留空保留旧值 | `{success,message?/error?}` | ✅ |
+| POST `/api/turnstile/solver/test` | 3926 | 实解一个 token 验证打码配置（消耗一次费用；site_id 缺省自动挑开启 Turnstile 的站点） | `?site_id=` | `{success,tested,site?,elapsed?,token_preview?,message?/error?}` | ✅ |
+| POST `/api/protection/test` | 3880 | 探测站点防护层（CF 质询/阿里云 WAF/Turnstile）并现场验证突破；solved 的 null=撞到但没配求解器 | `?site_id=` | `{success,site,domain,page_http_status,protections,solved,flaresolverr_configured}` | ✅ |
+
+- 配置打码后 `run_newapi_checkin` 遇到 Turnstile 站点逐账号求解 token（`?turnstile=`）再签到；未配置则维持「提示浏览器脚本」原行为。
+- `newapi_request` 撞上 CF 边缘质询（cf-mitigated: challenge）或阿里云 WAF 挑战页（arg1）时，自动解防护 cookies（按域名缓存 5 分钟 + singleflight）原地重打一次；CF 质询需在设置页配 FlareSolverr（`request.get` 协议，必须与本服务同出口 IP，cf_clearance 绑 UA）。
+- `/api/sites/probe` 的 info 现在带 `protections{cf_challenge,aliyun_waf}`（首页裸探测，保守分类）。
+
 ### 密钥管理
 
 | POST `/api/keys/list` | 3826 | 批量列出/补取全量密钥 | `{refs:[...],refresh?}` | `{success,accounts:[{ref,name,provider,success,keys,total,truncated,warning?,cached?}]}` | ✅ |

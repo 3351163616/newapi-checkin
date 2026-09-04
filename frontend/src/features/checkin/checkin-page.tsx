@@ -21,6 +21,7 @@ import {
   getLoginCheckinStatus,
   getSiteCheckinStatus,
   getSiteTurnstile,
+  getTurnstileSolver,
   listLoginAccounts,
   listSiteAccounts,
   listSites,
@@ -68,6 +69,7 @@ export function CheckinPage() {
   });
   const tokenAccountsQ = useQuery({ queryKey: checkinKeys.tokenAccounts, queryFn: listTokenAccounts });
   const loginAccountsQ = useQuery({ queryKey: checkinKeys.loginAccounts, queryFn: listLoginAccounts });
+  const solverQ = useQuery({ queryKey: ["checkin", "turnstile-solver"], queryFn: getTurnstileSolver });
 
   const sites = sitesQ.data?.sites ?? [];
   const siteAccountsQ = useQuery({
@@ -151,7 +153,15 @@ export function CheckinPage() {
         }
         return;
       }
-      // Turnstile 站点：生成浏览器脚本。先跑 sync 剔除今日已签——token 一次性，替已签的取 token 是纯浪费
+      // Turnstile 站点：配了打码平台就走服务器端（每日自动签到也是这条路径）；没配才用浏览器脚本
+      if (solverQ.data?.solver.configured) {
+        if (window.confirm(`${site.label} 已开启 Turnstile，将通过打码平台自动过验并在服务器端签到（每个账号消耗一次打码费用）。继续？`)) {
+          await startSiteCheckin(site.id);
+          toast.success(`${site.label} 签到已启动`);
+        }
+        return;
+      }
+      // 浏览器脚本：先跑 sync 剔除今日已签——token 一次性，替已签的取 token 是纯浪费
       let pending = accs;
       try {
         const sync = await syncSiteCheckin(site.id);
@@ -392,7 +402,11 @@ export function CheckinPage() {
                 <AutoCheckinRow
                   checked={Boolean(settings[`${site.id}_auto`])}
                   onCheckedChange={(next) => void toggleSetting({ [`${site.id}_auto`]: next }, next ? `已开启 ${site.label} 自动签到` : `已关闭 ${site.label} 自动签到`)}
-                  hint="每天 0 点服务器端签到；开启 Turnstile 的站点需手动浏览器签到"
+                  hint={
+                    solverQ.data?.solver.configured
+                      ? "每天 0 点服务器端签到；Turnstile 站点自动打码过验"
+                      : "每天 0 点服务器端签到；开启 Turnstile 的站点需配置打码平台（设置页）或手动浏览器签到"
+                  }
                 />
               ) : null}
               {progressBar(state)}
