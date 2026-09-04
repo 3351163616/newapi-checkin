@@ -1,0 +1,484 @@
+import { useState, type FormEvent } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Eye, EyeOff, FlaskConical, Loader2, Radio, RefreshCw, Send, ShieldQuestion } from "lucide-react";
+import { toast } from "sonner";
+import { z } from "zod";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ErrorState, LoadingState } from "@/shared/components/data-state";
+import { PageHeader } from "@/shared/components/page-header";
+import { apiGet, apiPost } from "@/shared/api/client";
+import type { CookieAccount, MonitorEmailConfig, MonitorStatus, SavedConfig } from "@/types";
+
+import { errorMessage } from "@/features/checkin/checkin-format";
+import { getTurnstileSolver, saveTurnstileSolver, testSiteProtection, testTurnstileSolver } from "@/features/checkin/checkin-api";
+
+/** GET /api/monitor/status 是全项目唯一不带 {success:...} 信封的端点——apiGet 原样透传整个 payload */
+interface ProxyInfo {
+  proxy: { url: string; source: string; has_credentials: boolean; reachable: boolean | null };
+  mihomo: { group: string; rotation_enabled: boolean; config_path: string; config_exists: boolean };
+}
+
+const emailSchema = z.object({
+  smtp_server: z.string().min(1, "SMTP 服务器必填"),
+  smtp_port: z.coerce.number().int().min(1).max(65535),
+  email_user: z.string().min(1, "发件邮箱必填"),
+  email_pass: z.string().min(1, "密码 / 授权码必填"),
+  email_to: z.string().email("收件邮箱格式不对"),
+});
+
+interface StartMonitorValues {
+  email: MonitorEmailConfig;
+  interval_hours: number;
+  threshold: number;
+}
+
+/**
+ * 监控告警表单。初始值来自 saved_config.json（SMTP 密码刻意不落盘，见 SavedEmailConfig 注释，
+ * 所以每次启动监控都要重新输入授权码）。
+ *
+ * 由父组件在 configQ 数据就绪后才挂载（条件渲染），useState 初始化器天然拿到正确初值——
+ * 不要在父组件里用「render 中 setState 回填 + hydrated 标志」的老办法，那会让整棵表单
+ * 白渲染一轮（React 会丢弃带 setState 的那次渲染立即重放）。
+ */
+function MonitorForm({
+  config,
+  monitor,
+  submitting,
+  onSubmit,
+}: {
+  config: SavedConfig;
+  monitor: MonitorStatus | undefined;
+  submitting: boolean;
+  onSubmit: (values: StartMonitorValues) => void;
+}) {
+  const [smtpServer, setSmtpServer] = useState(config.email?.smtp_server ?? "");
+  const [smtpPort, setSmtpPort] = useState(String(config.email?.smtp_port ?? 465));
+  const [emailUser, setEmailUser] = useState(config.email?.email_user ?? "");
+  const [emailPass, setEmailPass] = useState("");
+  const [emailTo, setEmailTo] = useState(config.email?.email_to ?? "");
+  const [interval, setIntervalHours] = useState(String(config.monitor?.interval ?? 6));
+  const [threshold, setThreshold] = useState(String(config.monitor?.threshold ?? 10));
+  const [showPass, setShowPass] = useState(false);
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const parsed = emailSchema.safeParse({ smtp_server: smtpServer, smtp_port: smtpPort, email_user: emailUser, email_pass: emailPass, email_to: emailTo });
+    if (!parsed.success) {
+      toast.error(parsed.error.issues[0]?.message ?? "表单有误");
+      return;
+    }
+    onSubmit({ email: parsed.data, interval_hours: Number(interval) || 6, threshold: Number(threshold) || 10 });
+  }
+
+  return (
+    <form className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" onSubmit={handleSubmit}>
+      <div className="space-y-1">
+        <Label htmlFor="smtp-server" className="text-xs">SMTP 服务器</Label>
+        <Input id="smtp-server" value={smtpServer} onChange={(e) => setSmtpServer(e.target.value)} className="h-8 text-xs" placeholder="smtp.example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="smtp-port" className="text-xs">端口</Label>
+        <Input id="smtp-port" value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-user" className="text-xs">发件邮箱</Label>
+        <Input id="email-user" value={emailUser} onChange={(e) => setEmailUser(e.target.value)} className="h-8 text-xs" placeholder="bot@example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-pass" className="text-xs">密码 / 授权码</Label>
+        <div className="relative">
+          <Input
+            id="email-pass"
+            type={showPass ? "text" : "password"}
+            autoComplete="new-password"
+            value={emailPass}
+            onChange={(e) => setEmailPass(e.target.value)}
+            className="h-8 pr-8 text-xs"
+            placeholder="••••••••"
+          />
+          <button
+            type="button"
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            onClick={() => setShowPass((v) => !v)}
+            aria-label={showPass ? "隐藏密码" : "显示密码"}
+          >
+            {showPass ? <EyeOff className="size-3.5" aria-hidden="true" /> : <Eye className="size-3.5" aria-hidden="true" />}
+          </button>
+        </div>
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="email-to" className="text-xs">收件邮箱</Label>
+        <Input id="email-to" value={emailTo} onChange={(e) => setEmailTo(e.target.value)} className="h-8 text-xs" placeholder="you@example.com" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="monitor-interval" className="text-xs">检查间隔（小时）</Label>
+        <Input id="monitor-interval" value={interval} onChange={(e) => setIntervalHours(e.target.value)} className="h-8 font-data text-xs" inputMode="numeric" />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="monitor-threshold" className="text-xs">告警阈值（$）</Label>
+        <Input id="monitor-threshold" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="h-8 font-data text-xs" inputMode="decimal" />
+      </div>
+      <div className="flex items-end">
+        <Button type="submit" className="w-full sm:w-auto" disabled={submitting || monitor?.running}>
+          {submitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
+          启动监控
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+const SOLVER_LABELS: Record<string, string> = {
+  "2captcha": "2Captcha",
+  yescaptcha: "YesCaptcha",
+  capsolver: "CapSolver",
+  custom: "自定义网关",
+};
+
+/**
+ * 人机校验与防护配置：打码平台（过 Turnstile）+ FlareSolverr（过 CF 边缘质询）。
+ * api_key 后端不回显（只回 configured），表单留空即保持原值。
+ * 「测试过验」会真解一个 token（消耗约 $0.001~0.002），不拿去签到；
+ * 「检测站点防护」裸探测各站点防护层并现场验证突破手段。
+ */
+function SolverSection() {
+  const queryClient = useQueryClient();
+  const solverQ = useQuery({ queryKey: ["checkin", "turnstile-solver"], queryFn: getTurnstileSolver });
+  const solver = solverQ.data?.solver;
+  const [provider, setProvider] = useState<string>("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [flaresolverrUrl, setFlaresolverrUrl] = useState<string | null>(null);
+  const [showKey, setShowKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [probing, setProbing] = useState(false);
+
+  const effectiveProvider = provider || solver?.provider || "2captcha";
+  const presetUrl = solver?.presets?.[effectiveProvider];
+  const effectiveFlare = flaresolverrUrl ?? solver?.flaresolverr_url ?? "";
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const r = await saveTurnstileSolver({ provider: effectiveProvider, api_key: apiKey, base_url: baseUrl, flaresolverr_url: effectiveFlare });
+      if (!r.success) {
+        toast.error(r.error ?? "保存失败");
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["checkin", "turnstile-solver"] });
+      setApiKey("");
+      toast.success(r.message ?? "已保存");
+    } catch (err) {
+      toast.error(errorMessage(err, "保存失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const r = await testTurnstileSolver();
+      if (r.success && r.tested) toast.success(`过验通过：${r.site} · ${r.elapsed}s`);
+      else if (r.success) toast.info(r.message ?? "站点未开启 Turnstile，无需打码");
+      else toast.error(r.error ?? "过验失败");
+    } catch (err) {
+      toast.error(errorMessage(err, "测试失败"));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function handleProtectionTest() {
+    setProbing(true);
+    try {
+      const r = await testSiteProtection();
+      if (!r.success) {
+        toast.error(r.error ?? "探测失败");
+        return;
+      }
+      const parts: string[] = [];
+      if (r.protections.turnstile) parts.push("Turnstile");
+      if (r.protections.cf_challenge) parts.push(r.solved.cf_challenge === null ? "CF 质询（未配 FlareSolverr）" : r.solved.cf_challenge ? "CF 质询（已过）" : "CF 质询（过验失败）");
+      if (r.protections.aliyun_waf) parts.push(r.solved.aliyun_waf ? "阿里云 WAF（已过）" : "阿里云 WAF（过验失败）");
+      toast.success(`${r.site}：${parts.length ? parts.join(" · ") : "无防护"}`);
+    } catch (err) {
+      toast.error(errorMessage(err, "探测失败"));
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  return (
+    <section className="rounded-lg bg-card p-4 sm:p-5">
+      <div className="flex min-h-8 items-center justify-between gap-3">
+        <h2 className="text-sm font-medium">人机校验与防护</h2>
+        {solverQ.isLoading ? null : solver?.configured ? (
+          <Badge variant="secondary" className="text-[11px] text-checkin-done">
+            {SOLVER_LABELS[solver.provider] ?? solver.provider} 已配置
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className="text-[11px] text-muted-foreground">未配置</Badge>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        配置后，开启 Cloudflare Turnstile 人机校验的站点也能在服务器端自动签到（含每天 0 点的自动任务），按求解次数计费。
+        FlareSolverr 用于过 Cloudflare 边缘质询（cf_clearance），需与本服务同出口 IP。
+      </p>
+      {solverQ.isPending ? (
+        <LoadingState className="min-h-20" />
+      ) : solverQ.isError ? (
+        <ErrorState message={errorMessage(solverQ.error, "打码配置加载失败")} onRetry={() => void solverQ.refetch()} />
+      ) : (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="space-y-1">
+            <Label htmlFor="solver-provider" className="text-xs">平台</Label>
+            <Select value={effectiveProvider} onValueChange={setProvider}>
+              <SelectTrigger id="solver-provider" className="h-8 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {Object.keys(SOLVER_LABELS).map((p) => (
+                  <SelectItem key={p} value={p}>{SOLVER_LABELS[p]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="solver-api-key" className="text-xs">API Key（ClientKey）</Label>
+            <div className="relative">
+              <Input
+                id="solver-api-key"
+                type={showKey ? "text" : "password"}
+                autoComplete="new-password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                className="h-8 pr-8 text-xs"
+                placeholder={solver?.configured ? "已配置，留空保持不变" : "平台后台获取"}
+              />
+              <button
+                type="button"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                onClick={() => setShowKey((v) => !v)}
+                aria-label={showKey ? "隐藏密钥" : "显示密钥"}
+              >
+                {showKey ? <EyeOff className="size-3.5" aria-hidden="true" /> : <Eye className="size-3.5" aria-hidden="true" />}
+              </button>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="solver-base-url" className="text-xs">API 域名（自定义网关才需填）</Label>
+            <Input
+              id="solver-base-url"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder={presetUrl ?? "https://your-gateway.example.com"}
+            />
+          </div>
+          <div className="flex items-end gap-2">
+            <Button onClick={() => void handleSave()} disabled={saving}>
+              {saving ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
+              保存
+            </Button>
+            <Button variant="secondary" onClick={() => void handleTest()} disabled={testing}>
+              {testing ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <FlaskConical className="size-3.5" aria-hidden="true" />}
+              测试过验
+            </Button>
+          </div>
+          <div className="space-y-1 sm:col-span-2">
+            <Label htmlFor="solver-flaresolverr" className="text-xs">FlareSolverr 地址（过 CF 边缘质询，可选）</Label>
+            <Input
+              id="solver-flaresolverr"
+              value={effectiveFlare}
+              onChange={(e) => setFlaresolverrUrl(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder="http://127.0.0.1:8191"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button variant="secondary" className="w-full sm:w-auto" onClick={() => void handleProtectionTest()} disabled={probing}>
+              {probing ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <ShieldQuestion className="size-3.5" aria-hidden="true" />}
+              检测站点防护
+            </Button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function SettingsPage() {
+  const queryClient = useQueryClient();
+
+  const configQ = useQuery({ queryKey: ["accounts", "cookie"], queryFn: async (): Promise<SavedConfig | null> => (await apiGet<{ data: SavedConfig | null }>("/config")).data });
+  const monitorQ = useQuery({
+    queryKey: ["monitor", "status"],
+    queryFn: () => apiGet<MonitorStatus>("/monitor/status"),
+    refetchInterval: (query) => (query.state.data?.running ? 5000 : false),
+  });
+  const proxyQ = useQuery({ queryKey: ["system", "proxy-info"], queryFn: () => apiGet<ProxyInfo>("/system/proxy-info"), retry: false });
+  const [probingProxy, setProbingProxy] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const monitor = monitorQ.data;
+
+  async function startMonitor(values: StartMonitorValues) {
+    // accounts 传空：后端自动收集全部 token/站点/cookie 账号监控
+    const accounts: CookieAccount[] = [];
+    setSubmitting(true);
+    try {
+      await apiPost("/monitor/start", {
+        accounts,
+        email: values.email,
+        interval_hours: values.interval_hours,
+        threshold: values.threshold,
+      });
+      await queryClient.invalidateQueries({ queryKey: ["monitor"] });
+      toast.success("监控已启动");
+    } catch (err) {
+      toast.error(errorMessage(err, "启动失败"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function stopMonitor() {
+    try {
+      await apiPost("/monitor/stop");
+      await queryClient.invalidateQueries({ queryKey: ["monitor"] });
+      toast.success("监控已停止");
+    } catch (err) {
+      toast.error(errorMessage(err, "停止失败"));
+    }
+  }
+
+  async function probeProxy() {
+    setProbingProxy(true);
+    try {
+      await queryClient.invalidateQueries({ queryKey: ["system", "proxy-info"] });
+      await apiGet<ProxyInfo>("/system/proxy-info?probe=true");
+      await queryClient.invalidateQueries({ queryKey: ["system", "proxy-info"] });
+      toast.success("连通性测试完成");
+    } catch (err) {
+      toast.error(errorMessage(err, "探测失败"));
+    } finally {
+      setProbingProxy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <PageHeader title="设置" description="监控告警与运行环境" />
+
+      <section className="rounded-lg bg-card p-4 sm:p-5">
+        <div className="flex min-h-8 items-center justify-between gap-3">
+          <h2 className="text-sm font-medium">余额监控告警</h2>
+          <div className="flex items-center gap-2">
+            {monitorQ.isLoading ? null : monitor?.running ? (
+              <Badge variant="secondary" className="gap-1 text-[11px] text-checkin-done">
+                <span className="relative flex size-1.5">
+                  <span className="absolute inline-flex size-full animate-ping rounded-full bg-checkin-done opacity-75" />
+                  <span className="relative inline-flex size-1.5 rounded-full bg-checkin-done" />
+                </span>
+                运行中
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="text-[11px] text-muted-foreground">未启动</Badge>
+            )}
+            {monitor?.running ? (
+              <Button variant="secondary" size="sm" onClick={() => void stopMonitor()}>停止</Button>
+            ) : null}
+          </div>
+        </div>
+        {monitor?.running && monitor.config ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            每 {monitor.config.interval_hours} 小时检查一次 · 阈值 ${monitor.config.threshold} · 监控 {monitor.config.account_count} 个账号 · 上次 {monitor.last_check ?? "--"} · 下次 {monitor.next_check ?? "--"}
+          </p>
+        ) : null}
+
+        {configQ.isPending ? (
+          <LoadingState className="min-h-24" />
+        ) : configQ.data ? (
+          <MonitorForm config={configQ.data} monitor={monitor} submitting={submitting} onSubmit={(v) => void startMonitor(v)} />
+        ) : (
+          <div className="mt-4">
+            <ErrorState message={errorMessage(configQ.error, "配置加载失败")} onRetry={() => void configQ.refetch()} />
+          </div>
+        )}
+
+        {monitor?.logs && monitor.logs.length > 0 ? (
+          <div className="mt-4 max-h-32 space-y-0.5 overflow-y-auto rounded-md bg-muted/40 p-2">
+            {monitor.logs.slice(-10).reverse().map((l, i) => (
+              <p key={`${l.time}-${i}`} className="font-data text-[11px] text-muted-foreground">
+                <span className="mr-1.5 opacity-60">{l.time}</span>
+                {l.message}
+              </p>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      <SolverSection />
+
+      <section className="rounded-lg bg-card p-4 sm:p-5">
+        <div className="flex min-h-8 items-center justify-between gap-3">
+          <h2 className="text-sm font-medium">代理与出口</h2>
+          <Button variant="secondary" size="sm" onClick={() => void probeProxy()} disabled={probingProxy}>
+            {probingProxy ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Radio className="size-3.5" aria-hidden="true" />}
+            测试连通性
+          </Button>
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">访问 Handle / AgentRouter 必须经本地代理。以下配置来自服务端环境变量 / .env，只读——修改后需重启服务。</p>
+        {proxyQ.isLoading ? (
+          <LoadingState className="min-h-16" />
+        ) : proxyQ.isError ? (
+          <ErrorState message={errorMessage(proxyQ.error, "代理信息加载失败")} onRetry={() => void proxyQ.refetch()} />
+        ) : proxyQ.data ? (
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-md border p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium">上游代理</span>
+                {proxyQ.data.proxy.reachable === false ? (
+                  <Badge variant="secondary" className="text-[11px] text-checkin-failed">✗ 不可达</Badge>
+                ) : proxyQ.data.proxy.reachable === true ? (
+                  <Badge variant="secondary" className="text-[11px] text-checkin-done">✓ 可达</Badge>
+                ) : null}
+              </div>
+              <p className="font-data mt-1.5 text-xs">{proxyQ.data.proxy.url}</p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                来源：{proxyQ.data.proxy.source}
+                {proxyQ.data.proxy.has_credentials ? " · 凭据已隐藏" : ""}
+                {proxyQ.data.proxy.reachable === false ? " —— 代理未运行时余额查询会静默失败，请先启动 mihomo" : ""}
+              </p>
+            </div>
+            <div className="rounded-md border p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium">mihomo 出口轮换</span>
+                <Badge variant="secondary" className="text-[11px]">
+                  {proxyQ.data.mihomo.rotation_enabled ? "已启用" : "未配置"}
+                </Badge>
+              </div>
+              <p className="font-data mt-1.5 text-xs">{proxyQ.data.mihomo.group || "--"}</p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {proxyQ.data.mihomo.rotation_enabled
+                  ? "AgentRouter 查询期间轮换出口 IP，避开阿里云 WAF 的按 IP 限流"
+                  : "未配置 MIHOMO_GROUP —— 以单一出口访问（安全降级，非故障）"}
+                {" · "}
+                {proxyQ.data.mihomo.config_exists ? "已找到配置" : "未找到 mihomo 配置文件"}
+              </p>
+            </div>
+          </div>
+        ) : null}
+        <Button variant="ghost" size="sm" className="mt-2 text-muted-foreground" onClick={() => void proxyQ.refetch()}>
+          <RefreshCw className="size-3.5" aria-hidden="true" />
+          刷新
+        </Button>
+      </section>
+    </div>
+  );
+}

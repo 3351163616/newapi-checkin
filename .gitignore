@@ -36,3 +36,12 @@ __pycache__/
 # ===== 其它本地工具 =====
 .claude/
 .wrangler/
+
+# ===== 前端（Vite + React）=====
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+frontend/*.tsbuildinfo
+
+# 本地演示工具（含 mock 账号，不进 PR）
+scripts/gen_mock_data.py

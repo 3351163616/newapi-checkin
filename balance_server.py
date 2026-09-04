@@ -5,6 +5,8 @@ AnyRouter 余额查询服务
 
 import asyncio
 import base64
+import contextlib
+import hmac
 import json
 import os
 import random
@@ -14,10 +16,10 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # anyrouter.top 与 agentrouter.org 现均需经本地代理（mihomo 7890）访问，且需浏览器级 TLS 指纹
 _LOCAL_PROXY = 'http://127.0.0.1:7890'
@@ -26,7 +28,8 @@ _AGENTROUTER_PROXY = _LOCAL_PROXY
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 
@@ -48,18 +51,32 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-app = FastAPI(title='New API Balance Manager')
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+	"""应用生命周期。startup 逻辑在文件尾部的 startup_event() 里（此处引用后定义的函数没问题，
+	真正执行时机是事件循环启动后）。@app.on_event('startup') 已弃用，统一走 lifespan。
+	"""
+	await startup_event()
+	yield
+
+
+app = FastAPI(title='New API Balance Manager', lifespan=_lifespan)
 
 # 认证配置：从环境变量或 .env 读取（.env 已被 gitignore，别提交真实密码）。
 # 未设置 AUTH_PASSWORD 时自动生成随机密码写回 .env —— 开箱即用且每次部署都不同。
 AUTH_USERNAME = os.environ.get('AUTH_USERNAME') or 'admin'
 AUTH_PASSWORD = os.environ.get('AUTH_PASSWORD') or ''
+
+# 书签采集密钥：/api/collect 的防滥用口令（登录后从「站点管理」复制书签脚本时内嵌）
+# 未设置时采集端点禁用
+COLLECT_KEY = os.environ.get('COLLECT_KEY') or ''
 if not AUTH_PASSWORD:
 	AUTH_PASSWORD = uuid.uuid4().hex + uuid.uuid4().hex[:8]
 	try:
 		with (Path(__file__).parent / '.env').open('a', encoding='utf-8') as f:
 			f.write(f'\nAUTH_PASSWORD={AUTH_PASSWORD}\n')
-		print(f'[AUTH] .env 未设置 AUTH_PASSWORD，已自动生成并写入 .env。用户名: {AUTH_USERNAME}，密码: {AUTH_PASSWORD}')
+		print(f'[AUTH] .env 未设置 AUTH_PASSWORD，已自动生成并写入 .env（密码看 .env 文件，别让它进日志）。用户名: {AUTH_USERNAME}')
 	except OSError:
 		print(f'[AUTH] 未设置 AUTH_PASSWORD 且 .env 不可写，本次使用随机密码（重启会变）: {AUTH_PASSWORD}')
 TOKEN_EXPIRE_SECONDS = 2592000  # 30 天
@@ -74,7 +91,10 @@ class LoginRequest(BaseModel):
 
 @app.post('/api/login')
 async def login(req: LoginRequest):
-	if req.username != AUTH_USERNAME or req.password != AUTH_PASSWORD:
+	# hmac.compare_digest 常数时间比较，消除密码校验的时序侧信道
+	if not hmac.compare_digest(req.username.encode(), AUTH_USERNAME.encode()) or not hmac.compare_digest(
+		req.password.encode(), AUTH_PASSWORD.encode()
+	):
 		return {'success': False, 'message': '用户名或密码错误'}
 	token = str(uuid.uuid4())
 	active_tokens[token] = time.time() + TOKEN_EXPIRE_SECONDS
@@ -106,7 +126,8 @@ async def check_auth(request: Request):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
 	path = request.url.path
-	if path in ('/', '/api/login', '/api/logout', '/api/check-auth') or not path.startswith('/api'):
+	# /api/collect 免登录：书签脚本在站点页面上下文调用，靠 COLLECT_KEY 防滥用
+	if path in ('/', '/api/login', '/api/logout', '/api/check-auth', '/api/collect') or not path.startswith('/api'):
 		return await call_next(request)
 	auth_header = request.headers.get('Authorization', '')
 	if not auth_header.startswith('Bearer '):
@@ -117,6 +138,67 @@ async def auth_middleware(request: Request, call_next):
 		active_tokens.pop(token, None)
 		return JSONResponse(status_code=401, content={'success': False, 'error': '登录已过期'})
 	return await call_next(request)
+
+
+# ── 通用工具 ────────────────────────────────────────────────────────────────
+
+def _atomic_write_json(path: Path, data, indent: int | None = None) -> None:
+	"""原子写 JSON：先写临时文件再 os.replace。
+
+	直接 write_text 覆盖原文件，进程在写入中途崩溃/断电会留下半个 JSON；
+	os.replace 在同一文件系统上是原子的，最坏情况也只是旧文件完好无损。
+	"""
+	tmp = path.with_name(path.name + '.tmp')
+	tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding='utf-8')
+	os.replace(tmp, path)
+	# 本进程是这些配置文件唯一的写入方，写完直接丢缓存，下次读按新 mtime 重建
+	_json_cache.pop(path, None)
+
+
+# 配置文件读多写少（几乎每个 API 请求都要 load 一遍账号/站点清单），
+# 按 (mtime_ns, size) 缓存解析结果：文件没变就只做一次 stat，不再反复读盘 + json.loads。
+# 进程外手动改文件也会因 mtime 变化自动失效。
+_json_cache: dict[Path, tuple[tuple[int, int], object]] = {}
+
+
+def _read_json_cached(path: Path) -> object:
+	"""读 JSON 并走 mtime 缓存；文件不存在抛 FileNotFoundError，损坏抛 JSONDecodeError"""
+	try:
+		st = path.stat()
+	except OSError as e:
+		_json_cache.pop(path, None)
+		raise FileNotFoundError(str(path)) from e
+	stamp = (st.st_mtime_ns, st.st_size)
+	cached = _json_cache.get(path)
+	if cached is not None and cached[0] == stamp:
+		return cached[1]
+	data = json.loads(path.read_text(encoding='utf-8'))
+	_json_cache[path] = (stamp, data)
+	return data
+
+
+def _read_json_models(path: Path, model, tag: str) -> list:
+	"""读取「JSON 数组 + pydantic 模型」配置文件的公共样板；文件不存在或损坏都返回空列表"""
+	try:
+		data = _read_json_cached(path)
+		return [model(**item) for item in data]
+	except FileNotFoundError:
+		return []
+	except Exception as e:
+		print(f'[{tag}] 加载 {path.name} 失败: {e}')
+		return []
+
+
+# 后台任务强引用：事件循环对 task 只持弱引用，不保存随时可能被 GC 静默杀掉
+_background_tasks: set = set()
+
+
+def _spawn(coro):
+	"""create_task 并持有引用，结束后自动清理。所有长生命周期调度器都该走这里。"""
+	task = asyncio.create_task(coro)
+	_background_tasks.add(task)
+	task.add_done_callback(_background_tasks.discard)
+	return task
 
 
 # 配置文件路径
@@ -176,7 +258,9 @@ AGENTROUTER_ORG_CONFIG = {
 #   2. GET /api/user/checkin 额外返回签到配置与历史（enabled / min_quota / max_quota / stats）
 #   3. 站点在 Cloudflare 后而非阿里云盾，无需 WAF cookies、无需代理、无需 TLS 指纹
 #   4. access_token 可直接签到（anyrouter 的签到只认 session cookie）
-#   5. POST 挂了 Cloudflare Turnstile 中间件时服务器侧签不了；GET 没挂，随时可读状态
+#   5. POST 挂了 Cloudflare Turnstile 中间件时，服务器侧要带 ?turnstile=<token> 才签得了：
+#      配置了打码平台（saved_config.json 的 turnstile_solver 段）就自动代解，没配置则提示
+#      走浏览器脚本；GET 没挂中间件，随时可读状态
 #      （见 new-api 的 router/api-router.go：POST 带 middleware.TurnstileCheck()，GET 不带）
 # AnyRouter 与 AgentRouter 不在此列：前者要过阿里云 WAF + 走代理，后者只能账号密码登录。
 NEWAPI_DEFAULTS = {
@@ -294,6 +378,40 @@ class NewapiAccountItem(BaseModel):
 	user_id: str
 
 
+class CollectRequest(BaseModel):
+	"""书签脚本上报的账号信息（方案 A：登录站点后一键采集 token）"""
+
+	site_url: str
+	access_token: str
+	user_id: str = ''
+	name: str = ''
+	key: str = ''
+
+
+# ── 站点健康状态（三态：ok / invalid / unknown）────────────────────────
+_SITE_STATUS_FILE = Path(__file__).parent / 'site_status.json'
+_site_status: dict[str, dict] = {}
+
+
+def _load_site_status() -> None:
+	global _site_status
+	try:
+		_site_status = json.loads(_SITE_STATUS_FILE.read_text(encoding='utf-8'))
+	except Exception:
+		_site_status = {}
+
+
+def _set_site_status(site_id: str, status: str, error: str = '') -> None:
+	_site_status[site_id] = {'status': status, 'error': error, 'checked_at': int(time.time())}
+	try:
+		_SITE_STATUS_FILE.write_text(json.dumps(_site_status, ensure_ascii=False, indent=2), encoding='utf-8')
+	except Exception:
+		pass
+
+
+_load_site_status()
+
+
 class NewapiSite(BaseModel):
 	"""一个 new-api 同构站点的配置。前端「站点管理」写入 newapi_sites.json，后端据此工作。
 
@@ -339,10 +457,29 @@ class EmailConfig(BaseModel):
 
 
 class MonitorStartRequest(BaseModel):
-	accounts: list[AccountItem]
+	# accounts 为空时后端自动收集全部账号（token + 站点 + cookie）监控，且循环每轮
+	# 重新收集——监控期间增删账号即时生效；传入时为 [{kind: cookie|token|site, ...}]
+	# 的宽松字典（兼容旧前端传 CookieAccount[]），固定用这份快照
+	accounts: list[dict] = []
 	email: EmailConfig
 	interval_hours: float = 6
 	threshold: float = 10.0
+
+
+def _collect_monitor_accounts() -> list[dict]:
+	"""收集全部可监控账号：token（anyrouter）+ 各站点 + cookie"""
+	accounts: list[dict] = []
+	for a in load_token_accounts():
+		accounts.append({'kind': 'token', 'name': a.name, 'access_token': a.access_token, 'user_id': a.user_id})
+	for site in load_newapi_sites():
+		for a in load_newapi_accounts(site):
+			accounts.append({
+				'kind': 'site', 'site_id': site.id, 'name': a.name,
+				'access_token': a.access_token, 'user_id': a.user_id,
+			})
+	for a in load_cookie_accounts():
+		accounts.append({'kind': 'cookie', 'name': a.name, 'cookies': a.cookies, 'api_user': a.api_user})
+	return accounts
 
 
 # 监控状态
@@ -365,6 +502,7 @@ checkin_state: dict = {
 	'started_at': None,  # 本轮开始时间
 	'finished_at': None,  # 本轮结束时间
 	'trigger': None,  # 触发方式：manual / auto
+	'mode': None,  # 本轮模式：slow（默认，逐个间隔签）/ fast（出口轮换批量签）；进骨架才能随状态文件持久化
 	'total': 0,  # 账号总数
 	'done': 0,  # 已处理数（含成功/失败）
 	'order': [],  # 本轮随机顺序的账号名
@@ -413,6 +551,49 @@ def _blank_checkin_state() -> dict:
 	}
 
 
+# ── 签到状态的通用操作 ──
+# AgentRouter / AnyRouter / 各 new-api 站点三套签到状态机的日志、持久化、恢复逻辑完全同构，
+# 差异只有「状态字典、文件路径、日志前缀」三元组，统一在这里实现，各站点的同名函数只是薄封装。
+
+
+def _checkin_add_log(st: dict, tag: str, msg: str):
+	"""添加签到日志到状态字典，最多保留 100 条"""
+	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	st['logs'].append({'time': ts, 'message': msg})
+	if len(st['logs']) > 100:
+		st['logs'] = st['logs'][-100:]
+	print(f'[{tag} {ts}] {msg}')
+
+
+def _checkin_save(st: dict, path: Path, tag: str):
+	"""持久化签到状态到文件（排除不可序列化的 task）"""
+	try:
+		data = {k: v for k, v in st.items() if k != 'task'}
+		_atomic_write_json(path, data, indent=2)
+	except Exception as e:
+		print(f'[{tag}] 状态保存失败: {e}')
+
+
+def _checkin_load(st: dict, path: Path, tag: str):
+	"""服务启动时从文件恢复签到状态（仅用于前端展示历史进度），并强制复位运行标记"""
+	if not path.exists():
+		return
+	try:
+		data = json.loads(path.read_text(encoding='utf-8'))
+		for k, v in data.items():
+			if k in st and k != 'task':
+				st[k] = v
+		# 重启后不可能仍在运行，强制复位运行标记与进度指针
+		st['running'] = False
+		st['task'] = None
+		if 'current' in st:
+			st['current'] = None
+		if 'next_at' in st:
+			st['next_at'] = None
+	except Exception as e:
+		print(f'[{tag}] 状态恢复失败: {e}')
+
+
 def _api_url(path: str) -> str:
 	"""返回 API 地址"""
 	return ANYROUTER_CONFIG['domain'] + path
@@ -435,7 +616,7 @@ async def anyrouter_request(method: str, url: str, headers: dict, cookies: dict 
 		sess = _get_cffi_session('anyrouter', proxies)
 		return sess.request(method.upper(), url, headers=headers, cookies=ck, json=json_body)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do, send)
 	if resp.status_code != 200:
 		return resp
@@ -536,55 +717,105 @@ def _solve_acw_sc_v2(arg1: str) -> str:
 	return v
 
 
+_waf_lock = asyncio.Lock()
+
+
 async def get_waf_cookies() -> dict | None:
-	"""获取 WAF cookies（curl_cffi 求解 acw_sc__v2 挑战），带缓存。
+	"""获取 WAF cookies（curl_cffi 求解 acw_sc__v2 挑战），带缓存 + singleflight。
 
 	阿里云 WAF 现已按 TLS 指纹（JA3）拦截无头 Chromium，导致 Playwright 直接握手失败
 	（net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH），拿不到 cookie。改用 curl_cffi 模拟
 	Chrome 指纹访问登录页，提取 acw_tc/cdn_sec_tc 并解析 arg1 计算 acw_sc__v2 即可通过校验。
+
+	加锁做 singleflight：缓存过期瞬间，warmup/查询/签到等并发调用只放一个去打挑战页，
+	其余等结果 —— 挑战页请求是要省着用的配额。
 	"""
 	cached = waf_cache.get('anyrouter')
 	if cached and cached['expires'] > time.time():
 		return cached['cookies']
 
-	config = ANYROUTER_CONFIG
-	login_url = f'{config["domain"]}{config["login_path"]}'
-	required = config['waf_cookie_names']
+	async with _waf_lock:
+		# 双检：排队等锁期间可能已有同伴刷新了缓存
+		cached = waf_cache.get('anyrouter')
+		if cached and cached['expires'] > time.time():
+			return cached['cookies']
 
-	def _do() -> dict:
-		from curl_cffi import requests as cffi_requests
+		config = ANYROUTER_CONFIG
+		login_url = f'{config["domain"]}{config["login_path"]}'
+		required = config['waf_cookie_names']
 
-		# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
-		# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
-		sess = cffi_requests.Session(
-			impersonate='chrome131',
-			proxies={'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY},
-			timeout=30,
-		)
-		resp = sess.get(login_url, headers={'User-Agent': USER_AGENT})
-		waf_cookies = {}
-		for name in required:
-			val = sess.cookies.get(name)
-			if val:
-				waf_cookies[name] = val
-		m = _WAF_CHALLENGE_RE.search(resp.text)
-		if m:
-			waf_cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
-		return waf_cookies
+		def _do() -> dict:
+			from curl_cffi import requests as cffi_requests
 
-	try:
-		loop = asyncio.get_event_loop()
-		waf_cookies = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		if waf_cookies:
-			waf_cache['anyrouter'] = {
-				'cookies': waf_cookies,
-				'expires': time.time() + WAF_CACHE_TTL,
-			}
+			# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
+			# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
+			sess = cffi_requests.Session(
+				impersonate='chrome131',
+				proxies={'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY},
+				timeout=30,
+			)
+			resp = sess.get(login_url, headers={'User-Agent': USER_AGENT})
+			waf_cookies = {}
+			for name in required:
+				val = sess.cookies.get(name)
+				if val:
+					waf_cookies[name] = val
+			m = _WAF_CHALLENGE_RE.search(resp.text)
+			if m:
+				waf_cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
 			return waf_cookies
-		return None
-	except Exception as e:
-		print(f'[WAF] Error: {e}')
-		return None
+
+		try:
+			loop = asyncio.get_running_loop()
+			waf_cookies = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+			if waf_cookies:
+				waf_cache['anyrouter'] = {
+					'cookies': waf_cookies,
+					'expires': time.time() + WAF_CACHE_TTL,
+				}
+				return waf_cookies
+			return None
+		except Exception as e:
+			print(f'[WAF] Error: {e}')
+			return None
+
+
+async def _query_balance_impl(name: str, headers: dict, cookies: dict) -> dict:
+	"""余额查询的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
+	url = _api_url(ANYROUTER_CONFIG['user_info_path'])
+	max_retries = 3
+
+	for attempt in range(max_retries):
+		try:
+			resp = await anyrouter_request('GET', url, headers, cookies=cookies)
+			blocked = anyrouter_block_reason(resp)
+			if blocked:
+				kind, why = blocked
+				return {'name': name, 'success': False, 'error': why, 'blocked': kind}
+			data = resp.json()
+			if data.get('success'):
+				user_data = data.get('data', {})
+				return {
+					'name': name,
+					'success': True,
+					'quota': round(user_data.get('quota', 0) / 500000, 2),
+					'used': round(user_data.get('used_quota', 0) / 500000, 2),
+					'username': user_data.get('username', ''),
+				}
+			return {
+				'name': name,
+				'success': False,
+				'error': f'API 返回失败: {data.get("message", "Unknown")}',
+			}
+		except Exception as e:
+			if attempt < max_retries - 1:
+				await asyncio.sleep(1.5 * (attempt + 1))
+				continue
+			return {
+				'name': name,
+				'success': False,
+				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
+			}
 
 
 async def query_balance(account: AccountItem, waf_cookies: dict) -> dict:
@@ -600,41 +831,7 @@ async def query_balance(account: AccountItem, waf_cookies: dict) -> dict:
 		'Origin': config['domain'],
 		config['api_user_key']: account.api_user,
 	}
-
-	url = _api_url(config['user_info_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('GET', url, headers, cookies=all_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'error': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				return {
-					'name': account.name,
-					'success': True,
-					'quota': round(user_data.get('quota', 0) / 500000, 2),
-					'used': round(user_data.get('used_quota', 0) / 500000, 2),
-					'username': user_data.get('username', ''),
-				}
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'API 返回失败: {data.get("message", "Unknown")}',
-			}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
-			}
+	return await _query_balance_impl(account.name, headers, all_cookies)
 
 
 async def query_balance_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
@@ -650,41 +847,37 @@ async def query_balance_with_token(account: TokenAccountItem, waf_cookies: dict)
 		'Authorization': f'Bearer {account.access_token}',
 		config['api_user_key']: account.user_id,
 	}
+	return await _query_balance_impl(account.name, headers, waf_cookies)
 
-	url = _api_url(config['user_info_path'])
+
+async def _sign_in_impl(name: str, headers: dict, cookies: dict) -> dict:
+	"""签到的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
+	url = _api_url(ANYROUTER_CONFIG['sign_in_path'])
 	max_retries = 3
 
 	for attempt in range(max_retries):
 		try:
-			resp = await anyrouter_request('GET', url, headers, cookies=waf_cookies)
+			resp = await anyrouter_request('POST', url, headers, cookies=cookies)
 			blocked = anyrouter_block_reason(resp)
 			if blocked:
 				kind, why = blocked
-				return {'name': account.name, 'success': False, 'error': why, 'blocked': kind}
+				return {'name': name, 'success': False, 'message': why, 'blocked': kind}
 			data = resp.json()
 			if data.get('success'):
-				user_data = data.get('data', {})
+				msg = data.get('message', '')
+				# 空消息表示签到成功，有消息可能是"今日已签到"等
 				return {
-					'name': account.name,
+					'name': name,
 					'success': True,
-					'quota': round(user_data.get('quota', 0) / 500000, 2),
-					'used': round(user_data.get('used_quota', 0) / 500000, 2),
-					'username': user_data.get('username', ''),
+					'message': msg if msg else '签到成功 +$25',
+					'already_signed': bool(msg),
 				}
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'API 返回失败: {data.get("message", "Unknown")}',
-			}
+			return {'name': name, 'success': False, 'message': data.get('message', '签到失败')}
 		except Exception as e:
 			if attempt < max_retries - 1:
 				await asyncio.sleep(1.5 * (attempt + 1))
 				continue
-			return {
-				'name': account.name,
-				'success': False,
-				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
-			}
+			return {'name': name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
 
 
 async def sign_in(account: AccountItem, waf_cookies: dict) -> dict:
@@ -701,33 +894,7 @@ async def sign_in(account: AccountItem, waf_cookies: dict) -> dict:
 		config['api_user_key']: account.api_user,
 		'Cache-Control': 'no-store',
 	}
-
-	url = _api_url(config['sign_in_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('POST', url, headers, cookies=all_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'message': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				msg = data.get('message', '')
-				# 空消息表示签到成功，有消息可能是"今日已签到"等
-				return {
-					'name': account.name,
-					'success': True,
-					'message': msg if msg else '签到成功 +$25',
-					'already_signed': bool(msg),
-				}
-			return {'name': account.name, 'success': False, 'message': data.get('message', '签到失败')}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
+	return await _sign_in_impl(account.name, headers, all_cookies)
 
 
 async def sign_in_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
@@ -744,44 +911,12 @@ async def sign_in_with_token(account: TokenAccountItem, waf_cookies: dict) -> di
 		config['api_user_key']: account.user_id,
 		'Cache-Control': 'no-store',
 	}
-
-	url = _api_url(config['sign_in_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('POST', url, headers, cookies=waf_cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': account.name, 'success': False, 'message': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				msg = data.get('message', '')
-				return {
-					'name': account.name,
-					'success': True,
-					'message': msg if msg else '签到成功 +$25',
-					'already_signed': bool(msg),
-				}
-			return {'name': account.name, 'success': False, 'message': data.get('message', '签到失败')}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
+	return await _sign_in_impl(account.name, headers, waf_cookies)
 
 
 def load_token_accounts() -> list[TokenAccountItem]:
 	"""从 new_accounts_config.json 加载 access_token 账号列表"""
-	if not NEW_ACCOUNTS_FILE.exists():
-		return []
-	try:
-		data = json.loads(NEW_ACCOUNTS_FILE.read_text(encoding='utf-8'))
-		return [TokenAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[TOKEN] 加载 new_accounts_config.json 失败: {e}')
-		return []
+	return _read_json_models(NEW_ACCOUNTS_FILE, TokenAccountItem, 'TOKEN')
 
 
 def agentrouter_block_reason(resp) -> str | None:
@@ -827,7 +962,7 @@ async def agentrouter_real_balance(cookies: dict, user_id: str) -> tuple[dict | 
 		)
 
 	try:
-		loop = asyncio.get_event_loop()
+		loop = asyncio.get_running_loop()
 		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 		blocked = agentrouter_block_reason(resp)
 		if blocked:
@@ -861,13 +996,15 @@ async def query_balance_login(account: LoginAccountItem) -> dict:
 	max_retries = 3
 
 	def _do():
-		sess = _get_cffi_session('agentrouter', proxies)
+		# key 必须带出口代数：出口轮换后复用旧代数的 Session 会继续从旧 IP 出去，
+		# 与 _ar_session_key 注释里描述的轮换机制直接矛盾（其余 agentrouter 调用点都带了）
+		sess = _get_cffi_session(_ar_session_key('agentrouter'), proxies)
 		resp = sess.post(login_url, json=body, timeout=15)
 		return resp, dict(sess.cookies)
 
 	for attempt in range(max_retries):
 		try:
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 			# 429 的响应体是空的，先认出来，否则 resp.json() 抛的 JSONDecodeError 完全看不出是限流
 			if resp.status_code == 429:
@@ -928,7 +1065,7 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 
 	for attempt in range(max_retries):
 		try:
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
 			if resp.status_code == 429:
 				return {'name': account.name, 'success': False, 'message': '登录被站点限流（429），请等几分钟再试'}
@@ -972,14 +1109,7 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 
 def load_login_accounts() -> list[LoginAccountItem]:
 	"""从 agentrouter_accounts.json 加载登录方式账号列表"""
-	if not AGENTROUTER_ACCOUNTS_FILE.exists():
-		return []
-	try:
-		data = json.loads(AGENTROUTER_ACCOUNTS_FILE.read_text(encoding='utf-8'))
-		return [LoginAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[LOGIN] 加载 agentrouter_accounts.json 失败: {e}')
-		return []
+	return _read_json_models(AGENTROUTER_ACCOUNTS_FILE, LoginAccountItem, 'LOGIN')
 
 
 # ========== 通用 new-api 站点（access_token 方式）==========
@@ -991,24 +1121,17 @@ def load_newapi_sites() -> list[NewapiSite]:
 	"""读取 newapi_sites.json；文件不存在时用 NEWAPI_SEED_SITES 初始化后再读。"""
 	if not NEWAPI_SITES_FILE.exists():
 		try:
-			NEWAPI_SITES_FILE.write_text(json.dumps(NEWAPI_SEED_SITES, ensure_ascii=False, indent=2), encoding='utf-8')
+			_atomic_write_json(NEWAPI_SITES_FILE, NEWAPI_SEED_SITES, indent=2)
 			print(f'[SITE] 已初始化 newapi_sites.json（{len(NEWAPI_SEED_SITES)} 个站点）')
 		except Exception as e:
 			print(f'[SITE] 初始化 newapi_sites.json 失败: {e}')
 			return [NewapiSite(**s) for s in NEWAPI_SEED_SITES]
-	try:
-		data = json.loads(NEWAPI_SITES_FILE.read_text(encoding='utf-8'))
-		return [NewapiSite(**item) for item in data]
-	except Exception as e:
-		print(f'[SITE] 加载 newapi_sites.json 失败: {e}')
-		return []
+	return _read_json_models(NEWAPI_SITES_FILE, NewapiSite, 'SITE')
 
 
 def save_newapi_sites(sites: list[NewapiSite]):
 	"""写回站点清单"""
-	NEWAPI_SITES_FILE.write_text(
-		json.dumps([s.model_dump() for s in sites], ensure_ascii=False, indent=2), encoding='utf-8'
-	)
+	_atomic_write_json(NEWAPI_SITES_FILE, [s.model_dump() for s in sites], indent=2)
 
 
 def get_newapi_site(site_id: str) -> NewapiSite | None:
@@ -1021,22 +1144,12 @@ def get_newapi_site(site_id: str) -> NewapiSite | None:
 
 def load_newapi_accounts(site: NewapiSite) -> list[NewapiAccountItem]:
 	"""从站点自己的 accounts_file 加载账号列表"""
-	path = site.accounts_path()
-	if not path.exists():
-		return []
-	try:
-		data = json.loads(path.read_text(encoding='utf-8'))
-		return [NewapiAccountItem(**item) for item in data]
-	except Exception as e:
-		print(f'[{site.id.upper()}] 加载 {path.name} 失败: {e}')
-		return []
+	return _read_json_models(site.accounts_path(), NewapiAccountItem, site.id.upper())
 
 
 def save_newapi_accounts(site: NewapiSite, accounts: list[NewapiAccountItem]):
 	"""保存账号列表到站点自己的 accounts_file"""
-	site.accounts_path().write_text(
-		json.dumps([a.model_dump() for a in accounts], ensure_ascii=False, indent=2), encoding='utf-8'
-	)
+	_atomic_write_json(site.accounts_path(), [a.model_dump() for a in accounts], indent=2)
 
 
 def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
@@ -1053,19 +1166,46 @@ def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
 	}
 
 
-async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
+async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None, _auto_bypass: bool = True):
 	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
 
 	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
+
+	撞上 CF 边缘质询或阿里云 WAF 挑战页时，解一次防护 cookies（按域名缓存 5 分钟）后
+	原地重打一次；有缓存就直接带上。cf_clearance 绑 UA，重试时用求解方返回的同一个 UA。
+	挑战页由防护层返回，请求没到过 new-api 源站，重试对签到是安全的（不会重复签）。
 	"""
 	url = site.domain + path
+	prot = protection_cache.get(site.domain.rstrip('/'))
+	if prot and prot['expires'] <= time.time():
+		prot = None
+	send_headers = dict(headers)
+	if prot and prot.get('user_agent'):
+		send_headers['User-Agent'] = prot['user_agent']
 
 	def _do():
 		sess = _get_cffi_session(f'newapi:{site.id}')
-		return sess.request(method.upper(), url, headers=headers, json=json_body)
+		if prot:
+			sess.cookies.update(prot['cookies'])
+		return sess.request(method.upper(), url, headers=send_headers, json=json_body)
 
-	loop = asyncio.get_event_loop()
-	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	loop = asyncio.get_running_loop()
+	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	if not _auto_bypass:
+		return resp
+	kind = detect_protection(resp)
+	if kind is None:
+		return resp
+	if prot:
+		# 带着缓存的 cookies 仍撞质询：这条缓存已坏（被吊销/过期），作废后强制重解，
+		# 否则 ensure 会命中同一条「新鲜但无效」的缓存，拿同样的坏 cookies 白打一次
+		protection_cache.pop(site.domain.rstrip('/'), None)
+	entry = await ensure_protection_cookies(site, kind)
+	if not entry:
+		print(f'[{site.id.upper()}] 撞上 {kind} 防护但未能过验（CF 质询需在设置页配置 FlareSolverr）')
+		return resp
+	print(f'[{site.id.upper()}] 撞上 {kind} 防护，已过验并自动重试')
+	return await newapi_request(site, method, path, headers, json_body, _auto_bypass=False)
 
 
 async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
@@ -1086,7 +1226,7 @@ async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, head
 			proxies=proxies, impersonate='chrome131', timeout=20,
 		)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
 
 
@@ -1150,19 +1290,268 @@ async def newapi_turnstile_status(site: NewapiSite) -> dict:
 	return value
 
 
-async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem) -> dict:
+# ========== Turnstile 打码平台（服务器端过 CF 人机校验）==========
+# 站点开着 Turnstile 时，签到 POST 必须带一次性 token。浏览器场景由前端生成的 Console
+# 脚本现场渲染 widget 取 token；服务器侧则接打码平台代解。三家主流平台（2Captcha /
+# YesCaptcha / CapSolver）都兼容 createTask + getTaskResult 协议，差异只有域名和 task.type。
+TURNSTILE_SOLVER_PRESETS = {
+	'2captcha': {'base_url': 'https://api.2captcha.com', 'task_type': 'TurnstileTaskProxyless'},
+	'yescaptcha': {'base_url': 'https://api.yescaptcha.com', 'task_type': 'TurnstileTaskProxyless'},
+	'capsolver': {'base_url': 'https://api.capsolver.com', 'task_type': 'AntiTurnstileTaskProxyLess'},
+}
+# 打码按次计费且平台侧有限速，求解并发固定 3，不跟站点签到并发（10）走
+_TURNSTILE_SOLVER_SEM = asyncio.Semaphore(3)
+TURNSTILE_SOLVER_POLL_INTERVAL = 3  # 秒
+TURNSTILE_SOLVER_TIMEOUT = 150  # 单个 token 求解上限
+
+
+def get_turnstile_solver_config() -> dict:
+	"""读打码平台配置（saved_config.json 的 turnstile_solver 段），缺省即未配置。"""
+	try:
+		cfg = _read_json_cached(CONFIG_FILE)
+	except Exception:
+		cfg = {}
+	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
+	s = s if isinstance(s, dict) else {}
+	provider = (s.get('provider') or '').strip().lower()
+	api_key = (s.get('api_key') or '').strip()
+	base_url = (s.get('base_url') or '').strip().rstrip('/')
+	preset = TURNSTILE_SOLVER_PRESETS.get(provider)
+	return {
+		'provider': provider,
+		'api_key': api_key,
+		'base_url': base_url or (preset['base_url'] if preset else ''),
+		# 自定义网关没指 task.type 时按 2Captcha 协议猜——绝大多数兼容网关都认这个名字
+		'task_type': preset['task_type'] if preset else ('TurnstileTaskProxyless' if base_url else ''),
+	}
+
+
+async def solve_turnstile_token(site_key: str, page_url: str, timeout: int = TURNSTILE_SOLVER_TIMEOUT) -> dict:
+	"""调打码平台解一个 Turnstile token，成功返回 {'success': True, 'token': ...}。
+
+	同一 token 只能用一次（new-api 转发给 CF siteverify 后即作废），每个账号签到前
+	各解一个。CapSolver 的 createTask 可能直接带 solution.token，与轮询 getTaskResult
+	两种返回方式一并兼容。
+	"""
+	cfg = get_turnstile_solver_config()
+	if not (cfg['api_key'] and cfg['base_url'] and cfg['task_type']):
+		return {'success': False, 'error': '打码平台未配置（设置页选择平台并填 api_key）'}
+	if not site_key:
+		return {'success': False, 'error': '缺少 sitekey（站点状态探测失败）'}
+
+	def _post(path: str, payload: dict):
+		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
+		return sess.post(cfg['base_url'] + path, json=payload, timeout=30)
+
+	loop = asyncio.get_running_loop()
+
+	async with _TURNSTILE_SOLVER_SEM:
+		try:
+			resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/createTask', {
+				'clientKey': cfg['api_key'],
+				'task': {'type': cfg['task_type'], 'websiteURL': page_url, 'websiteKey': site_key},
+			})
+			data = resp.json()
+			if data.get('errorId'):
+				return {'success': False, 'error': f"createTask 失败: {data.get('errorCode') or data.get('errorDescription')}"}
+			token = (data.get('solution') or {}).get('token')
+			if token:
+				return {'success': True, 'token': token}
+			task_id = data.get('taskId')
+			if not task_id:
+				return {'success': False, 'error': f'createTask 响应异常: {str(data)[:150]}'}
+
+			deadline = time.monotonic() + timeout
+			while time.monotonic() < deadline:
+				await asyncio.sleep(TURNSTILE_SOLVER_POLL_INTERVAL)
+				resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/getTaskResult', {
+					'clientKey': cfg['api_key'], 'taskId': task_id,
+				})
+				data = resp.json()
+				if data.get('errorId'):
+					return {'success': False, 'error': f"求解失败: {data.get('errorCode') or data.get('errorDescription')}"}
+				if data.get('status') == 'ready':
+					token = (data.get('solution') or {}).get('token')
+					if token:
+						return {'success': True, 'token': token}
+					return {'success': False, 'error': '平台返回 ready 但没有 token'}
+			return {'success': False, 'error': f'求解超时（{timeout}s 未就绪）'}
+		except Exception as e:
+			return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
+
+
+# ========== 通用站点防护层（CF 边缘质询 / 阿里云 WAF）==========
+# new-api 站点常见的网络层防护有两类：Cloudflare 边缘质询（cf-mitigated: challenge，
+# 403/503 +「Just a moment」页）和阿里云 WAF 的 acw_sc__v2 挑战（正文 var arg1='...'）。
+# 后者是纯算法可直接解；前者无浏览器解不了，借自托管开源项目 FlareSolverr 代过——
+# cf_clearance 与出口 IP、User-Agent 双重绑定，FlareSolverr 必须与本服务同出口。
+# newapi_request 撞到防护时自动取 cookies 原地重打一次：挑战页由防护层返回，请求没到过
+# new-api 源站，重试对签到是安全的（不会重复签）。
+
+_CF_CHALLENGE_BODY_RE = re.compile(r'Just a moment|challenge-platform|_cf_chl|cf-chl|Checking your browser', re.I)
+_ALIYUN_WAF_COOKIE_NAMES = ('acw_tc', 'cdn_sec_tc', 'acw_sc__v2')
+
+# 防护 cookies 缓存：{domain: {'cookies': dict, 'user_agent': str|None, 'expires': float}}，TTL 沿用 WAF_CACHE_TTL
+protection_cache: dict = {}
+_protection_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_flaresolverr_url() -> str:
+	"""FlareSolverr 地址（saved_config.json 的 turnstile_solver.flaresolverr_url），未配置返回空串。"""
+	try:
+		cfg = _read_json_cached(CONFIG_FILE)
+	except Exception:
+		cfg = {}
+	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
+	return ((s or {}).get('flaresolverr_url') or '').strip().rstrip('/')
+
+
+def detect_protection(resp) -> str | None:
+	"""识别响应背后的防护层：'cf_challenge' / 'aliyun_waf'；正常返回 None。
+
+	CF 以官方 cf-mitigated 响应头为准，正文特征兜底（质询页变体多，头最可靠）；
+	阿里云 WAF 挑战页在 200 里也可能出现（校验中转页），认 arg1 特征。
+	"""
+	try:
+		headers = resp.headers or {}
+		body = resp.text or ''
+	except Exception:
+		return None
+	if str(headers.get('cf-mitigated', '')).lower() == 'challenge':
+		return 'cf_challenge'
+	if resp.status_code in (403, 503) and _CF_CHALLENGE_BODY_RE.search(body):
+		return 'cf_challenge'
+	if _WAF_CHALLENGE_RE.search(body):
+		return 'aliyun_waf'
+	return None
+
+
+async def solve_aliyun_waf(domain: str) -> dict | None:
+	"""过任意域名的阿里云 WAF 挑战：GET 首页 → 提 arg1 → 算 acw_sc__v2。失败返回 None。
+
+	独立 Session 收挑战页下发的 acw_tc/cdn_sec_tc（acw_sc__v2 与它们配对校验），
+	直连不走代理——这类站点平时不需要代理。
+	"""
+	def _do():
+		from curl_cffi import requests as cffi_requests
+
+		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
+		resp = sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
+		m = _WAF_CHALLENGE_RE.search(resp.text or '')
+		if not m:
+			return None
+		cookies = {}
+		for name in _ALIYUN_WAF_COOKIE_NAMES:
+			val = sess.cookies.get(name)
+			if val:
+				cookies[name] = val
+		cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
+		return {'cookies': cookies, 'user_agent': None}
+
+	loop = asyncio.get_running_loop()
+	try:
+		return await loop.run_in_executor(_UPSTREAM_POOL, _do)
+	except Exception as e:
+		print(f'[PROTECT] {domain} 阿里云 WAF 求解失败: {e}')
+		return None
+
+
+async def solve_cf_challenge(domain: str) -> dict | None:
+	"""用 FlareSolverr 过 Cloudflare 边缘质询，返回 {cookies, user_agent}。
+
+	未配置 FlareSolverr 时直接返回 None——保持旧行为：撞质询就让调用方拿到 403/503。
+	"""
+	base = get_flaresolverr_url()
+	if not base:
+		return None
+
+	def _do():
+		sess = _get_cffi_session(f'flaresolverr:{base}')
+		return sess.post(base + '/v1', json={'cmd': 'request.get', 'url': domain + '/', 'maxTimeout': 60000}, timeout=70)
+
+	loop = asyncio.get_running_loop()
+	try:
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+		data = resp.json()
+		if data.get('status') != 'ok':
+			print(f'[PROTECT] {domain} FlareSolverr 求解失败: {str(data.get("message"))[:120]}')
+			return None
+		solution = data.get('solution') or {}
+		cookies = {c.get('name'): c.get('value') for c in solution.get('cookies', []) if c.get('name')}
+		if not cookies:
+			return None
+		return {'cookies': cookies, 'user_agent': solution.get('userAgent') or None}
+	except Exception as e:
+		print(f'[PROTECT] {domain} FlareSolverr 调用失败: {e}')
+		return None
+
+
+async def ensure_protection_cookies(site: NewapiSite, kind: str) -> dict | None:
+	"""确保某站点的防护 cookies 就绪（5 分钟缓存 + 按域名 singleflight），失败返回 None。
+
+	singleflight 很重要：签到是 10 并发，缓存过期瞬间不能让每个账号各打一次
+	FlareSolverr/WAF 挑战页（前者按次耗时几十秒，后者可能撞 IP 限流）。
+	"""
+	domain = site.domain.rstrip('/')
+	cached = protection_cache.get(domain)
+	if cached and cached['expires'] > time.time():
+		return cached
+	lock = _protection_locks.setdefault(domain, asyncio.Lock())
+	async with lock:
+		cached = protection_cache.get(domain)
+		if cached and cached['expires'] > time.time():
+			return cached
+		if kind == 'aliyun_waf':
+			solved = await solve_aliyun_waf(domain)
+		elif kind == 'cf_challenge':
+			solved = await solve_cf_challenge(domain)
+		else:
+			solved = None
+		if not solved:
+			return None
+		entry = {**solved, 'expires': time.time() + WAF_CACHE_TTL}
+		protection_cache[domain] = entry
+		return entry
+
+
+async def probe_page_protection(domain: str) -> dict:
+	"""裸探测站点首页的防护层（不走 newapi_request 的自动过验），供添加站点时分类展示。"""
+	def _do():
+		from curl_cffi import requests as cffi_requests
+
+		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
+		return sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
+
+	loop = asyncio.get_running_loop()
+	try:
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+		kind = detect_protection(resp)
+		return {
+			'http_status': resp.status_code,
+			'cf_challenge': kind == 'cf_challenge',
+			'aliyun_waf': kind == 'aliyun_waf',
+		}
+	except Exception as e:
+		return {'http_status': None, 'cf_challenge': False, 'aliyun_waf': False, 'error': str(e)[:100]}
+
+
+async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile_token: str | None = None) -> dict:
 	"""为单个账号签到（POST /api/user/checkin，奖励区间由站点配置决定）。
 
 	今日已签时接口返回 200 且 success=false、message='今日已签到'，据此区分 already。
 
-	站点若开着 Turnstile，服务器侧无 token，接口会返回「Turnstile token 为空」——
-	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要走浏览器签到。
+	turnstile_token 传入时签到 URL 带上 ?turnstile=<token> —— new-api 的 TurnstileCheck
+	中间件只认 query 参数，与前端浏览器脚本的传法一致。
+
+	站点开着 Turnstile 且没传 token 时，接口会返回「Turnstile token 为空」——
+	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要先过人机校验。
 	"""
 	headers = _newapi_headers(site, account)
+	path = site.sign_in_path + (f'?turnstile={quote(turnstile_token, safe="")}' if turnstile_token else '')
 	max_retries = 3
 	for attempt in range(max_retries):
 		try:
-			resp = await newapi_request(site, 'POST', site.sign_in_path, headers)
+			resp = await newapi_request(site, 'POST', path, headers)
 			if resp.status_code == 200:
 				data = resp.json()
 				msg = data.get('message', '')
@@ -1209,39 +1598,17 @@ async def newapi_checkin_info(site: NewapiSite, account: NewapiAccountItem) -> d
 
 
 def add_checkin_log(msg: str):
-	"""添加签到日志，最多保留 100 条"""
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	checkin_state['logs'].append({'time': ts, 'message': msg})
-	if len(checkin_state['logs']) > 100:
-		checkin_state['logs'] = checkin_state['logs'][-100:]
-	print(f'[CHECKIN {ts}] {msg}')
+	_checkin_add_log(checkin_state, 'CHECKIN', msg)
 
 
 def save_checkin_state():
-	"""持久化签到状态到文件（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in checkin_state.items() if k != 'task'}
-		CHECKIN_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[CHECKIN] 状态保存失败: {e}')
+	"""持久化签到状态到文件"""
+	_checkin_save(checkin_state, CHECKIN_STATE_FILE, 'CHECKIN')
 
 
 def load_checkin_state():
 	"""服务启动时从文件恢复签到状态（仅用于前端展示历史进度）"""
-	if not CHECKIN_STATE_FILE.exists():
-		return
-	try:
-		data = json.loads(CHECKIN_STATE_FILE.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in checkin_state and k != 'task':
-				checkin_state[k] = v
-		# 重启后不可能仍在运行，强制复位运行标记
-		checkin_state['running'] = False
-		checkin_state['task'] = None
-		checkin_state['current'] = None
-		checkin_state['next_at'] = None
-	except Exception as e:
-		print(f'[CHECKIN] 状态恢复失败: {e}')
+	_checkin_load(checkin_state, CHECKIN_STATE_FILE, 'CHECKIN')
 
 
 async def run_login_checkin(trigger: str = 'manual'):
@@ -1406,10 +1773,8 @@ def load_checkin_settings():
 			if changed:
 				save_newapi_sites(sites)
 				print(f'[CHECKIN] 已把旧的自动签到开关迁移到 newapi_sites.json: {legacy}')
-			# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
-			CHECKIN_SETTINGS_FILE.write_text(
-				json.dumps(checkin_settings, ensure_ascii=False, indent=2), encoding='utf-8'
-			)
+		# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
 	except Exception as e:
 		print(f'[CHECKIN] 自动签到设置读取失败: {e}')
 
@@ -1417,7 +1782,7 @@ def load_checkin_settings():
 def save_checkin_settings():
 	"""持久化自动签到开关"""
 	try:
-		CHECKIN_SETTINGS_FILE.write_text(json.dumps(checkin_settings, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
 	except Exception as e:
 		print(f'[CHECKIN] 自动签到设置保存失败: {e}')
 
@@ -1429,25 +1794,30 @@ async def daily_checkin_scheduler():
 	关闭后仅跳过自动触发，手动签到不受影响。新增站点会自动纳入，无需改这里。
 	"""
 	while True:
-		wait_seconds = seconds_until_midnight()
-		print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
-		await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
-		if checkin_settings['agentrouter_auto']:
-			if not checkin_state['running']:
-				start_login_checkin(trigger='auto')
-		else:
-			print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
-		if checkin_settings['anyrouter_auto']:
-			if not anyrouter_checkin_state['running']:
-				start_anyrouter_checkin(trigger='auto')
-		else:
-			print('[ANYROUTER] AnyRouter 每日自动签到已关闭，跳过')
-		for site in load_newapi_sites():
-			if not site.auto_checkin:
-				print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
-				continue
-			if not newapi_state(site)['running']:
-				start_newapi_checkin(site, trigger='auto')
+		try:
+			wait_seconds = seconds_until_midnight()
+			print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
+			await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
+			if checkin_settings['agentrouter_auto']:
+				if not checkin_state['running']:
+					start_login_checkin(trigger='auto')
+			else:
+				print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
+			if checkin_settings['anyrouter_auto']:
+				if not anyrouter_checkin_state['running']:
+					start_anyrouter_checkin(trigger='auto')
+			else:
+				print('[ANYROUTER] AnyRouter 每日自动签到已关闭，跳过')
+			for site in load_newapi_sites():
+				if not site.auto_checkin:
+					print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
+					continue
+				if not newapi_state(site)['running']:
+					start_newapi_checkin(site, trigger='auto')
+		except Exception as e:
+			# 调度器是长生命周期任务：单轮出错只记日志，绝不能让异常杀死整个循环
+			print(f'[CHECKIN] 签到调度出错（下一轮继续）: {e}')
+			await asyncio.sleep(60)
 
 
 # ========== AnyRouter（cookie/session 方式）签到与续期 ==========
@@ -1458,7 +1828,7 @@ def load_cookie_accounts() -> list[AccountItem]:
 	if not CONFIG_FILE.exists():
 		return []
 	try:
-		data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+		data = _read_json_cached(CONFIG_FILE)
 		accounts = data.get('accounts', []) if isinstance(data, dict) else data
 		return [AccountItem(**a) for a in accounts]
 	except Exception as e:
@@ -1516,36 +1886,17 @@ def _session_is_authenticated(session: str) -> bool | None:
 
 
 def add_anyrouter_checkin_log(msg: str):
-	"""添加 AnyRouter 签到日志，最多保留 100 条"""
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	anyrouter_checkin_state['logs'].append({'time': ts, 'message': msg})
-	if len(anyrouter_checkin_state['logs']) > 100:
-		anyrouter_checkin_state['logs'] = anyrouter_checkin_state['logs'][-100:]
-	print(f'[ANYROUTER {ts}] {msg}')
+	_checkin_add_log(anyrouter_checkin_state, 'ANYROUTER', msg)
 
 
 def save_anyrouter_checkin_state():
-	"""持久化 AnyRouter 签到状态（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in anyrouter_checkin_state.items() if k != 'task'}
-		ANYROUTER_CHECKIN_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[ANYROUTER] 状态保存失败: {e}')
+	"""持久化 AnyRouter 签到状态"""
+	_checkin_save(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
 
 
 def load_anyrouter_checkin_state():
 	"""服务启动时恢复 AnyRouter 签到状态（仅用于前端展示历史进度）"""
-	if not ANYROUTER_CHECKIN_STATE_FILE.exists():
-		return
-	try:
-		data = json.loads(ANYROUTER_CHECKIN_STATE_FILE.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in anyrouter_checkin_state and k != 'task':
-				anyrouter_checkin_state[k] = v
-		anyrouter_checkin_state['running'] = False
-		anyrouter_checkin_state['task'] = None
-	except Exception as e:
-		print(f'[ANYROUTER] 状态恢复失败: {e}')
+	_checkin_load(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
 
 
 async def run_anyrouter_checkin(trigger: str = 'manual'):
@@ -1658,39 +2009,17 @@ def newapi_state(site: NewapiSite) -> dict:
 
 
 def add_newapi_checkin_log(site: NewapiSite, msg: str):
-	"""添加签到日志，最多保留 100 条"""
-	st = newapi_state(site)
-	ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	st['logs'].append({'time': ts, 'message': msg})
-	if len(st['logs']) > 100:
-		st['logs'] = st['logs'][-100:]
-	print(f'[{site.id.upper()} {ts}] {msg}')
+	_checkin_add_log(newapi_state(site), site.id.upper(), msg)
 
 
 def save_newapi_checkin_state(site: NewapiSite):
-	"""持久化签到状态（排除不可序列化的 task）"""
-	try:
-		data = {k: v for k, v in newapi_state(site).items() if k != 'task'}
-		site.state_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-	except Exception as e:
-		print(f'[{site.id.upper()}] 状态保存失败: {e}')
+	"""持久化签到状态"""
+	_checkin_save(newapi_state(site), site.state_path(), site.id.upper())
 
 
 def load_newapi_checkin_state(site: NewapiSite):
 	"""服务启动时恢复签到状态（仅用于前端展示历史进度）"""
-	path = site.state_path()
-	st = newapi_state(site)
-	if not path.exists():
-		return
-	try:
-		data = json.loads(path.read_text(encoding='utf-8'))
-		for k, v in data.items():
-			if k in st and k != 'task':
-				st[k] = v
-		st['running'] = False
-		st['task'] = None
-	except Exception as e:
-		print(f'[{site.id.upper()}] 状态恢复失败: {e}')
+	_checkin_load(newapi_state(site), site.state_path(), site.id.upper())
 
 
 async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
@@ -1698,9 +2027,9 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 
 	签到成功后顺便查一次余额写入今日快照，省去额外的查询请求。
 
-	站点开着 Turnstile 时服务器侧签不了，这里会先探测一次并直接结束，把原因写进日志，
-	避免所有账号各打一次上游只为拿到同一句「Turnstile token 为空」。
-	站长关掉 Turnstile 后无需改代码，此路径自动恢复正常。
+	站点开着 Turnstile 时分两种情况：配置了打码平台 → 先用免费的 GET 预检剔除今日已签
+	账号（token 按次计费，别替已签的白解），再逐账号求解并签到（全自动）；没配置 → 先
+	探测一次并直接结束，把原因写进日志。站长关掉 Turnstile 后无需改代码，此路径自动恢复。
 	"""
 	accounts = load_newapi_accounts(site)
 	st = newapi_state(site)
@@ -1736,23 +2065,71 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 		return
 
 	ts_state = await newapi_turnstile_status(site)
-	if ts_state['enabled']:
-		ts_msg = '站点已开启 Turnstile 人机校验，服务器端无法签到，请在 Web UI 用浏览器脚本签到'
-		now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		for name in st['accounts']:
-			st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
-		add_newapi_checkin_log(site, ts_msg)
-		_finish()
-		return
+	ts_enabled = bool(ts_state['enabled'])
+	ts_site_key = ts_state['site_key'] or ''
+	if ts_enabled:
+		solver_cfg = get_turnstile_solver_config()
+		if not solver_cfg['api_key']:
+			ts_msg = '站点已开启 Turnstile 人机校验且未配置打码平台，服务器端无法签到；请在设置页配置打码平台，或用 Web UI 的浏览器脚本签到'
+			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			for name in st['accounts']:
+				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
+			add_newapi_checkin_log(site, ts_msg)
+			_finish()
+			return
+		if not ts_site_key:
+			# 探测失败时 status 保守返回 enabled=True 但没有 sitekey，没东西可解，只能走浏览器
+			ts_msg = '站点 Turnstile 状态探测失败拿不到 sitekey，无法服务器端求解；请稍后重试或用浏览器脚本签到'
+			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			for name in st['accounts']:
+				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
+			add_newapi_checkin_log(site, ts_msg)
+			_finish()
+			return
+		add_newapi_checkin_log(
+			site, f"站点开启 Turnstile，改用打码平台（{solver_cfg['provider'] or '自定义网关'}）逐账号求解 token"
+		)
+		page_url = site.domain.rstrip('/') + '/login'
 
 	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	if ts_enabled:
+		# Turnstile token 按次计费：先用不挂中间件的 GET 状态把今日已签的剔掉，
+		# 别替已签账号白解 token（与前端浏览器脚本的「先 sync 再生成」同一思路）。
+		# 查询失败的账号按未签处理，宁可多花一次打码也不漏签。
+		async def _preflight(acc: NewapiAccountItem):
+			async with sem:
+				return acc, await newapi_checkin_info(site, acc)
+
+		pending: list[NewapiAccountItem] = []
+		for acc, info in await asyncio.gather(*[_preflight(a) for a in accounts]):
+			if info.get('success') and info.get('checked_in_today'):
+				ts_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+				st['accounts'][acc.name] = {'status': 'already', 'message': '今日已签（打码预检跳过）', 'time': ts_now}
+			else:
+				pending.append(acc)
+		skipped = len(accounts) - len(pending)
+		if skipped:
+			add_newapi_checkin_log(site, f'打码预检：{skipped} 个账号今日已签，跳过求解')
+		if not pending:
+			_finish()
+			return
 
 	async def _one(acc: NewapiAccountItem):
 		async with sem:
 			if not st['running']:
 				return
-			result = await sign_in_newapi(site, acc)
 			ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+			token = None
+			if ts_enabled:
+				solved = await solve_turnstile_token(ts_site_key, page_url)
+				if not solved.get('success'):
+					msg = f"过验失败: {solved.get('error', '未知错误')}"
+					st['accounts'][acc.name] = {'status': 'failed', 'message': msg, 'time': ts}
+					add_newapi_checkin_log(site, f'{acc.name}: {msg}')
+					save_newapi_checkin_state(site)
+					return
+				token = solved['token']
+			result = await sign_in_newapi(site, acc, turnstile_token=token)
 			if result.get('success'):
 				status = 'already' if result.get('already_signed') else 'signed'
 				st['accounts'][acc.name] = {'status': status, 'message': result.get('message', '签到成功'), 'time': ts}
@@ -1764,7 +2141,7 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 			add_newapi_checkin_log(site, f'{acc.name}: {st["accounts"][acc.name]["message"]}')
 			save_newapi_checkin_state(site)
 
-	await asyncio.gather(*[_one(a) for a in accounts])
+	await asyncio.gather(*[_one(a) for a in (pending if ts_enabled else accounts)])
 	_finish()
 
 
@@ -1812,7 +2189,7 @@ def save_renewed_sessions(updates: dict):
 		for a in accounts:
 			if a.get('name') in updates:
 				a.setdefault('cookies', {})['session'] = updates[a['name']]
-		CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CONFIG_FILE, data, indent=2)
 	except Exception as e:
 		print(f'[ANYROUTER] 写回续期 session 失败: {e}')
 
@@ -1896,48 +2273,106 @@ def add_monitor_log(msg: str):
 
 
 def send_alert_email(email_cfg: EmailConfig, subject: str, body: str):
-	"""发送告警邮件"""
+	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）"""
 	msg = MIMEText(body, 'plain', 'utf-8')
 	msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
 	msg['To'] = email_cfg.email_to
 	msg['Subject'] = subject
 
-	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port) as server:
+	# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
+	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
 		server.login(email_cfg.email_user, email_cfg.email_pass)
 		server.send_message(msg)
 
 
-async def monitor_loop(config: MonitorStartRequest):
-	"""监控主循环"""
+def _monitor_alert_key(acc: dict) -> str:
+	"""告警去重键：不同站点的账号可能同名，只用名字会互相吞掉告警"""
+	return f"{acc.get('kind', 'cookie')}:{acc.get('site_id', '')}/{acc.get('name', '?')}"
+
+
+async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
+	"""监控主循环
+
+	自动收集模式（请求里 accounts=[]）每轮重新收集账号，监控期间新增/删除账号
+	即时生效；显式传入账号列表则固定用这份快照。
+	"""
+	auto_accounts = not config.accounts
 	interval_seconds = config.interval_hours * 3600
 	add_monitor_log(
-		f'监控启动：间隔 {config.interval_hours}h，阈值 ${config.threshold}，共 {len(config.accounts)} 个账号'
+		f'监控启动：间隔 {config.interval_hours}h，阈值 ${config.threshold}，共 {len(accounts)} 个账号'
 	)
 
 	while monitor_state['running']:
 		monitor_state['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		add_monitor_log('开始检测余额...')
 
-		try:
-			waf_cookies = await _get_waf_cookies_if_needed()
-			if not waf_cookies :
-				add_monitor_log('WAF cookies 获取失败，跳过本次检测')
-			else:
+		if auto_accounts:
+			accounts = _collect_monitor_accounts()
+			monitor_state['config']['account_count'] = len(accounts)
+		add_monitor_log(f'开始检测余额...（{len(accounts)} 个账号）')
+
+		if not accounts:
+			add_monitor_log('没有可监控的账号，本轮跳过')
+		else:
+			try:
+				waf_cookies = await _get_waf_cookies_if_needed()
 				sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
 
-				async def limited_query(acc):
+				async def limited_query(acc: dict):
 					async with sem:
-						return await query_balance(acc, waf_cookies)
+						kind = acc.get('kind', 'cookie')
+						if kind == 'site':
+							site = get_newapi_site(acc.get('site_id', ''))
+							if site is None:
+								return {'name': acc.get('name', '?'), 'success': False, 'error': '站点不存在'}
+							return await query_balance_newapi(
+								site,
+								NewapiAccountItem(
+									name=acc.get('name', '?'),
+									access_token=acc.get('access_token', ''),
+									user_id=acc.get('user_id', ''),
+								),
+							)
+						if kind == 'token':
+							return await query_balance_with_token(
+								TokenAccountItem(
+									name=acc.get('name', '?'),
+									access_token=acc.get('access_token', ''),
+									user_id=acc.get('user_id', ''),
+								),
+								waf_cookies,
+							)
+						# cookie 方式（anyrouter）：需要 WAF cookies
+						if not waf_cookies:
+							return {'name': acc.get('name', '?'), 'success': False, 'error': 'WAF cookies 获取失败'}
+						return await query_balance(
+							AccountItem(
+								name=acc.get('name', '?'),
+								cookies=acc.get('cookies', {}) or {},
+								api_user=acc.get('api_user', ''),
+							),
+							waf_cookies,
+						)
 
-				tasks = [limited_query(acc) for acc in config.accounts]
-				results = await asyncio.gather(*tasks)
+				tasks = [limited_query(acc) for acc in accounts]
+				# return_exceptions=True：单个账号查询抛异常只算它自己失败，
+				# 不让 gather 把整轮结果全部作废
+				results = await asyncio.gather(*tasks, return_exceptions=True)
 
 				low_balance = []
 				all_balances = []  # 所有账号余额
 				total_quota = 0
 				total_used = 0
 
-				for r in results:
+				# results 顺序与 accounts 一致，配对取告警键
+				for acc, r in zip(accounts, results):
+					name = acc.get('name', '?')
+					alert_key = _monitor_alert_key(acc)
+
+					if isinstance(r, BaseException):
+						add_monitor_log(f'{name}: 查询异常 - {type(r).__name__}: {str(r)[:80]}')
+						all_balances.append({'name': name, 'success': False, 'error': str(r)[:120]})
+						continue
+
 					if not r.get('success'):
 						add_monitor_log(f'{r["name"]}: 查询失败 - {r.get("error", "")}')
 						all_balances.append({'name': r['name'], 'success': False, 'error': r.get('error', '')})
@@ -1948,13 +2383,13 @@ async def monitor_loop(config: MonitorStartRequest):
 					total_used += r['used']
 
 					if r['quota'] < config.threshold:
-						if r['name'] not in monitor_state['alerted_accounts']:
+						if alert_key not in monitor_state['alerted_accounts']:
 							low_balance.append(r)
-							monitor_state['alerted_accounts'].add(r['name'])
+							monitor_state['alerted_accounts'].add(alert_key)
 							add_monitor_log(f'{r["name"]}: 余额 ${r["quota"]} 低于阈值 ${config.threshold}')
 					else:
 						# 余额恢复，移除告警标记，下次再低于阈值会重新告警
-						monitor_state['alerted_accounts'].discard(r['name'])
+						monitor_state['alerted_accounts'].discard(alert_key)
 
 				if low_balance:
 					subject = f'⚠️ AnyRouter 余额告警：{len(low_balance)} 个账号余额不足'
@@ -1978,14 +2413,18 @@ async def monitor_loop(config: MonitorStartRequest):
 					body = '\n'.join(lines)
 
 					try:
-						send_alert_email(config.email, subject, body)
+						# smtplib 是纯同步 IO，直呼会冻结整个事件循环（所有 API/签到全卡住），
+						# 扔进默认线程池执行
+						await asyncio.get_running_loop().run_in_executor(
+							None, send_alert_email, config.email, subject, body
+						)
 						add_monitor_log(f'告警邮件已发送：{len(low_balance)} 个账号')
 					except Exception as e:
 						add_monitor_log(f'邮件发送失败：{str(e)[:80]}')
 				else:
 					add_monitor_log('所有账号余额正常')
-		except Exception as e:
-			add_monitor_log(f'检测出错：{str(e)[:80]}')
+			except Exception as e:
+				add_monitor_log(f'检测出错：{str(e)[:80]}')
 
 		# 计算下次检测时间
 		next_time = datetime.now().timestamp() + interval_seconds
@@ -2000,10 +2439,41 @@ async def monitor_loop(config: MonitorStartRequest):
 	add_monitor_log('监控已停止')
 
 
+# ── 前端入口 ────────────────────────────────────────────────────────────────
+# frontend/ 是 Vite + React 工程，构建产物落在 frontend/dist/。
+# 有构建产物就服务它，没有就回退到 templates/index.html（旧的单文件前端），
+# 这样没装 Node 的环境 clone 下来依然开箱即用。
+FRONTEND_DIST = Path(__file__).parent / 'frontend' / 'dist'
+LEGACY_INDEX = Path(__file__).parent / 'templates' / 'index.html'
+
+
+def frontend_index() -> Path | None:
+	"""当前该用哪个前端入口。构建产物优先，其次旧前端，都没有则 None。
+
+	每次调用都重新判断（不缓存）—— 这样 `pnpm build` 完不必重启服务，
+	与旧前端「改完刷新即可」的开发体验保持一致。
+	"""
+	dist_index = FRONTEND_DIST / 'index.html'
+	if dist_index.is_file():
+		return dist_index
+	if LEGACY_INDEX.is_file():
+		return LEGACY_INDEX
+	return None
+
+
 @app.get('/', response_class=HTMLResponse)
 async def index():
-	with open('templates/index.html', encoding='utf-8') as f:
-		return f.read()
+	entry = frontend_index()
+	if entry is None:
+		return HTMLResponse(
+			'<h1>前端资源缺失</h1><p>既没有 <code>frontend/dist/index.html</code>，'
+			'也没有 <code>templates/index.html</code>。</p>'
+			'<p>请在 <code>frontend/</code> 下执行 <code>pnpm install &amp;&amp; pnpm build</code>。</p>',
+			status_code=503,
+		)
+	# no-cache：每次都向服务器确认入口有没有更新。部署换版本后浏览器立刻拿新
+	# index.html，不会攥着旧产物的 hash 清单去请求已不存在的 chunk
+	return HTMLResponse(entry.read_text(encoding='utf-8'), headers={'Cache-Control': 'no-cache'})
 
 
 @app.get('/api/config')
@@ -2011,8 +2481,7 @@ async def get_config():
 	"""读取保存的配置"""
 	if CONFIG_FILE.exists():
 		try:
-			data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-			return {'success': True, 'data': data}
+			return {'success': True, 'data': _read_json_cached(CONFIG_FILE)}
 		except Exception as e:
 			return {'success': False, 'error': str(e)}
 	return {'success': True, 'data': None}
@@ -2022,7 +2491,7 @@ async def get_config():
 async def save_config(req: dict):
 	"""保存配置"""
 	try:
-		CONFIG_FILE.write_text(json.dumps(req, ensure_ascii=False, indent=2), encoding='utf-8')
+		_atomic_write_json(CONFIG_FILE, req, indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2108,9 +2577,7 @@ async def save_token_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [TokenAccountItem(**acc) for acc in raw_accounts]
-		NEW_ACCOUNTS_FILE.write_text(
-			json.dumps([acc.model_dump() for acc in validated], ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2211,9 +2678,7 @@ async def save_login_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [LoginAccountItem(**acc) for acc in raw_accounts]
-		AGENTROUTER_ACCOUNTS_FILE.write_text(
-			json.dumps([acc.model_dump() for acc in validated], ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -2320,16 +2785,22 @@ async def login_checkin_fast():
 	aborted = False
 	if pending:
 		async with _balances_query_lock:
-			results, aborted = await _run_with_rotation(pending, _sign_in_one, on_result=_on_result)
+			# 停止按钮置 running=False，轮换调度每轮开始前检查它 —— fast 模式从此可停
+			results, aborted = await _run_with_rotation(
+				pending, _sign_in_one, on_result=_on_result, should_stop=lambda: not checkin_state['running']
+			)
 	else:
 		add_checkin_log('全部账号今日都已签到，无需签到')
 
+	stopped = not checkin_state['running']  # 停止按钮已把 running 置 False
 	checkin_state['running'] = False
 	checkin_state['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 	signed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') in ('signed', 'already'))
 	failed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') == 'failed')
 	add_checkin_log(
-		f'一键全签结束：{signed}/{checkin_state["total"]} 已签到，失败 {failed}' + ('（WAF 惩罚期提前中止）' if aborted else '')
+		f'一键全签结束：{signed}/{checkin_state["total"]} 已签到，失败 {failed}'
+		+ ('（WAF 惩罚期提前中止）' if aborted else '')
+		+ ('（手动停止）' if stopped else '')
 	)
 	save_checkin_state()
 	return {
@@ -2547,7 +3018,7 @@ async def _query_egress_ip() -> str | None:
 				continue
 		return None
 
-	return await asyncio.get_event_loop().run_in_executor(_UPSTREAM_POOL, _do)
+	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
 
 
 async def _probe_exit_passes_waf() -> bool:
@@ -2579,31 +3050,25 @@ async def _probe_exit_passes_waf() -> bool:
 		except Exception:
 			return False
 
-	return await asyncio.get_event_loop().run_in_executor(_UPSTREAM_POOL, _do)
+	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
 
 
-class ExitRotator:
-	"""查询期间轮换 mihomo 出口 IP，结束后恢复原节点。
+class _MihomoGroupSwitcher:
+	"""mihomo 代理组切换的公共底座：controller 定位、API 封装、原节点记忆与恢复。
 
-	候选是组里**全部真实节点**（不限地区）：按实际出口 IP 去重后逐个用匿名探针实测能否过
-	agentrouter 的 WAF，能过的都进轮换池（2026-08-22 实测约 10 个独立 IP：香港原生/新加坡/
-	日本专线/韩国家宽/美国原生与专线）。探测结果缓存 WAF_PASS_CACHE_TTL —— 探测要 1~2 分钟，
-	而且探测本身也在消耗各 IP 的 WAF 配额。
-
-	controller 读不到 / 凑不出能过的节点时 start() 返回 False，查询退化为「不换 IP 只分批」。
-	探测要切节点（期间影响用户经 7890 的其它流量），限时 150 秒。
+	ExitRotator（余额/全签的 WAF 出口轮换）与 _KeysExitRotator（取密钥撞限流换出口）
+	共用这套机制，差别只在「怎么挑下一个节点」的策略（子类实现）。
 	"""
 
 	def __init__(self):
 		self._base, self._secret = None, None
 		self._original = None
 		self._nodes: list[str] = []
-		self._ips: list[str] = []
 		self._idx = -1
 		self._touched = False
 
 	async def _api(self, method: str, path: str, body: dict | None = None):
-		resp = await asyncio.get_event_loop().run_in_executor(
+		resp = await asyncio.get_running_loop().run_in_executor(
 			_UPSTREAM_POOL, _mihomo_call, method, f'{self._base}{path}', self._secret, body,
 		)
 		if resp is None or resp.status_code >= 300:
@@ -2620,6 +3085,30 @@ class ExitRotator:
 		if ok is not None:
 			self._touched = True
 		return ok is not None
+
+	async def restore(self) -> None:
+		if self._touched and self._original:
+			if await self._select(self._original):
+				global _exit_generation
+				_exit_generation += 1  # 恢复原节点后同样要重新建连
+			self._touched = False
+
+
+class ExitRotator(_MihomoGroupSwitcher):
+	"""查询期间轮换 mihomo 出口 IP，结束后恢复原节点。
+
+	候选是组里**全部真实节点**（不限地区）：按实际出口 IP 去重后逐个用匿名探针实测能否过
+	agentrouter 的 WAF，能过的都进轮换池（2026-08-22 实测约 10 个独立 IP：香港原生/新加坡/
+	日本专线/韩国家宽/美国原生与专线）。探测结果缓存 WAF_PASS_CACHE_TTL —— 探测要 1~2 分钟，
+	而且探测本身也在消耗各 IP 的 WAF 配额。
+
+	controller 读不到 / 凑不出能过的节点时 start() 返回 False，查询退化为「不换 IP 只分批」。
+	探测要切节点（期间影响用户经 7890 的其它流量），限时 150 秒。
+	"""
+
+	def __init__(self):
+		super().__init__()
+		self._ips: list[str] = []
 
 	@property
 	def ip_count(self) -> int:
@@ -2686,13 +3175,6 @@ class ExitRotator:
 		"""当前用的是第几个出口 IP（-1 表示还没切过）"""
 		return self._idx
 
-	async def restore(self) -> None:
-		if self._touched and self._original:
-			if await self._select(self._original):
-				global _exit_generation
-				_exit_generation += 1  # 恢复原节点后同样要重新建连
-			self._touched = False
-
 
 _FATAL_LOGIN_MARKS = ('密码', '封禁', '限流', '429')
 
@@ -2733,7 +3215,9 @@ async def _login_balance_one(account: LoginAccountItem, force: bool) -> dict:
 	}
 
 
-async def _run_with_rotation(accounts: list, work, initial_force: bool = False, on_result=None) -> tuple[list[dict], bool]:
+async def _run_with_rotation(
+	accounts: list, work, initial_force: bool = False, on_result=None, should_stop=None
+) -> tuple[list[dict], bool]:
 	"""分批 + 轮换出口 IP 地跑 work(account, force)，返回 (与 accounts 同序的结果, 是否提前中止)。
 
 	调度规则（都是 2026-08-22 实测出的 WAF 行为）：
@@ -2744,7 +3228,8 @@ async def _run_with_rotation(accounts: list, work, initial_force: bool = False, 
 	- 只在真的轮换成功时才重试 —— 没有新 IP，同一 IP 上重试也过不去（实测）。
 
 	work 返回的 dict 用 success / fatal / error(message) 表达结果，fatal=True 的失败换 IP 也没用；
-	on_result 在每个账号到达终态时回调，签到流程用它更新进度面板。
+	on_result 在每个账号到达终态时回调，签到流程用它更新进度面板；
+	should_stop 每轮开始前询问一次，返回 True 就停 —— fast 全签靠它响应停止按钮。
 	"""
 	rotator = ExitRotator()
 	rotated = await rotator.start()
@@ -2759,6 +3244,11 @@ async def _run_with_rotation(accounts: list, work, initial_force: bool = False, 
 	aborted = False
 	try:
 		while todo and time.time() < deadline and not aborted:
+			if should_stop and should_stop():
+				for a, _ in todo:
+					final[a.name] = {'name': a.name, 'success': False, 'error': '已手动停止', 'message': '已手动停止'}
+				todo.clear()
+				break
 			if rotated:
 				# 挑一个还有预算的出口 IP；全热就冷却一轮（不消耗账号）
 				for _ in range(len(ip_use)):
@@ -3000,9 +3490,188 @@ def _site_or_error(site_id: str) -> tuple[NewapiSite | None, dict | None]:
 
 
 @app.get('/api/sites')
-async def get_sites():
-	"""返回所有通用 new-api 站点配置，供前端渲染切换器与站点管理"""
-	return {'success': True, 'sites': [s.model_dump() for s in load_newapi_sites()]}
+async def get_sites(with_counts: bool = False):
+	"""返回所有通用 new-api 站点配置，附带三态健康状态
+
+	with_counts=true 时附带各站点账号数（站点管理页用）——读盘走 mtime 缓存，
+	顺带返回比前端对每个站点各发一次 /site/{id}/accounts 便宜得多。
+	"""
+	sites = load_newapi_sites()
+	resp: dict = {
+		'success': True,
+		'sites': [
+			{**s.model_dump(), 'status': _site_status.get(s.id, {'status': 'unknown', 'error': ''})}
+			for s in sites
+		],
+		'collect_key_ready': bool(COLLECT_KEY),
+	}
+	if with_counts:
+		resp['counts'] = {s.id: len(load_newapi_accounts(s)) for s in sites}
+	return resp
+
+
+@app.get('/api/collect/key')
+async def collect_key():
+	"""返回书签采集密钥（前端生成书签脚本用），未启用时返回空"""
+	return {'success': True, 'key': COLLECT_KEY}
+
+
+def _token_rejected(status: int, body: str) -> bool:
+	"""识别 new-api 的 token 拒绝响应：401/403、正文含「无权」，或 4xx 且正文提到 token。
+
+	只认 4xx：5xx/限流页正文也常带 "token" 字样，不能据此判 token 无效。
+	"""
+	return status in (401, 403) or '无权' in body or ('token' in body.lower() and 400 <= status < 500)
+
+
+async def _collect_anyrouter_token(req: CollectRequest) -> dict:
+	"""anyrouter.top 的采集：验证后写入 new_accounts_config.json（provider=anyrouter）"""
+	headers = {
+		'User-Agent': USER_AGENT,
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Referer': ANYROUTER_CONFIG['domain'],
+		'Origin': ANYROUTER_CONFIG['domain'],
+		'Authorization': f'Bearer {req.access_token}',
+		ANYROUTER_CONFIG['api_user_key']: req.user_id or '0',
+	}
+	try:
+		resp = await anyrouter_request('GET', _api_url(ANYROUTER_CONFIG['user_info_path']), headers)
+		body = resp.text or ''
+		status = resp.status_code
+	except Exception as e:
+		return {'success': False, 'error': f'验证请求异常: {type(e).__name__}: {str(e)[:80]}'}
+
+	if _token_rejected(status, body):
+		return {'success': False, 'error': f'token 无效（HTTP {status}）'}
+
+	try:
+		data = json.loads(body)
+	except Exception:
+		return {'success': False, 'error': f'站点返回非 JSON（HTTP {status}）'}
+
+	if isinstance(data, dict) and data.get('success') is False:
+		msg = str(data.get('error') or data.get('message') or '未知错误')[:100]
+		return {'success': False, 'error': f'站点拒绝: {msg}'}
+
+	inner = data.get('data', {}) if isinstance(data, dict) else {}
+	user_id = str(req.user_id or inner.get('id') or data.get('id') or '')
+	if not user_id:
+		return {'success': False, 'error': '未能从响应取到 user id，请确认账号有效后重试'}
+
+	username = inner.get('username') or data.get('username') or req.name or 'user'
+	accounts = load_token_accounts()
+	replaced = any(a.user_id == user_id or a.name == username for a in accounts)
+	accounts = [a for a in accounts if a.user_id != user_id and a.name != username]
+	accounts.append(TokenAccountItem(name=username, access_token=req.access_token, user_id=user_id, provider='anyrouter'))
+	_atomic_write_json(NEW_ACCOUNTS_FILE, [a.model_dump() for a in accounts], indent=2)
+	_set_site_status('anyrouter', 'ok', '')
+	return {'success': True, 'message': f'AnyRouter 账号 {username} 已更新（{"覆盖" if replaced else "新增"}）'}
+
+
+@app.options('/api/collect')
+async def collect_preflight(request: Request):
+	"""CORS 预检：书签脚本从站点页面跨域调用，需放行"""
+	return Response(
+		status_code=204,
+		headers={
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Methods': 'POST, OPTIONS',
+			'Access-Control-Allow-Headers': 'Content-Type',
+			'Access-Control-Max-Age': '86400',
+		},
+	)
+
+
+@app.post('/api/collect')
+async def collect_token(req: CollectRequest, request: Request):
+	"""书签脚本采集端点：按 site_url 匹配站点，验证 token 后写入配置。
+
+	书签脚本运行在站点页面上下文（可读该站 localStorage），因此需要 CORS 放行；
+	`key` 与 COLLECT_KEY 一致才接受（防他人往配置里塞 token）。
+	"""
+	# CORS：预检与真实请求都放行（仅此端点）
+	origin = request.headers.get('origin', '*')
+	if request.method == 'OPTIONS':
+		return Response(
+			status_code=204,
+			headers={
+				'Access-Control-Allow-Origin': '*',
+				'Access-Control-Allow-Methods': 'POST, OPTIONS',
+				'Access-Control-Allow-Headers': 'Content-Type',
+				'Access-Control-Max-Age': '86400',
+			},
+		)
+
+	if not COLLECT_KEY:
+		return JSONResponse(
+			status_code=503,
+			content={'success': False, 'error': '采集功能未启用（服务器未配置 COLLECT_KEY）'},
+			headers={'Access-Control-Allow-Origin': origin},
+		)
+	if not req.key or not hmac.compare_digest(req.key, COLLECT_KEY):
+		return JSONResponse(
+			status_code=401,
+			content={'success': False, 'error': '采集密钥无效'},
+			headers={'Access-Control-Allow-Origin': origin},
+		)
+
+	site = next(
+		(s for s in load_newapi_sites() if s.domain.rstrip('/') == req.site_url.rstrip('/')),
+		None,
+	)
+	if site is None:
+		# anyrouter.top 是专用账号（provider=anyrouter，存 new_accounts_config.json），单独处理
+		if req.site_url.rstrip('/') == ANYROUTER_CONFIG['domain']:
+			return await _collect_anyrouter_token(req)
+		return {'success': False, 'error': f'站点 {req.site_url} 未接入（先在「站点管理」添加）'}
+
+	# 验证 token：带 Chrome 指纹调 user/self
+	verify_account = NewapiAccountItem(name='__verify__', access_token=req.access_token, user_id=req.user_id or '')
+	try:
+		resp = await anyrouter_request('GET', f'{site.domain}{site.user_info_path}', _newapi_headers(site, verify_account))
+		body = resp.text or ''
+		status = resp.status_code
+	except Exception as e:
+		_set_site_status(site.id, 'invalid', f'验证请求异常: {type(e).__name__}')
+		return {'success': False, 'error': f'验证请求异常: {type(e).__name__}: {str(e)[:80]}'}
+
+	if _token_rejected(status, body):
+		_set_site_status(site.id, 'invalid', f'HTTP {status}')
+		return {'success': False, 'error': f'token 无效（HTTP {status}）'}
+
+	try:
+		data = json.loads(body)
+	except Exception:
+		_set_site_status(site.id, 'invalid', f'响应非 JSON（HTTP {status}）')
+		return {'success': False, 'error': f'站点返回非 JSON（HTTP {status}），可能被风控拦截'}
+
+	if isinstance(data, dict) and data.get('success') is False:
+		msg = str(data.get('error') or data.get('message') or '未知错误')[:100]
+		_set_site_status(site.id, 'invalid', msg)
+		return {'success': False, 'error': f'站点拒绝: {msg}'}
+
+	# new-api 的 user/self 返回 {success, data: {id, username, ...}}，id 在 data 里
+	inner = data.get('data', {}) if isinstance(data, dict) else {}
+	user_id = str(req.user_id or inner.get('id') or data.get('id') or '')
+	if not user_id:
+		return {'success': False, 'error': '未能从响应取到 user id，请确认账号有效后重试'}
+
+	# 写入配置：同名或同 user_id 覆盖，否则追加
+	accounts = load_newapi_accounts(site)
+	username = inner.get('username') or inner.get('display_name') or req.name or 'user'
+	name = username
+	existing = [a for a in accounts if a.user_id == user_id or a.name == name]
+	replaced = bool(existing)
+	if existing:
+		accounts = [a for a in accounts if a not in existing]
+	accounts.append(NewapiAccountItem(name=name, access_token=req.access_token, user_id=user_id))
+	save_newapi_accounts(site, accounts)
+	_set_site_status(site.id, 'ok', '')
+	return {
+		'success': True,
+		'message': f'{site.label} 账号 {name} 已更新（{"覆盖" if replaced else "新增"}）',
+	}
 
 
 @app.post('/api/sites')
@@ -3052,6 +3721,7 @@ async def probe_site(req: dict):
 		return {'success': False, 'error': '返回的不是 JSON，可能不是 new-api 站点'}
 	if not data.get('version'):
 		return {'success': False, 'error': '未识别为 new-api 站点（/api/status 里没有 version）'}
+	page = await probe_page_protection(domain)
 	return {
 		'success': True,
 		'info': {
@@ -3060,6 +3730,10 @@ async def probe_site(req: dict):
 			'checkin_enabled': bool(data.get('checkin_enabled')),
 			'turnstile_check': bool(data.get('turnstile_check')),
 			'quota_per_unit': data.get('quota_per_unit') or NEWAPI_DEFAULTS['quota_per_unit'],
+			'protections': {
+				'cf_challenge': bool(page.get('cf_challenge')),
+				'aliyun_waf': bool(page.get('aliyun_waf')),
+			},
 		},
 	}
 
@@ -3105,6 +3779,11 @@ async def query_site(site_id: str):
 
 	results = await asyncio.gather(*[_limited(a) for a in accounts])
 	ok = [r for r in results if r.get('success')]
+	if ok:
+		_set_site_status(site.id, 'ok', '')
+	else:
+		errors = '; '.join(str(r.get('error', ''))[:60] for r in results if not r.get('success'))
+		_set_site_status(site.id, 'invalid', errors[:200])
 	return {
 		'success': True,
 		'results': results,
@@ -3142,13 +3821,147 @@ async def site_checkin_start(site_id: str):
 async def site_turnstile(site_id: str):
 	"""返回某站点当前的 Turnstile 状态，供前端决定签到走哪条路。
 
-	enabled=True  → 服务器端签不了，前端展示浏览器脚本 + 同步流程
+	enabled=True  → 服务器端要带 token 才签得了：配置了打码平台就自动求解，
+	                没配置则前端展示浏览器脚本 + 同步流程
 	enabled=False → 站长关掉了校验，前端直接走 /checkin/start 一键签到
 	"""
 	site, err = _site_or_error(site_id)
 	if err:
 		return err
 	return {'success': True, 'turnstile': await newapi_turnstile_status(site)}
+
+
+class TurnstileSolverRequest(BaseModel):
+	"""打码平台 / FlareSolverr 配置。api_key 留空表示保留已保存的值（前端不回显密钥）。"""
+
+	provider: str
+	api_key: str = ''
+	base_url: str = ''
+	flaresolverr_url: str = ''
+
+
+@app.get('/api/turnstile/solver')
+async def turnstile_solver_status():
+	"""打码平台 / FlareSolverr 配置状态。api_key 只回是否已配置，绝不回显。"""
+	cfg = get_turnstile_solver_config()
+	return {
+		'success': True,
+		'solver': {
+			'provider': cfg['provider'],
+			'base_url': cfg['base_url'],
+			'configured': bool(cfg['api_key'] and cfg['base_url'] and cfg['task_type']),
+			'flaresolverr_url': get_flaresolverr_url(),
+			'presets': {name: p['base_url'] for name, p in TURNSTILE_SOLVER_PRESETS.items()},
+		},
+	}
+
+
+@app.post('/api/turnstile/solver')
+async def save_turnstile_solver(req: TurnstileSolverRequest):
+	"""保存打码平台 / FlareSolverr 配置（合并写 saved_config.json，不动其他段）"""
+	provider = req.provider.strip().lower()
+	if provider != 'custom' and provider not in TURNSTILE_SOLVER_PRESETS:
+		return {'success': False, 'error': f'未知平台: {req.provider}（可选 2captcha / yescaptcha / capsolver / custom）'}
+	try:
+		data = dict(_read_json_cached(CONFIG_FILE) or {}) if CONFIG_FILE.exists() else {}
+	except Exception:
+		data = {}
+	saved = data.get('turnstile_solver') or {}
+	data['turnstile_solver'] = {
+		'provider': provider,
+		'api_key': req.api_key.strip() or saved.get('api_key') or '',
+		'base_url': req.base_url.strip(),
+		'flaresolverr_url': req.flaresolverr_url.strip(),
+	}
+	_atomic_write_json(CONFIG_FILE, data, indent=2)
+	return {'success': True, 'message': '打码平台配置已保存'}
+
+
+@app.post('/api/protection/test')
+async def protection_test(site_id: str = ''):
+	"""探测某站点挂了哪些防护层，并现场验证突破手段是否可用。
+
+	首页裸探测只反映「当前这次响应」的防护（部分站点仅对 API 或按负载触发质询），
+	结果是最保守的分类；运行期 newapi_request 撞到防护都会自动过验重试。
+	solved 里 None 表示撞到了但没配求解器（CF 质询需 FlareSolverr）。
+	"""
+	sites = load_newapi_sites()
+	if site_id:
+		site = next((s for s in sites if s.id == site_id), None)
+		if site is None:
+			return {'success': False, 'error': f'未知站点: {site_id}'}
+	else:
+		if not sites:
+			return {'success': False, 'error': '没有站点可探测'}
+		site = sites[0]
+	domain = site.domain.rstrip('/')
+
+	page = await probe_page_protection(domain)
+	ts = await newapi_turnstile_status(site)
+	protections = {
+		'cf_challenge': bool(page.get('cf_challenge')),
+		'aliyun_waf': bool(page.get('aliyun_waf')),
+		'turnstile': bool(ts['enabled']),
+	}
+	solved: dict = {}
+	if protections['aliyun_waf']:
+		solved['aliyun_waf'] = bool(await solve_aliyun_waf(domain))
+	if protections['cf_challenge']:
+		if get_flaresolverr_url():
+			solved['cf_challenge'] = bool(await solve_cf_challenge(domain))
+		else:
+			solved['cf_challenge'] = None
+	return {
+		'success': True,
+		'site': site.label,
+		'domain': site.domain,
+		'page_http_status': page.get('http_status'),
+		'page_error': page.get('error'),
+		'protections': protections,
+		'solved': solved,
+		'flaresolverr_configured': bool(get_flaresolverr_url()),
+	}
+
+
+@app.post('/api/turnstile/solver/test')
+async def test_turnstile_solver(site_id: str = ''):
+	"""实解一个 token 验证打码配置（会消耗一次打码费用，约 $0.001~0.002）。
+
+	不指定站点时自动挑第一个开着 Turnstile 且有 sitekey 的站点。只求解不消费：
+	token 不会拿去签到，纯验证 api_key、余额与网络链路是否可用。
+	"""
+	cfg = get_turnstile_solver_config()
+	if not cfg['api_key']:
+		return {'success': False, 'error': '请先保存 api_key'}
+	sites = load_newapi_sites()
+	site = None
+	site_key = ''
+	if site_id:
+		site = next((s for s in sites if s.id == site_id), None)
+		if site is None:
+			return {'success': False, 'error': f'未知站点: {site_id}'}
+		ts = await newapi_turnstile_status(site)
+		if not ts['enabled']:
+			return {'success': True, 'tested': False, 'message': f'{site.label} 未开启 Turnstile，无需打码'}
+		if not ts['site_key']:
+			return {'success': False, 'error': f'{site.label} 状态探测失败拿不到 sitekey'}
+		site_key = ts['site_key']
+	else:
+		for s in sites:
+			ts = await newapi_turnstile_status(s)
+			if ts['enabled'] and ts['site_key']:
+				site, site_key = s, ts['site_key']
+				break
+		if site is None:
+			return {'success': False, 'error': '没有开着 Turnstile 的站点，没有可用于测试的 sitekey'}
+
+	page_url = site.domain.rstrip('/') + '/login'
+	started = time.monotonic()
+	r = await solve_turnstile_token(site_key, page_url)
+	elapsed = round(time.monotonic() - started, 1)
+	if r.get('success'):
+		return {'success': True, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'token_preview': (r['token'] or '')[:24] + '…'}
+	return {'success': False, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'error': r.get('error')}
 
 
 @app.get('/api/site/{site_id}/checkin/status')
@@ -3301,7 +4114,7 @@ def save_keys_list_cache():
 		now = time.time()
 		for k in [k for k, v in _keys_list_cache.items() if now - v.get('ts', 0) > KEYS_CACHE_MAX_AGE]:
 			_keys_list_cache.pop(k, None)
-		KEYS_CACHE_FILE.write_text(json.dumps(_keys_list_cache, ensure_ascii=False), encoding='utf-8')
+		_atomic_write_json(KEYS_CACHE_FILE, _keys_list_cache)
 	except Exception as e:
 		print(f'[KEYS] 列表缓存写盘失败: {e}')
 
@@ -3333,9 +4146,7 @@ def load_agentrouter_sessions():
 
 def save_agentrouter_sessions():
 	try:
-		AGENTROUTER_SESSION_FILE.write_text(
-			json.dumps(_agentrouter_key_sessions, ensure_ascii=False, indent=2), encoding='utf-8'
-		)
+		_atomic_write_json(AGENTROUTER_SESSION_FILE, _agentrouter_key_sessions, indent=2)
 	except Exception as e:
 		print(f'[AGENTROUTER] 保存 session 缓存失败: {e}')
 
@@ -3376,7 +4187,7 @@ async def _agentrouter_session(account: LoginAccountItem, force: bool = False) -
 		)
 		return resp, dict(sess.cookies)
 
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_running_loop()
 	# 登录接口按 IP 限流，串行 + 间隔，别让批量操作把窗口打满
 	async with _agentrouter_login_lock:
 		resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
@@ -3477,7 +4288,7 @@ async def resolve_key_ctx(ref: str) -> tuple[KeyCtx | None, str | None]:
 					method.upper(), f'{config["domain"]}{path}', headers=_h, cookies=_c, json=json_body, timeout=20
 				)
 
-			loop = asyncio.get_event_loop()
+			loop = asyncio.get_running_loop()
 			return await loop.run_in_executor(_UPSTREAM_POOL, _do)
 
 		return KeyCtx(ref, account.name, 'AgentRouter', _req), None
@@ -3678,7 +4489,7 @@ _keys_reveal_until: dict[str, float] = {}  # 按站点/账号类型的熔断时�
 _keys_reveal_lock = asyncio.Lock()  # 同时只允许一轮「取全量」——它会切 mihomo 节点
 
 
-class _KeysExitRotator:
+class _KeysExitRotator(_MihomoGroupSwitcher):
 	"""取密钥撞限流时的轻量出口轮换。
 
 	与 ExitRotator（agentrouter 专用，要探 WAF、能过的才进池）不同：这里撞的是站点自己的
@@ -3687,25 +4498,8 @@ class _KeysExitRotator:
 	"""
 
 	def __init__(self):
-		self._base, self._secret = None, None
-		self._original = None
-		self._nodes: list[str] = []
-		self._idx = -1
-		self._touched = False
+		super().__init__()
 		self.tried_ips: set[str] = set()
-
-	async def _api(self, method: str, path: str, body: dict | None = None):
-		resp = await asyncio.get_event_loop().run_in_executor(
-			_UPSTREAM_POOL, _mihomo_call, method, f'{self._base}{path}', self._secret, body,
-		)
-		if resp is None or resp.status_code >= 300:
-			return None
-		if method == 'GET':
-			try:
-				return resp.json()
-			except Exception:
-				return None
-		return {}
 
 	async def prepare(self) -> bool:
 		"""读节点列表、记住原节点。mihomo 不可用时返回 False（调用方就不轮换）。"""
@@ -3724,9 +4518,8 @@ class _KeysExitRotator:
 		"""切到下一个没用过的节点（按实际出口 IP 去重 —— 多个节点共用出口很常见）。"""
 		while self._idx + 1 < len(self._nodes):
 			self._idx += 1
-			if await self._api('PUT', f'/proxies/{quote(MIHOMO_GROUP)}', {'name': self._nodes[self._idx]}) is None:
+			if not await self._select(self._nodes[self._idx]):
 				continue
-			self._touched = True
 			ip = await _query_egress_ip()
 			if ip:
 				if ip in self.tried_ips:
@@ -3734,10 +4527,6 @@ class _KeysExitRotator:
 				self.tried_ips.add(ip)
 			return True
 		return False
-
-	async def restore(self):
-		if self._touched and self._original:
-			await self._api('PUT', f'/proxies/{quote(MIHOMO_GROUP)}', {'name': self._original})
 
 
 def _reveal_scope(ctx: KeyCtx) -> str:
@@ -3923,9 +4712,13 @@ async def keys_delete(req: dict):
 
 @app.post('/api/monitor/start')
 async def monitor_start(req: MonitorStartRequest):
-	"""启动余额监控"""
+	"""启动余额监控（accounts 为空时自动收集全部 token/站点/cookie 账号）"""
 	if monitor_state['running']:
 		return {'success': False, 'error': '监控已在运行中'}
+
+	accounts = req.accounts or _collect_monitor_accounts()
+	if not accounts:
+		return {'success': False, 'error': '没有可监控的账号'}
 
 	monitor_state['running'] = True
 	monitor_state['alerted_accounts'] = set()
@@ -3933,12 +4726,12 @@ async def monitor_start(req: MonitorStartRequest):
 	monitor_state['config'] = {
 		'interval_hours': req.interval_hours,
 		'threshold': req.threshold,
-		'account_count': len(req.accounts),
+		'account_count': len(accounts),
 		'email_to': req.email.email_to,
 	}
 
-	monitor_state['task'] = asyncio.create_task(monitor_loop(req))
-	return {'success': True, 'message': '监控已启动'}
+	monitor_state['task'] = asyncio.create_task(monitor_loop(req, accounts))
+	return {'success': True, 'message': f'监控已启动（{len(accounts)} 个账号）'}
 
 
 @app.post('/api/monitor/stop')
@@ -3971,19 +4764,45 @@ async def monitor_status():
 
 # ========== 每日用量统计 ==========
 
+# 用量数据内存缓存。record_account_usage 每记一个账号都读写一次文件，
+# 29 个账号就是 29 次全量 IO 且随历史变肥；缓存后进程内合并，落盘走写穿。
+# 按路径做 key 是为了测试里 monkeypatch USAGE_FILE 指到 tmp_path 时能正确失效。
+_usage_cache: dict | None = None
+_usage_cache_path: Path | None = None
+
+
 def load_usage_data() -> dict:
-	"""读取用量历史数据"""
+	"""读取用量历史数据（带内存缓存；本服务是单进程独占该文件的，无外部写入方）"""
+	global _usage_cache, _usage_cache_path
+	if _usage_cache is not None and _usage_cache_path == USAGE_FILE:
+		return _usage_cache
+	_usage_cache_path = USAGE_FILE
 	if USAGE_FILE.exists():
 		try:
-			return json.loads(USAGE_FILE.read_text(encoding='utf-8'))
-		except Exception:
-			return {}
-	return {}
+			_usage_cache = json.loads(USAGE_FILE.read_text(encoding='utf-8'))
+		except Exception as e:
+			# 绝不能读失败后拿空 dict 继续跑 —— 下一次保存会把 90 天历史一次抹掉。
+			# 把坏文件留档再从空开始，历史还在备份里可人工抢救。
+			backup = USAGE_FILE.with_name(f'{USAGE_FILE.name}.corrupt-{datetime.now():%Y%m%d-%H%M%S}')
+			try:
+				os.replace(USAGE_FILE, backup)
+				print(f'[USAGE] daily_usage.json 损坏，已备份为 {backup.name} 后从空开始: {e}')
+			except OSError:
+				print(f'[USAGE] daily_usage.json 损坏且备份失败（拒绝覆盖）: {e}')
+				_usage_cache_path = None
+				raise
+			_usage_cache = {}
+	else:
+		_usage_cache = {}
+	return _usage_cache
 
 
 def save_usage_data(data: dict):
-	"""保存用量历史数据"""
-	USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+	"""保存用量历史数据（原子写 + 同步内存缓存）"""
+	global _usage_cache, _usage_cache_path
+	_atomic_write_json(USAGE_FILE, data, indent=2)
+	_usage_cache = data
+	_usage_cache_path = USAGE_FILE
 
 
 def usage_key(provider: str, name: str) -> str:
@@ -4108,7 +4927,7 @@ async def take_daily_snapshot():
 	# 1. 读取旧格式账号配置 (saved_config.json)
 	if waf_cookies and CONFIG_FILE.exists():
 		try:
-			config_data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+			config_data = _read_json_cached(CONFIG_FILE)
 			accounts_raw = config_data.get('accounts', [])
 			if accounts_raw:
 				accounts = [AccountItem(**acc) for acc in accounts_raw]
@@ -4142,7 +4961,10 @@ async def take_daily_snapshot():
 	# 由 record_account_usage() 增量写入今日快照，避免重复请求登录接口。
 
 	# 3. 通用 new-api 站点账号（不走 WAF/代理，各站点独立并发查询）
+	#    auto_checkin=false 的站点视为「服务器不再碰它」：不签到也不查快照（避免风控/封号）
 	for site in load_newapi_sites():
+		if not site.auto_checkin:
+			continue
 		site_accounts = load_newapi_accounts(site)
 		if not site_accounts:
 			continue
@@ -4181,33 +5003,29 @@ async def take_daily_snapshot():
 
 
 def seconds_until_midnight() -> float:
-	"""计算距离下一个 0 点的秒数"""
+	"""计算距离下一个 0 点的秒数。
+
+	用 timedelta 跨天，不要手动 day+1 —— 那样每月最后一天必抛 ValueError，
+	会把依赖它的两个每日调度器一起带死。
+	"""
 	now = datetime.now()
-	tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
-	if tomorrow <= now:
-		tomorrow = tomorrow.replace(day=now.day + 1)
-	# 处理月末
-	try:
-		tomorrow = now.replace(day=now.day + 1, hour=0, minute=0, second=0, microsecond=0)
-	except ValueError:
-		# 月末，跳到下个月
-		if now.month == 12:
-			tomorrow = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-		else:
-			tomorrow = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+	tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 	return (tomorrow - now).total_seconds()
 
 
 async def daily_snapshot_scheduler():
 	"""每日快照调度器"""
 	while True:
-		wait_seconds = seconds_until_midnight()
-		print(f'[USAGE] 下次快照将在 {wait_seconds:.0f} 秒后执行')
-		await asyncio.sleep(wait_seconds + 5)  # 多等 5 秒确保过了 0 点
-		await take_daily_snapshot()
+		try:
+			wait_seconds = seconds_until_midnight()
+			print(f'[USAGE] 下次快照将在 {wait_seconds:.0f} 秒后执行')
+			await asyncio.sleep(wait_seconds + 5)  # 多等 5 秒确保过了 0 点
+			await take_daily_snapshot()
+		except Exception as e:
+			print(f'[USAGE] 快照调度出错（下一轮继续）: {e}')
+			await asyncio.sleep(60)
 
 
-@app.on_event('startup')
 async def startup_event():
 	"""服务启动时初始化定时任务"""
 	# 先把用量快照的 key 迁移成「站点:账号名」，再判断今日有没有快照 —— 顺序反了会用旧 key 判断
@@ -4221,8 +5039,8 @@ async def startup_event():
 	usage_data = load_usage_data()
 	if today not in usage_data:
 		print(f'[USAGE] 今日 ({today}) 无快照数据，启动时立即执行快照')
-		asyncio.create_task(take_daily_snapshot())
-	asyncio.create_task(daily_snapshot_scheduler())
+		_spawn(take_daily_snapshot())
+	_spawn(daily_snapshot_scheduler())
 	print('[USAGE] 每日快照调度器已启动')
 
 	# 恢复 Login 签到状态并启动每日签到调度器
@@ -4234,7 +5052,7 @@ async def startup_event():
 		f'AnyRouter={"开" if checkin_settings["anyrouter_auto"] else "关"} {_site_flags}'
 	)
 	load_checkin_state()
-	asyncio.create_task(daily_checkin_scheduler())
+	_spawn(daily_checkin_scheduler())
 	print('[CHECKIN] 每日签到调度器已启动')
 	# 若今日尚未完成签到（服务在 0 点后才启动，或上一轮被重启中断），立即补一轮
 	_accts = checkin_state.get('accounts', {})
@@ -4329,6 +5147,118 @@ async def manual_snapshot():
 	"""手动触发快照（用于测试或补录）"""
 	await take_daily_snapshot()
 	return {'success': True, 'message': '快照已执行'}
+
+
+def mask_proxy_url(url: str) -> str:
+	"""把代理 URL 里的认证凭据打码。
+
+	代理可能写成 http://user:pass@host:port，原样吐给前端会经由 devtools、
+	截图或录屏泄露出去。主机和端口保留 —— 那才是排障要看的东西。
+
+	只在 authority 段（`://` 之后、第一个 `/` 之前）动手，并且按**最后一个** `@`
+	切分：密码本身可能含 `@`（`user:p@ssw0rd@host`），按第一个 `@` 切会把
+	`ssw0rd` 原样留下 —— 半截密码照样是泄露。host 段不允许出现 `@`，
+	所以最后一个 `@` 之前的一律是 userinfo。
+	"""
+	if not url:
+		return ''
+	m = re.match(r'^([A-Za-z0-9+.\-]+://)([^/]*)(.*)$', url)
+	if not m:
+		return url
+	scheme, authority, rest = m.groups()
+	if '@' in authority:
+		authority = '***:***@' + authority.rsplit('@', 1)[1]
+	return scheme + authority + rest
+
+
+async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
+	"""探测 TCP 端口是否可连。用于判断本地代理有没有真的在跑。"""
+	try:
+		_, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+		writer.close()
+		with contextlib.suppress(Exception):
+			await writer.wait_closed()
+		return True
+	except Exception:
+		return False
+
+
+@app.get('/api/system/proxy-info')
+async def get_proxy_info(probe: bool = False):
+	"""只读展示代理相关配置，供前端「设置」页做诊断。
+
+	这些值来自环境变量 / .env，前端改不了（改完要重启服务），所以纯只读。
+	之所以值得暴露：访问 anyrouter / agentrouter 必须走本地代理，代理没起来时
+	表现为一句藏在服务端日志里的 `[WAF] Failed to connect to 127.0.0.1:7890`，
+	用户在界面上完全看不到，只会觉得"查询莫名其妙失败"。
+
+	带 ?probe=true 时会实际连一下代理端口确认是否在跑。
+	"""
+	source = 'default'
+	if os.environ.get('HTTPS_PROXY'):
+		source = 'HTTPS_PROXY'
+	elif os.environ.get('HTTP_PROXY'):
+		source = 'HTTP_PROXY'
+
+	reachable = None
+	if probe:
+		parsed = urlparse(_PROXY)
+		if parsed.hostname and parsed.port:
+			reachable = await probe_tcp(parsed.hostname, parsed.port)
+
+	return {
+		'success': True,
+		'proxy': {
+			'url': mask_proxy_url(_PROXY),
+			'source': source,
+			'has_credentials': '@' in _PROXY.split('://', 1)[-1].split('/', 1)[0],
+			'reachable': reachable,
+		},
+		'mihomo': {
+			'group': MIHOMO_GROUP,
+			# 组名为空时不做出口轮换，是有意的安全降级而非故障
+			'rotation_enabled': bool(MIHOMO_GROUP),
+			'config_path': str(MIHOMO_CONFIG_FILE),
+			'config_exists': await asyncio.to_thread(MIHOMO_CONFIG_FILE.is_file),
+		},
+	}
+
+
+# ── 前端静态资源与 SPA 路由回退 ──────────────────────────────────────────────
+# 必须注册在所有 /api 路由之后：FastAPI 按注册顺序匹配，这个 catch-all 放前面
+# 会把所有接口都吃掉。
+@app.get('/{full_path:path}')
+async def frontend_catch_all(full_path: str):
+	"""服务构建产物里的静态文件，其余路径交还给前端路由。
+
+	新前端用 react-router 的 BrowserRouter，/dashboard、/accounts 这类路径在服务端
+	并不存在，直接访问或刷新会 404，所以要回退到 index.html 由前端接管。
+	"""
+	# 未匹配到任何已注册接口的 /api 路径，按 API 语义返回 JSON 而不是 HTML，
+	# 否则前端的 fetch 会拿到一坨 HTML 然后在 JSON.parse 处炸掉，难以排查。
+	if full_path == 'api' or full_path.startswith('api/'):
+		return JSONResponse({'success': False, 'error': f'未知接口: /{full_path}'}, status_code=404)
+
+	# 命中构建产物里的真实文件就直接返回（assets/*.js、favicon 等）
+	if FRONTEND_DIST.is_dir():
+		candidate = (FRONTEND_DIST / full_path).resolve()
+		# 防目录穿越：解析后必须仍在 dist 内
+		if candidate.is_file() and candidate.is_relative_to(FRONTEND_DIST.resolve()):
+			# assets/ 下是带 content hash 的产物，内容变了文件名必变，可永久缓存
+			headers = {'Cache-Control': 'public, max-age=31536000, immutable'} if full_path.startswith('assets/') else None
+			return FileResponse(candidate, headers=headers)
+
+	# 长得像静态文件的路径缺了文件就老实 404，绝不能回退 index.html——浏览器会把
+	# HTML 当 JS 模块解析，报「Failed to fetch dynamically imported module」，看似
+	# 代码坏了，实际是旧标签页在请求旧 hash 的 chunk（部署后尚未刷新的页面）
+	last_segment = full_path.rsplit('/', 1)[-1]
+	if '.' in last_segment:
+		return JSONResponse({'success': False, 'error': f'静态资源不存在: /{full_path}'}, status_code=404)
+
+	entry = frontend_index()
+	if entry is None:
+		return JSONResponse({'success': False, 'error': '前端资源缺失'}, status_code=503)
+	return HTMLResponse(entry.read_text(encoding='utf-8'), headers={'Cache-Control': 'no-cache'})
 
 
 if __name__ == '__main__':
