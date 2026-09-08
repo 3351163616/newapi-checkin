@@ -36,3 +36,27 @@ __pycache__/
 # ===== 其它本地工具 =====
 .claude/
 .wrangler/
+
+# ===== 前端（Vite + React）=====
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+frontend/*.tsbuildinfo
+
+# 本地演示工具（含 mock 账号，不进 PR）
+scripts/gen_mock_data.py
+
+# ===== 打包件与服务器数据快照（含真实账号数据，绝不提交）=====
+deploy*.tar.gz
+hub-data*.tar.gz
+*_loaded.yml
+accounts-loaded.yml
+
+# ===== 本地工作区杂物 =====
+desktop/
+.playwright-mcp/
+.spec-workflow/
+archive/
+*-loaded.yml
+frontend/node_modules.old/
+solver_stats.json

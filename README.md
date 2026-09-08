@@ -7,11 +7,12 @@
 ## 功能
 
 - **余额查询**：批量并发查询各站点账号余额与已用量，Chrome TLS 指纹（curl_cffi）访问
-- **每日签到**：定时快照、自动签到、签到状态面板；对开启了 Turnstile 的站点提供浏览器脚本签到
+- **每日签到**：定时快照、自动签到、签到状态面板；开启 Turnstile 的站点可配打码平台在服务器端全自动签到（详见 [docs/protection.md](docs/protection.md)）
+- **防护突破**：Turnstile 打码（2Captcha/YesCaptcha/CapSolver 兼容）、CF 边缘质询（FlareSolverr）、阿里云 WAF 挑战求解；请求撞防护自动过验重试
 - **用量记录**：每日 0 点快照写入 `daily_usage.json`，保留 90 天，前端展示今日用量与历史
 - **API 密钥管理**：列出 / 新建 / 删除各账号的 API Key（new-api「令牌」），完整密钥展示与批量复制，结果落缓存
-- **监控告警**：可配置间隔检查余额，低于阈值 SMTP 邮件告警（去重）
-- **站点管理**：跑 new-api 的站点在 Web UI 填个域名即可接入，后端零改动
+- **监控告警**：可配置间隔检查余额，低于阈值 SMTP 邮件 / Telegram / Server酱 / Bark webhook 告警（去重），签到失败可推送
+- **站点管理**：跑 new-api 的站点在 Web UI 填个域名即可接入，后端零改动；定期自动巡检，连续失联的站点自动暂停签到
 
 ### 支持的账号类型
 
@@ -65,9 +66,21 @@ uvicorn balance_server:app --host 0.0.0.0 --port 8003
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q        # 后端，全假数据驱动，不发上游请求
-node tests/test_site_frontend.mjs    # 前端
+python -m pytest tests/ -q --ignore=tests/test_waf.py   # 后端，全假数据驱动，不发上游请求
+node tests/test_site_frontend.mjs                        # 旧版单页前端的离线测试
 ```
+
+## 开发
+
+```bash
+pnpm --dir frontend install && pnpm --dir frontend build   # 前端（Vite + React 19），产物由 FastAPI 托管
+```
+
+服务端按业务域拆分在 `server/` 包（config/common 基础设施 + keys/usage/monitor/
+protection/turnstile/notify/sites/mihomo/agentrouter/cookies 各域），`balance_server.py`
+是应用装配壳（app、鉴权中间件、lifespan、路由挂载）。新增功能按域落位：
+纯逻辑进 `server/<域>.py`，端点用该域的 router 注册，跨域引用经 `bs.<名字>` 晚绑定
+（见 docs/refactor-plan.md 的过渡约定）。人机校验与防护见 docs/protection.md。
 
 ## 说明
 

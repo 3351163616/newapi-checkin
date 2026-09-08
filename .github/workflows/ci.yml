@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装依赖
+        run: pip install fastapi uvicorn "curl-cffi>=0.15" pytest
+      - name: 后端测试（全离线，不发上游请求）
+        run: python -m pytest tests/ -q --ignore=tests/test_waf.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 安装依赖
+        run: npm install
+      - name: 类型检查 + 构建
+        run: npm run build
+      - name: ESLint
+        run: npm run lint
