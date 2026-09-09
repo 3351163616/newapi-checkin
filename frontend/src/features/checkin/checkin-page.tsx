@@ -10,9 +10,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { EmptyState, ErrorState, LoadingState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
 import { siteDotClass } from "@/shared/lib/site-color";
-import type { CheckinAccountStatus, CheckinResult, NewapiSite, SiteAccount, SiteSyncResult } from "@/types";
+import type { CheckinAccountStatus, CheckinResult, NewapiSite, SiteAccount, SiteSyncResult, TurnstileStatus } from "@/types";
 
 import { buildSiteScript, filterPendingAccounts } from "@/features/checkin/build-site-script";
+import { TurnstileCheckinDialog } from "@/features/checkin/turnstile-checkin";
 import {
   checkinKeys,
   checkinTokenAccounts,
@@ -53,6 +54,7 @@ export function CheckinPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [tokenResults, setTokenResults] = useState<CheckinResult[] | null>(null);
   const [scriptDialog, setScriptDialog] = useState<{ site: NewapiSite; script: string; pending: number; total: number } | null>(null);
+  const [embedDialog, setEmbedDialog] = useState<{ site: NewapiSite; accounts: SiteAccount[]; ts: TurnstileStatus; pending: number; total: number } | null>(null);
   const [renewNotice, setRenewNotice] = useState<string | null>(null);
 
   const sitesQ = useQuery({ queryKey: checkinKeys.sites, queryFn: listSites });
@@ -175,6 +177,13 @@ export function CheckinPage() {
         await queryClient.invalidateQueries({ queryKey: ["checkin"] });
         return;
       }
+      if (ts.site_key) {
+        // 拿得到 sitekey：优先走「内嵌验证」——widget 嵌在本页弹窗里，token 由本浏览器解决并
+        // 直连站点提交（new-api 的 CORS 全开、siteverify 不看 hostname），不用再开 F12 粘脚本。
+        setEmbedDialog({ site, accounts: pending, ts, pending: pending.length, total: accs.length });
+        return;
+      }
+      // 探测没拿到 sitekey：只能走老路，让脚本自我拒绝并提示回 Web UI 重新探测
       setScriptDialog({ site, script: buildSiteScript(site, pending, ts), pending: pending.length, total: accs.length });
     } catch (err) {
       toast.error(errorMessage(err, "签到失败"));
@@ -416,6 +425,41 @@ export function CheckinPage() {
           );
         })}
       </div>
+
+      {embedDialog ? (
+        <TurnstileCheckinDialog
+          site={embedDialog.site}
+          accounts={embedDialog.accounts}
+          ts={embedDialog.ts}
+          total={embedDialog.total}
+          onFallback={() => {
+            const d = embedDialog;
+            setEmbedDialog(null);
+            // 回退前重新剔除一遍已签——内嵌流程可能已经签掉了一部分
+            setBusy(`site:${d.site.id}`);
+            void (async () => {
+              try {
+                let pending = d.accounts;
+                try {
+                  const sync = await syncSiteCheckin(d.site.id);
+                  pending = filterPendingAccounts(d.accounts, sync.results);
+                } catch {
+                  /* 同步失败就用当前列表 */
+                }
+                if (pending.length === 0) {
+                  toast.success("剩余账号今日都已签到 ✓");
+                } else {
+                  setScriptDialog({ site: d.site, script: buildSiteScript(d.site, pending, d.ts), pending: pending.length, total: d.total });
+                }
+              } finally {
+                setBusy(null);
+                await queryClient.invalidateQueries({ queryKey: ["checkin"] });
+              }
+            })();
+          }}
+          onClose={() => setEmbedDialog(null)}
+        />
+      ) : null}
 
       {scriptDialog ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
