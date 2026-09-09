@@ -126,7 +126,7 @@ export function SitesPage() {
     }
     setAdding(true);
     try {
-      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim().replace(/^https?:\/\//, "") };
+      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim() };
       await apiPost<SitesResponse>("/sites", { sites: [...sites, input] });
       // 本页缓存键是 ["sites", ...]，其他页面的站点列表在 ["accounts","sites"]，两处都要失效
       await queryClient.invalidateQueries({ queryKey: ["sites"] });
@@ -193,7 +193,7 @@ export function SitesPage() {
           </div>
           <div className="space-y-1">
             <Label htmlFor="site-domain" className="text-xs">域名</Label>
-            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="https://gorouter.app" />
+            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="kktoken.cc 或 https://gorouter.app" />
           </div>
           <div className="flex items-end gap-2">
             <Button type="button" variant="secondary" onClick={() => void onProbe()} disabled={probing}>

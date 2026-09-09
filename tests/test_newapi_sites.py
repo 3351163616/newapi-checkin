@@ -335,11 +335,12 @@ def test_保存站点拒绝重复id(sandbox):
 	assert out['success'] is False and '重复' in out['error']
 
 
-def test_保存站点拒绝非法id与裸域名(sandbox):
+def test_保存站点拒绝非法id_裸域名自动补全https(sandbox):
 	bad_id = asyncio.run(bs.save_sites({'sites': [{'id': 'a b/c', 'label': 'A', 'domain': 'https://a.com'}]}))
 	assert bad_id['success'] is False
-	bad_domain = asyncio.run(bs.save_sites({'sites': [{'id': 'a', 'label': 'A', 'domain': 'a.com'}]}))
-	assert bad_domain['success'] is False and 'http' in bad_domain['error']
+	bare_domain = asyncio.run(bs.save_sites({'sites': [{'id': 'a', 'label': 'A', 'domain': 'a.com'}]}))
+	assert bare_domain['success'] is True, '不带 http 前缀的裸域名应该自动补全 https://'
+	assert bare_domain['sites'][0]['domain'] == 'https://a.com'
 
 
 def test_保存站点会去掉域名末尾斜杠(sandbox):
@@ -408,6 +409,14 @@ def test_探测newapi站点回传版本与turnstile(sandbox, monkeypatch):
 	assert out['info']['system_name'] == 'TaBiAI' and out['info']['turnstile_check'] is True
 
 
-def test_探测拒绝裸域名(sandbox):
+def test_探测自动补全裸域名https(sandbox, monkeypatch):
+	async def fake_request(probe, method, path, headers, timeout=None):
+		assert probe.domain == 'https://tabitoken.com'
+		class Resp:
+			status_code = 200
+			def json(self): return {'data': {'version': '1.0', 'system_name': 'TaBiAI', 'turnstile_check': True}}
+		return Resp()
+	monkeypatch.setattr(bs, 'newapi_request', fake_request)
 	out = asyncio.run(bs.probe_site({'domain': 'tabitoken.com'}))
-	assert out['success'] is False and 'http' in out['error']
+	assert out['success'] is True, '不带 http 前缀的裸域名应该自动补全 https://'
+	assert out['info']['system_name'] == 'TaBiAI'
