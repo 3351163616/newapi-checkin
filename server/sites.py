@@ -59,6 +59,7 @@ class NewapiSite(BaseModel):
 	quota_per_unit: int = NEWAPI_DEFAULTS['quota_per_unit']
 	concurrency: int = NEWAPI_DEFAULTS['concurrency']
 	auto_checkin: bool = True
+	use_proxy: bool = True  # False = 直连；站点在 Cloudflare 后直连 403 时应保持 True
 	accounts_file: str = ''
 	state_file: str = ''
 
@@ -197,7 +198,8 @@ def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
 
 
 async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None, _auto_bypass: bool = True):
-	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
+	"""向 new-api 站点发请求。use_proxy=True（默认）走本地代理出口（_PROXY，可用 HTTPS_PROXY 覆盖），
+	直连被 Cloudflare 拦 403 的站点保持走代理；use_proxy=False 则直连。仍带 Chrome 指纹更稳。
 
 	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
 
@@ -208,6 +210,9 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 	import balance_server as bs
 
 	url = site.domain + path
+	proxies = {'https': bs._PROXY, 'http': bs._PROXY} if site.use_proxy else None
+	# 缓存键带上代理模式：Session 创建时就把 proxies 定死了，切换开关后必须换新 Session 才生效
+	sess_key = f'newapi:{site.id}:{"proxy" if site.use_proxy else "direct"}'
 	prot = bs.protection_cache.get(site.domain.rstrip('/'))
 	if prot and (prot.get('failed') or prot['expires'] <= time.time()):
 		prot = None  # 负缓存/过期条目对请求方不可见；负缓存的拦截图在 ensure 里做
@@ -216,10 +221,10 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 		send_headers['User-Agent'] = prot['user_agent']
 
 	def _do():
-		sess = bs._get_cffi_session(f'newapi:{site.id}')
+		sess = bs._get_cffi_session(sess_key, proxies)
 		if prot:
 			sess.cookies.update(prot['cookies'])
-		return sess.request(method.upper(), url, headers=send_headers, json=json_body)
+		return sess.request(method.upper(), url, headers=send_headers, json=json_body, proxies=proxies)
 
 	loop = asyncio.get_running_loop()
 	resp = await loop.run_in_executor(bs._UPSTREAM_POOL, _do)

@@ -66,8 +66,8 @@ class FakeSession:
 		self.requests = []
 		self.cookies = FakeCookieJar()
 
-	def request(self, method, url, headers=None, json=None):
-		self.requests.append({'method': method, 'url': url, 'headers': dict(headers or {})})
+	def request(self, method, url, headers=None, json=None, proxies=None):
+		self.requests.append({'method': method, 'url': url, 'headers': dict(headers or {}), 'proxies': proxies})
 		if len(self.script) > 1:
 			return self.script.pop(0)
 		return self.script[0]
@@ -91,8 +91,10 @@ def env(tmp_path, monkeypatch, config_file):
 	flare_sessions = []
 	site_script = []
 	flare_script = []
+	keys = []
 
 	def factory(key, proxies=None):
+		keys.append(key)
 		if key.startswith('flaresolverr:'):
 			sess = FakeSession(flare_script)
 			flare_sessions.append(sess)
@@ -105,6 +107,7 @@ def env(tmp_path, monkeypatch, config_file):
 	factory.flare_sessions = flare_sessions
 	factory.site_script = site_script
 	factory.flare_script = flare_script
+	factory.keys = keys
 	monkeypatch.setattr(bs, '_get_cffi_session', factory)
 	return factory
 
@@ -351,6 +354,22 @@ def test_请求_正常响应零开销不触发求解(env):
 	env.site_script.append(FakeResp(200, payload={'success': True}))
 	r = asyncio.run(bs.newapi_request(site(), 'GET', '/api/status', {}))
 	assert r.status_code == 200 and len(env.site_sessions) == 1
+
+
+def test_请求_use_proxy决定走代理还是直连(env):
+	"""use_proxy=True 带代理出口，False 直连（curl_cffi 不读环境代理，None 就是真直连）；
+	连接池 key 也要带上模式，否则切换开关后还会命中旧 Session、代理设置不生效。"""
+	env.site_script.append(FakeResp(200, payload={'success': True}))
+	proxy = {'https': bs._PROXY, 'http': bs._PROXY}
+
+	asyncio.run(bs.newapi_request(site(), 'GET', '/api/status', {}))
+	assert env.site_sessions[-1].requests[0]['proxies'] == proxy
+	assert 'newapi:t:proxy' in env.keys
+
+	direct = bs.NewapiSite(id='d', label='D', domain='https://d.com', use_proxy=False)
+	asyncio.run(bs.newapi_request(direct, 'GET', '/api/status', {}))
+	assert env.site_sessions[-1].requests[0]['proxies'] is None
+	assert 'newapi:d:direct' in env.keys
 
 
 # ===== 配置与检测端点 =====

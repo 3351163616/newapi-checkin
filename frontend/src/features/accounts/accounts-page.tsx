@@ -209,7 +209,7 @@ export function AccountsPage() {
     const val = (r: AccountRow) => {
       if (sortBy === "quota") {
         const b = bal(r);
-        return b?.success ? (b as QueryResultSuccess).quota - (b as QueryResultSuccess).used : -1;
+        return b?.success ? (b as QueryResultSuccess).quota : -1;
       }
       if (sortBy === "used") {
         const b = bal(r);
@@ -419,7 +419,7 @@ export function AccountsPage() {
 
   const queried = Object.values(balances);
   const totalBalance = queried
-    .map((r) => (r.success ? r.quota - r.used : 0))
+    .map((r) => (r.success ? r.quota : 0))
     .reduce((a, b) => a + b, 0);
   const totalToday = rows
     .map((row) => computeTodayUsed(balances[`${row.keyPrefix}:${row.name}`]?.success ? balances[`${row.keyPrefix}:${row.name}`] : undefined, baselineQ.data?.baseline[`${row.keyPrefix}:${row.name}`]))
@@ -604,7 +604,7 @@ export function AccountsPage() {
                         </Badge>
                       </TableCell>
                       <TableCell className={cn("text-right font-data text-xs", result?.success === false && "text-checkin-failed")}>
-                        {result ? (result.success ? formatMoney(result.quota - result.used) : "失败") : "--"}
+                        {result ? (result.success ? formatMoney(result.quota) : "失败") : "--"}
                       </TableCell>
                       <TableCell className="text-right font-data text-xs">{result?.success ? formatMoney(result.used) : "--"}</TableCell>
                       <TableCell className="text-right font-data text-xs">{today === null ? "--" : formatMoney(today)}</TableCell>
