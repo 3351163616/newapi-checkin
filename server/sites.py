@@ -15,9 +15,10 @@ import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
+from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel
-from fastapi import APIRouter
 
 sites_router = APIRouter()
 
@@ -246,9 +247,9 @@ async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, head
 	（取全量 key 的 batch/keys，20 次/20 分钟/IP）才借 mihomo 换出口。这里每次都新建连接，
 	不存在 keep-alive 隧道钉死旧出口的问题（agentrouter 轮换踩过的坑）。
 	"""
-	import balance_server as bs
-
 	from curl_cffi import requests as cffi_requests
+
+	import balance_server as bs
 
 	url = site.domain + path
 	proxies = {'https': bs._LOCAL_PROXY, 'http': bs._LOCAL_PROXY}
@@ -336,9 +337,9 @@ async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile
 	站点开着 Turnstile 且没传 token 时，接口会返回「Turnstile token 为空」——
 	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要先过人机校验。
 	"""
-	import balance_server as bs
-
 	from urllib.parse import quote
+
+	import balance_server as bs
 
 	headers = _newapi_headers(site, account)
 	path = site.sign_in_path + (f'?turnstile={quote(turnstile_token, safe="")}' if turnstile_token else '')
@@ -712,7 +713,7 @@ async def query_site(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 
 	async def _limited(a):
 		async with sem:
@@ -807,7 +808,7 @@ async def site_checkin_sync(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 	results: dict = {}
 
 	async def _one(acc: bs.NewapiAccountItem):
@@ -878,7 +879,7 @@ async def site_checkin_info_all(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 
 	async def _limited(a):
 		async with sem:
@@ -888,3 +889,52 @@ async def site_checkin_info_all(site_id: str):
 	return {'success': True, 'accounts': results}
 
 
+@sites_router.post('/api/sites/import-hub')
+async def import_hub(files: Annotated[list[UploadFile], File()], apply: bool = False):
+	"""从上传的 All API Hub 插件 LevelDB 文件导入站点与账号。
+
+	前端用 webkitdirectory 选 `Local Extension Settings` 目录上传全部文件；解析按
+	内容特征（account-<uuid>）提取，选错目录时无关文件解析不出账号，天然安全。
+	apply=false 只返回变更预览（dry-run）；true 时按 merge_import 语义落盘
+	（新站点追加注册表、已有站点按 user_id upsert，保留开关与非 hub 站点）。
+	"""
+	import balance_server as bs
+	from server.hub import build_hub, extract_objects, merge_import
+
+	parts: list[str] = []
+	total = 0
+	for f in files:
+		name = (f.filename or '').lower()
+		if not name.endswith(('.log', '.ldb')):
+			continue
+		chunk = (await f.read()).decode('utf-8', errors='replace')
+		total += len(chunk)
+		if len(chunk) > 20 * 1024 * 1024 or total > 200 * 1024 * 1024:
+			return {'success': False, 'error': '文件过大（单文件 20MB / 总量 200MB 上限），请只选 Local Extension Settings 目录'}
+		parts.append(chunk)
+	if not parts:
+		return {'success': False, 'error': '没有 .log/.ldb 文件——请选择浏览器的 Local Extension Settings 目录'}
+
+	objs = extract_objects('\n'.join(parts))
+	if not objs:
+		return {'success': False, 'error': '未从上传数据中识别出 All API Hub 账号（选错目录或插件无数据）'}
+	hub, skipped_empty = build_hub(objs)
+	root = bs.NEWAPI_SITES_FILE.parent  # 注册表所在目录即数据根（测试改写此常量即可全链路隔离）
+	result = merge_import(hub, root, dry_run=not apply)
+	preview = []
+	for sid, accs in sorted(hub.items()):
+		preview.append({
+			'site_id': sid,
+			'label': next(iter(accs.values()))['label'],
+			'domain': next(iter(accs.values()))['domain'],
+			'accounts': [{'name': a['name'], 'user_id': uid} for uid, a in accs.items()],
+		})
+	return {
+		'success': True,
+		'applied': apply,
+		'sites_in_upload': len(hub),
+		'accounts_in_upload': sum(len(a) for a in hub.values()),
+		'skipped_empty': skipped_empty,
+		'preview': preview,
+		**result,
+	}

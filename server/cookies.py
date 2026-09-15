@@ -41,6 +41,32 @@ RENEW_BEFORE_DAYS = 7
 
 
 
+def _checkin_status_payload() -> dict:
+	"""组装 cookie 账号签到状态返回体(状态 dict 家在 bs,经晚绑定读取)"""
+	import balance_server as bs
+
+	st = bs.anyrouter_checkin_state
+	accounts = [
+		{'name': name, 'status': info.get('status', 'pending'), 'message': info.get('message', ''), 'time': info.get('time')}
+		for name, info in st['accounts'].items()
+	]
+	signed = sum(1 for a in accounts if a['status'] in ('signed', 'already'))
+	failed = sum(1 for a in accounts if a['status'] == 'failed')
+	return {
+		'running': st['running'],
+		'date': st['date'],
+		'trigger': st['trigger'],
+		'started_at': st['started_at'],
+		'finished_at': st['finished_at'],
+		'total': st['total'],
+		'done': signed + failed,
+		'signed': signed,
+		'failed': failed,
+		'accounts': accounts,
+		'logs': st['logs'][-30:],
+	}
+
+
 class AccountItem(BaseModel):
 	"""传统 session cookie 方式"""
 	name: str
@@ -746,7 +772,7 @@ async def save_token_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [bs.TokenAccountItem(**acc) for acc in raw_accounts]
-		bs._atomic_write_json(NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
+		bs._atomic_write_json(bs.NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -841,7 +867,7 @@ async def anyrouter_checkin_start():
 	import balance_server as bs
 	"""启动 AnyRouter cookie 账号签到（并发，数秒完成）"""
 	if bs.anyrouter_checkin_state['running']:
-		return {'success': False, 'error': 'AnyRouter 签到已在运行中', 'status': _anyrouter_checkin_status_payload()}
+		return {'success': False, 'error': 'AnyRouter 签到已在运行中', 'status': _checkin_status_payload()}
 	accounts = bs.load_cookie_accounts()
 	if not accounts:
 		return {'success': False, 'error': '没有 cookie 账号可签到'}
@@ -850,16 +876,15 @@ async def anyrouter_checkin_start():
 	return {
 		'success': True,
 		'message': f'AnyRouter 签到已启动，共 {len(accounts)} 个账号',
-		'status': _anyrouter_checkin_status_payload(),
+		'status': _checkin_status_payload(),
 	}
 
 
 
 @cookies_router.get('/api/anyrouter/checkin/status')
 async def anyrouter_checkin_status():
-	import balance_server as bs
 	"""获取 AnyRouter 签到进度状态"""
-	return {'success': True, 'status': _anyrouter_checkin_status_payload()}
+	return {'success': True, 'status': _checkin_status_payload()}
 
 
 

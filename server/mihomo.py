@@ -10,9 +10,11 @@ _exit_generation 计数器被测试经 bs 观察与重绑，故家在 balance_se
 """
 
 import asyncio
+import os
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
 from fastapi import APIRouter
 
 mihomo_router = APIRouter()
@@ -69,9 +71,9 @@ def _mihomo_call(method: str, url: str, secret: str, body: dict | None = None):
 async def _query_egress_ip() -> str | None:
 	"""当前代理出口的公网 IP。切完节点必须核对它 —— 节点名不同 ≠ 出口 IP 不同
 	（实测原生 03/04 同 IP，专线 01/02 与 IPLC06 同 IP）。"""
-	import balance_server as bs
-
 	from curl_cffi import requests as cffi_requests
+
+	import balance_server as bs
 
 	proxies = {'https': bs._LOCAL_PROXY, 'http': bs._LOCAL_PROXY}
 
@@ -96,9 +98,9 @@ async def _probe_exit_passes_waf() -> bool:
 	实测（2026-08-22）：原生/家宽/专线 IP 基本都过，廉价数据中心（Vless 系）被拦，
 	与地区无关 —— 所以轮换池不挑地区，谁能过用谁。
 	"""
-	import balance_server as bs
-
 	from curl_cffi import requests as cffi_requests
+
+	import balance_server as bs
 
 	def _do():
 		try:
@@ -305,6 +307,29 @@ class _KeysExitRotator(_MihomoGroupSwitcher):
 
 # ===== 端点（块E 自 balance_server.py 迁入，晚绑定 bs.<名字>）=====
 
+
+def mask_proxy_url(url: str) -> str:
+	"""把代理 URL 里的认证凭据打码。
+
+	代理可能写成 http://user:pass@host:port，原样吐给前端会经由 devtools、
+	截图或录屏泄露出去。主机和端口保留 —— 那才是排障要看的东西。
+
+	只在 authority 段（`://` 之后、第一个 `/` 之前）动手，并且按**最后一个** `@`
+	切分：密码本身可能含 `@`（`user:p@ssw0rd@host`），按第一个 `@` 切会把
+	`ssw0rd` 原样留下 —— 半截密码照样是泄露。host 段不允许出现 `@`，
+	所以最后一个 `@` 之前的一律是 userinfo。
+	"""
+	if not url:
+		return ''
+	m = re.match(r'^([A-Za-z0-9+.\-]+://)([^/]*)(.*)$', url)
+	if not m:
+		return url
+	scheme, authority, rest = m.groups()
+	if '@' in authority:
+		authority = '***:***@' + authority.rsplit('@', 1)[1]
+	return scheme + authority + rest
+
+
 @mihomo_router.get('/api/system/proxy-info')
 async def get_proxy_info(probe: bool = False):
 	import balance_server as bs
@@ -325,24 +350,24 @@ async def get_proxy_info(probe: bool = False):
 
 	reachable = None
 	if probe:
-		parsed = urlparse(_PROXY)
+		parsed = urlparse(bs._PROXY)
 		if parsed.hostname and parsed.port:
-			reachable = await probe_tcp(parsed.hostname, parsed.port)
+			reachable = await bs.probe_tcp(parsed.hostname, parsed.port)
 
 	return {
 		'success': True,
 		'proxy': {
-			'url': mask_proxy_url(_PROXY),
+			'url': mask_proxy_url(bs._PROXY),
 			'source': source,
-			'has_credentials': '@' in _PROXY.split('://', 1)[-1].split('/', 1)[0],
+			'has_credentials': '@' in bs._PROXY.split('://', 1)[-1].split('/', 1)[0],
 			'reachable': reachable,
 		},
 		'mihomo': {
-			'group': MIHOMO_GROUP,
+			'group': bs.MIHOMO_GROUP,
 			# 组名为空时不做出口轮换，是有意的安全降级而非故障
-			'rotation_enabled': bool(MIHOMO_GROUP),
-			'config_path': str(MIHOMO_CONFIG_FILE),
-			'config_exists': await asyncio.to_thread(MIHOMO_CONFIG_FILE.is_file),
+			'rotation_enabled': bool(bs.MIHOMO_GROUP),
+			'config_path': str(bs.MIHOMO_CONFIG_FILE),
+			'config_exists': await asyncio.to_thread(bs.MIHOMO_CONFIG_FILE.is_file),
 		},
 	}
 

@@ -5,113 +5,53 @@ AnyRouter 余额查询服务
 
 import asyncio
 import contextlib
-from datetime import datetime
 import hmac
 import json
 import os
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlparse
-
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+
+from server.common import (  # noqa: E402
+	_atomic_write_json,
+	_read_json_cached,
+	_read_json_models,
+	_spawn,
+)
 
 # ===== 基础设施与配置（已迁至 server/config.py / server/common.py）=====
 # 常量与无状态工具的唯一住所迁移至 server 包；此处重导出保持 bs.<名字> 兼容
 # （测试 patch bs.X / 域模块过渡期读 bs.X 均继续有效）。config 导入即加载 .env。
 from server.config import (  # noqa: E402
-	_LOCAL_PROXY,
-	_PROXY,
-	_AGENTROUTER_PROXY,
-	USER_AGENT,
-	CONFIG_FILE,
-	NEW_ACCOUNTS_FILE,
-	USAGE_FILE,
-	AGENTROUTER_ACCOUNTS_FILE,
-	CHECKIN_STATE_FILE,
-	ANYROUTER_CHECKIN_STATE_FILE,
-	CHECKIN_SETTINGS_FILE,
-	NEWAPI_SITES_FILE,
-	MIHOMO_CONFIG_FILE,
-	MIHOMO_GROUP,
-	MIHOMO_NODE_SKIP,
-	KEYS_CACHE_FILE,
 	AGENTROUTER_SESSION_FILE,
-	CHECKIN_MIN_DELAY,
-	CHECKIN_MAX_DELAY,
-	WAF_CACHE_TTL,
-	ANYROUTER_CONCURRENCY,
-	NEWAPI_CONCURRENCY,
+	AGENTROUTER_SESSION_TTL,
+	CHECKIN_SETTINGS_FILE,
+	CONFIG_FILE,
+	KEYS_CACHE_FILE,
+	KEYS_CACHE_MAX_AGE,
+	NEW_ACCOUNTS_FILE,
 	TOKEN_LIST_PATH,
 	TOKEN_PAGE_SIZE,
-	KEYS_CACHE_MAX_AGE,
-	AGENTROUTER_SESSION_TTL,
+	USER_AGENT,
+)
+from server.notify import (  # noqa: E402
+	notify_router,
 )
 
 # ===== 防护/打码/通知（已迁至 server/protection.py、server/turnstile.py、server/notify.py）=====
 # 过渡期约定：域模块函数体内晚绑定 bs.<名字>；这里重导出保持 bs.<名字> 兼容。
 from server.protection import (  # noqa: E402
-	_WAF_CHALLENGE_RE,
-	_ESA_DENY_RE,
-	_WAF_POS,
-	_WAF_MASK,
-	_solve_acw_sc_v2,
-	_CF_CHALLENGE_BODY_RE,
-	_ALIYUN_WAF_COOKIE_NAMES,
-	protection_cache,
-	_protection_locks,
-	get_flaresolverr_url,
-	detect_protection,
-	solve_aliyun_waf,
-	solve_cf_challenge,
-	ensure_protection_cookies,
-	probe_page_protection,
-	protection_test,
 	protection_router,
 )
 from server.turnstile import (  # noqa: E402
-	TURNSTILE_SOLVER_PRESETS,
-	_TURNSTILE_SOLVER_SEM,
-	TURNSTILE_SOLVER_POLL_INTERVAL,
-	TURNSTILE_SOLVER_TIMEOUT,
-	get_turnstile_solver_config,
-	solve_turnstile_token,
-	_solve_turnstile_token_raw,
-	_solver_stats,
-	_solver_stats_bump,
-	TurnstileSolverRequest,
-	solver_stats,
-	solver_balance,
-	turnstile_solver_status,
-	save_turnstile_solver,
-	test_turnstile_solver,
 	turnstile_router,
-)
-from server.notify import (  # noqa: E402
-	get_notify_config,
-	notify_configured,
-	send_webhook_notify,
-	_mask_secret,
-	get_notify,
-	save_notify,
-	test_notify,
-	NotifyRequest,
-	notify_router,
-)
-from server.common import (  # noqa: E402
-	_atomic_write_json,
-	_read_json_cached,
-	_read_json_models,
-	_background_tasks,
-	_spawn,
-	_UPSTREAM_POOL,
-	_get_cffi_session,
 )
 
 
@@ -212,44 +152,14 @@ async def auth_middleware(request: Request, call_next):
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；登录端点暂留主文件（块E 收口）。
 # _agentrouter_session/_agentrouter_key_sessions 暂居 server/keys.py，块E 归并到本域。
 from server.agentrouter import (  # noqa: E402
-	agentrouter_block_reason,
-	checkin_gap_seconds,
-	LoginAccountItem,
-	agentrouter_real_balance,
-	query_balance_login,
-	sign_in_login,
-	load_login_accounts,
-	add_checkin_log,
-	save_checkin_state,
+	agentrouter_router,
 	load_checkin_state,
-	run_login_checkin,
+	load_login_accounts,
 	start_login_checkin,
-	_session_expiry_info,
-	_FATAL_LOGIN_MARKS,
-	_login_balance_one,
-	_run_with_rotation,
-	_query_login_balances,
-	_sign_in_one,
-	get_login_accounts,
-	save_login_accounts,
-	query_login_accounts,
-	login_checkin_fast,
-	login_checkin_start,
-	login_checkin_stop,
-	login_checkin_status,
-	login_accounts_balances,
 )
 
+app.include_router(agentrouter_router)
 
-
-ANYROUTER_CONFIG = {
-	'domain': 'https://anyrouter.top',
-	'login_path': '/login',
-	'user_info_path': '/api/user/self',
-	'sign_in_path': '/api/user/sign_in',
-	'api_user_key': 'new-api-user',
-	'waf_cookie_names': ['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
-}
 
 AGENTROUTER_ORG_CONFIG = {
 	'domain': 'https://agentrouter.org',
@@ -298,20 +208,10 @@ NEWAPI_SEED_SITES = [
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；_exit_generation/_ar_session_key
 # 因 global 原地递增的耦合关系整体随域迁移，不经 bs.（bs 无读取方）。
 from server.mihomo import (  # noqa: E402
-	_ar_session_key,
-	WAF_PASS_CACHE_TTL,
-	_waf_pass_cache,
-	_balances_query_lock,
-	_mihomo_controller,
-	_mihomo_call,
-	_query_egress_ip,
-	_probe_exit_passes_waf,
-	_MihomoGroupSwitcher,
-	ExitRotator,
-	_KeysExitRotator,
-	get_proxy_info,
-	get_proxy_info,
+	mihomo_router,
 )
+
+app.include_router(mihomo_router)
 
 # 出口代数计数器：mihomo.ExitRotator 递增、_ar_session_key 读取；测试观察/重绑，家在 bs
 _exit_generation = 0
@@ -329,13 +229,6 @@ WAF_ABORT_STREAK = 8  # 连续这么多个账号被拦且零成功就提前中�
 
 
 
-
-
-class TokenAccountItem(BaseModel):
-	"""传统 access_token 方式（new_accounts_config.json）"""
-	name: str
-	access_token: str
-	user_id: str
 
 
 class CollectRequest(BaseModel):
@@ -375,46 +268,20 @@ _load_site_status()
 # ========== 通用 new-api 站点域（已迁至 server/sites.py） ==========
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；站点端点暂留主文件（块E 收口）。
 from server.sites import (  # noqa: E402
-	NEWAPI_DEFAULTS,
 	NewapiAccountItem,
-	NewapiSite,
-	newapi_checkin_states,
-	load_newapi_sites,
-	save_newapi_sites,
-	get_newapi_site,
-	load_newapi_accounts,
-	save_newapi_accounts,
 	_newapi_headers,
-	newapi_request,
-	_proxied_newapi_request,
-	query_balance_newapi,
-	newapi_turnstile_status,
-	sign_in_newapi,
-	newapi_checkin_info,
-	newapi_state,
-	add_newapi_checkin_log,
-	save_newapi_checkin_state,
+	load_newapi_accounts,
 	load_newapi_checkin_state,
-	run_newapi_checkin,
-	start_newapi_checkin,
-	_newapi_checkin_status_payload,
-	run_site_patrol,
+	load_newapi_sites,
+	newapi_state,
+	save_newapi_accounts,
+	save_newapi_sites,
 	site_patrol_scheduler,
-	SITE_PATROL_INTERVAL,
-	SITE_PATROL_FIRST_DELAY,
-	SITE_PATROL_FAIL_LIMIT,
-	save_sites,
-	probe_site,
-	get_site_accounts,
-	post_site_accounts,
-	query_site,
-	site_checkin_start,
-	site_turnstile,
-	site_checkin_status,
-	site_checkin_sync,
-	site_checkin_info_all,
-	_site_or_error,
+	sites_router,
+	start_newapi_checkin,
 )
+
+app.include_router(sites_router)
 
 # 巡检失败计数（测试会整体重绑，故家在 bs；sites.run_site_patrol 经 bs. 读写）
 site_patrol_fails: dict[str, int] = {}
@@ -429,68 +296,24 @@ site_patrol_fails: dict[str, int] = {}
 # 跨实体引用在函数体内晚绑定 bs.<名字>。EmailConfig / MonitorStartRequest 随域迁移
 # （pydantic 注解在定义期求值，必须与模型同模块）。
 from server.monitor import (  # noqa: E402
-	EmailConfig,
-	MonitorStartRequest,
-	monitor_state,
-	_collect_monitor_accounts,
-	add_monitor_log,
-	send_alert_email,
-	_monitor_alert_key,
-	monitor_loop,
 	monitor_router,
 )
+
 app.include_router(monitor_router)
 
 # ========== Cookie 域（已迁至 server/cookies.py） ==========
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；cookie 相关端点暂留主文件（块E 收口）。
 from server.cookies import (  # noqa: E402
-	AccountItem,
-	TokenAccountItem,
-	waf_cache,
-	_waf_lock,
 	ANYROUTER_CONFIG,
+	TokenAccountItem,
 	_api_url,
 	anyrouter_request,
-	anyrouter_block_reason,
-	_get_waf_cookies_if_needed,
-	get_waf_cookies,
-	_query_balance_impl,
-	query_balance,
-	query_balance_with_token,
-	_sign_in_impl,
-	sign_in,
-	sign_in_with_token,
-	load_cookie_accounts,
-	_session_is_authenticated,
-	save_renewed_sessions,
-	renew_one_cookie,
-	add_anyrouter_checkin_log,
-	save_anyrouter_checkin_state,
-	load_anyrouter_checkin_state,
-	run_anyrouter_checkin,
-	start_anyrouter_checkin,
-	query,
-	checkin,
-	get_token_accounts,
-	save_token_accounts,
-	query_with_token,
-	checkin_with_token,
-	anyrouter_checkin_start,
-	anyrouter_checkin_status,
-	anyrouter_cookie_status,
-	anyrouter_renew,
 	cookies_router,
-	query,
-	checkin,
-	get_token_accounts,
-	save_token_accounts,
-	query_with_token,
-	checkin_with_token,
-	anyrouter_checkin_start,
-	anyrouter_checkin_status,
-	anyrouter_cookie_status,
-	anyrouter_renew,
+	load_anyrouter_checkin_state,
+	load_cookie_accounts,
+	start_anyrouter_checkin,
 )
+
 app.include_router(cookies_router)
 
 
@@ -1045,44 +868,15 @@ async def collect_token(req: CollectRequest, request: Request):
 #     请求通道、可变缓存等一切跨实体引用晚绑定 bs.<名字> —— 测试对 bs 命名空间的
 #     monkeypatch（resolve_key_ctx / _agentrouter_session / _KeysExitRotator /
 #     KEYS_CACHE_FILE 等）因此原样生效，本块迁移零测试改动；
-#   - 文件路径常量留在本模块（测试会改写它们指向 tmp）；
+#   - 文件路径常量现由顶部 from server.config import 统一提供（测试仍 patch bs.<名字> 指向 tmp）；
 #   - 后续域迁移时逐步把 bs.* 换成真正的模块内依赖，patch 目标随之迁移。
-TOKEN_LIST_PATH = '/api/token/'
-TOKEN_PAGE_SIZE = 100
-KEYS_CACHE_FILE = Path(__file__).parent / 'keys_cache.json'
-KEYS_CACHE_MAX_AGE = 30 * 24 * 3600  # 保存时清掉一个月没碰过的条目，防无限增长
-AGENTROUTER_SESSION_TTL = 6 * 3600
-AGENTROUTER_SESSION_FILE = Path(__file__).parent / 'agentrouter_sessions.json'
 
 from server.keys import (  # noqa: E402
-	KeyCtx,
-	_key_value_cache,
-	_keys_list_cache,
-	_agentrouter_key_sessions,
-	_agentrouter_login_lock,
-	_keys_reveal_until,
-	_keys_reveal_lock,
-	KEYS_REVEAL_CONCURRENCY,
-	KEYS_REVEAL_MAX_SWITCHES,
-	KEYS_REVEAL_LIMIT_WINDOW,
-	load_keys_list_cache,
-	save_keys_list_cache,
-	load_agentrouter_sessions,
-	save_agentrouter_sessions,
-	_agentrouter_session,
-	resolve_key_ctx,
-	_parse_token_items,
-	_token_row,
-	reveal_key_values,
-	list_account_keys,
-	_reveal_scope,
-	_keys_cache_store_if_complete,
-	_reveal_accounts,
-	keys_list,
-	keys_create,
-	keys_delete,
 	keys_router,
+	load_agentrouter_sessions,
+	load_keys_list_cache,
 )
+
 app.include_router(keys_router)
 
 
@@ -1094,22 +888,14 @@ app.include_router(keys_router)
 # monkeypatch 原样生效；_usage_cache/_usage_cache_path 会被 load/save 重绑，其读写
 # 一律走 bs. 保证命名空间唯一事实来源。USAGE_FILE 常量留在本模块（测试会改写）。
 from server.usage import (  # noqa: E402
-	_usage_cache,
-	_usage_cache_path,
-	load_usage_data,
-	save_usage_data,
-	usage_key,
-	migrate_usage_keys,
-	run_usage_key_migration,
-	record_account_usage,
-	take_daily_snapshot,
-	seconds_until_midnight,
 	daily_snapshot_scheduler,
-	get_today_usage,
-	get_usage_history,
-	manual_snapshot,
+	load_usage_data,
+	run_usage_key_migration,
+	seconds_until_midnight,
+	take_daily_snapshot,
 	usage_router,
 )
+
 app.include_router(usage_router)
 
 def load_token_accounts() -> list[TokenAccountItem]:
@@ -1265,6 +1051,227 @@ async def frontend_catch_all(full_path: str):
 		return JSONResponse({'success': False, 'error': '前端资源缺失'}, status_code=503)
 	return HTMLResponse(entry.read_text(encoding='utf-8'), headers={'Cache-Control': 'no-cache'})
 
+
+# ── bs.<名字> 兼容再导出（恢复被 ruff 误删的跨域晚绑定/测试转发出口）
+#
+# 这些名字定义在 server/ 各域模块，本装配壳不直接引用，仅为域模块跨域晚绑定（函数体内 bs.<名字>）
+# 与测试 patch bs.X 转发。已在 pyproject 对本文件关闭 F401，防 ruff（fix=true）再次整片误删。
+# ────────────────────────────────────────────────────────────────────────────
+from server.agentrouter import (
+	_FATAL_LOGIN_MARKS,
+	LoginAccountItem,
+	_login_balance_one,
+	_query_login_balances,
+	_run_with_rotation,
+	_session_expiry_info,
+	_sign_in_one,
+	add_checkin_log,
+	agentrouter_block_reason,
+	agentrouter_real_balance,
+	checkin_gap_seconds,
+	get_login_accounts,
+	login_accounts_balances,
+	login_checkin_fast,
+	login_checkin_start,
+	login_checkin_status,
+	login_checkin_stop,
+	query_balance_login,
+	query_login_accounts,
+	run_login_checkin,
+	save_checkin_state,
+	save_login_accounts,
+	sign_in_login,
+)
+from server.common import (
+	_UPSTREAM_POOL,
+	_background_tasks,
+	_get_cffi_session,
+)
+from server.config import (
+	_AGENTROUTER_PROXY,
+	_LOCAL_PROXY,
+	_PROXY,
+	AGENTROUTER_ACCOUNTS_FILE,
+	ANYROUTER_CHECKIN_STATE_FILE,
+	ANYROUTER_CONCURRENCY,
+	CHECKIN_MAX_DELAY,
+	CHECKIN_MIN_DELAY,
+	CHECKIN_STATE_FILE,
+	MIHOMO_CONFIG_FILE,
+	MIHOMO_GROUP,
+	MIHOMO_NODE_SKIP,
+	NEWAPI_CONCURRENCY,
+	NEWAPI_SITES_FILE,
+	USAGE_FILE,
+	WAF_CACHE_TTL,
+)
+from server.cookies import (
+	AccountItem,
+	_get_waf_cookies_if_needed,
+	_query_balance_impl,
+	_session_is_authenticated,
+	_sign_in_impl,
+	_waf_lock,
+	add_anyrouter_checkin_log,
+	anyrouter_block_reason,
+	anyrouter_checkin_start,
+	anyrouter_checkin_status,
+	anyrouter_cookie_status,
+	anyrouter_renew,
+	checkin,
+	checkin_with_token,
+	get_token_accounts,
+	get_waf_cookies,
+	query,
+	query_balance,
+	query_balance_with_token,
+	query_with_token,
+	renew_one_cookie,
+	run_anyrouter_checkin,
+	save_anyrouter_checkin_state,
+	save_renewed_sessions,
+	save_token_accounts,
+	sign_in,
+	sign_in_with_token,
+	waf_cache,
+)
+from server.keys import (
+	KEYS_REVEAL_CONCURRENCY,
+	KEYS_REVEAL_LIMIT_WINDOW,
+	KEYS_REVEAL_MAX_SWITCHES,
+	KeyCtx,
+	_agentrouter_key_sessions,
+	_agentrouter_login_lock,
+	_agentrouter_session,
+	_key_value_cache,
+	_keys_cache_store_if_complete,
+	_keys_list_cache,
+	_keys_reveal_lock,
+	_keys_reveal_until,
+	_parse_token_items,
+	_reveal_accounts,
+	_reveal_scope,
+	_token_row,
+	keys_create,
+	keys_delete,
+	keys_list,
+	list_account_keys,
+	resolve_key_ctx,
+	reveal_key_values,
+	save_agentrouter_sessions,
+	save_keys_list_cache,
+)
+from server.mihomo import (
+	WAF_PASS_CACHE_TTL,
+	ExitRotator,
+	_ar_session_key,
+	_balances_query_lock,
+	_KeysExitRotator,
+	_mihomo_call,
+	_mihomo_controller,
+	_MihomoGroupSwitcher,
+	_probe_exit_passes_waf,
+	_query_egress_ip,
+	_waf_pass_cache,
+	get_proxy_info,
+)
+from server.monitor import (
+	EmailConfig,
+	MonitorStartRequest,
+	_collect_monitor_accounts,
+	_monitor_alert_key,
+	add_monitor_log,
+	monitor_loop,
+	monitor_state,
+	send_alert_email,
+)
+from server.notify import (
+	NotifyRequest,
+	_mask_secret,
+	get_notify,
+	get_notify_config,
+	notify_configured,
+	save_notify,
+	send_webhook_notify,
+	test_notify,
+)
+from server.protection import (
+	_ALIYUN_WAF_COOKIE_NAMES,
+	_CF_CHALLENGE_BODY_RE,
+	_ESA_DENY_RE,
+	_WAF_CHALLENGE_RE,
+	_WAF_MASK,
+	_WAF_POS,
+	_protection_locks,
+	_solve_acw_sc_v2,
+	detect_protection,
+	ensure_protection_cookies,
+	get_flaresolverr_url,
+	probe_page_protection,
+	protection_cache,
+	protection_test,
+	solve_aliyun_waf,
+	solve_cf_challenge,
+)
+from server.sites import (
+	NEWAPI_DEFAULTS,
+	SITE_PATROL_FAIL_LIMIT,
+	SITE_PATROL_FIRST_DELAY,
+	SITE_PATROL_INTERVAL,
+	NewapiSite,
+	_newapi_checkin_status_payload,
+	_proxied_newapi_request,
+	_site_or_error,
+	add_newapi_checkin_log,
+	get_newapi_site,
+	get_site_accounts,
+	newapi_checkin_info,
+	newapi_checkin_states,
+	newapi_request,
+	newapi_turnstile_status,
+	post_site_accounts,
+	probe_site,
+	query_balance_newapi,
+	query_site,
+	run_newapi_checkin,
+	run_site_patrol,
+	save_newapi_checkin_state,
+	save_sites,
+	sign_in_newapi,
+	site_checkin_info_all,
+	site_checkin_start,
+	site_checkin_status,
+	site_checkin_sync,
+	site_turnstile,
+)
+from server.turnstile import (
+	_TURNSTILE_SOLVER_SEM,
+	TURNSTILE_SOLVER_POLL_INTERVAL,
+	TURNSTILE_SOLVER_PRESETS,
+	TURNSTILE_SOLVER_TIMEOUT,
+	TurnstileSolverRequest,
+	_solve_turnstile_token_raw,
+	_solver_stats,
+	_solver_stats_bump,
+	get_turnstile_solver_config,
+	save_turnstile_solver,
+	solve_turnstile_token,
+	solver_balance,
+	solver_stats,
+	test_turnstile_solver,
+	turnstile_solver_status,
+)
+from server.usage import (
+	_usage_cache,
+	_usage_cache_path,
+	get_today_usage,
+	get_usage_history,
+	manual_snapshot,
+	migrate_usage_keys,
+	record_account_usage,
+	save_usage_data,
+	usage_key,
+)
 
 if __name__ == '__main__':
 	uvicorn.run(app, host='0.0.0.0', port=8003)

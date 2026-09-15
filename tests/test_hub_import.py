@@ -5,13 +5,10 @@
 """
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from extract_hub_accounts import merge_import, site_id_from_url  # noqa: E402
+from server.hub import build_hub, extract_objects, merge_import, site_id_from_url
 
 
 @pytest.fixture
@@ -86,8 +83,8 @@ def test_agentrouter域跳过(sandbox):
 def test_重复导入幂等(sandbox):
 	merge_import(hub_data(), sandbox)
 	before = (sandbox / "new-site-io_accounts.json").read_text(encoding="utf-8")
-	out = merge_import(hub_data(), sandbox)  # 第二次应报「无变化」且文件不动
-	assert out == 0
+	out = merge_import(hub_data(), sandbox)  # 第二次应无变化且文件不动
+	assert out["added_sites"] == [] and out["changed_accounts"] == []
 	assert (sandbox / "new-site-io_accounts.json").read_text(encoding="utf-8") == before
 	sites = json.loads((sandbox / "newapi_sites.json").read_text(encoding="utf-8"))
 	assert len(sites) == 3, '不得重复追加注册表'
@@ -103,6 +100,98 @@ def test_域名保留原始url_连字符域名不被反推破坏(sandbox):
 		'域名含连字符时不能用 sid 反推（会把 grok-heavy 变成 grok.heavy）'
 
 
+def test_dry_run只算不写(sandbox):
+	out = merge_import(hub_data(), sandbox, dry_run=True)
+	assert out["dry_run"] is True
+	assert len(out["added_sites"]) == 1 and out["added_sites"][0]["id"] == "new-site-io"
+	assert {c["action"] for c in out["changed_accounts"]} == {"token 更新", "新增账号"}
+	# 落盘检查：注册表与账号文件都未动
+	sites = json.loads((sandbox / "newapi_sites.json").read_text(encoding="utf-8"))
+	assert len(sites) == 2, "dry_run 不得改注册表"
+	assert not (sandbox / "new-site-io_accounts.json").exists()
+	demo = json.loads((sandbox / "demo_accounts.json").read_text(encoding="utf-8"))
+	assert demo[0]["access_token"] == "old", "dry_run 不得改账号文件"
+
+
+def test_解析器对原始leveldb文本():
+	# LevelDB value 是被转义一层的 JSON；按内容特征提取，无关文本不产生对象
+	rec = ('{"id":"account-12345678-1234-1234-1234-123456789abc",'
+		'"site_url":"https://a.com","site_name":"A",'
+		'"account_info":{"id":11,"username":"u","access_token":"tk"}}')
+	escaped = rec.replace('\\', '\\\\').replace('"', '\\"')
+	objs = extract_objects('{"db/save/1":"' + escaped + '"}')
+	assert len(objs) == 1 and objs[0]["site_url"] == "https://a.com"
+	hub, skipped = build_hub(objs)
+	assert hub == {"a-com": {"11": {"name": "u", "token": "tk", "label": "A", "domain": "https://a.com"}}}
+	assert skipped == 0
+
+
+def test_build_hub跳过空token并按去重保留最新():
+	o1 = {"site_url": "https://a.com", "site_name": "A", "account_info": {"id": "1", "username": "u", "access_token": ""}}
+	o2 = {"site_url": "https://a.com", "site_name": "A", "account_info": {"id": "1", "username": "u", "access_token": "tk"}}
+	hub, skipped = build_hub([o1, o2])
+	# 同 (site_url, id) 去重保留最后一次：旧的空 token 记录被最新覆盖，不计入 skipped
+	assert skipped == 0 and hub["a-com"]["1"]["token"] == "tk"
+
+
 def test_site_id_from_url():
 	assert site_id_from_url("https://demo.com") == "demo-com"
 	assert site_id_from_url("https://grok-heavy.878.indevs.in/x") == "grok-heavy-878-indevs-in"
+
+
+# ===== Web 端点（POST /api/sites/import-hub）=====
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+	"""TestClient + 把注册表/账号根目录指到 tmp（借 sites 域的 bs 晚绑定）。"""
+	import balance_server as bs
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'newapi_sites.json')
+	monkeypatch.setattr(bs.NewapiSite, 'accounts_path', lambda self: tmp_path / (self.accounts_file or f'{self.id}_accounts.json'))
+	monkeypatch.setattr(bs.NewapiSite, 'state_path', lambda self: tmp_path / (self.state_file or f'{self.id}_checkin_state.json'))
+	(tmp_path / 'newapi_sites.json').write_text(json.dumps([
+		{'id': 'demo-com', 'label': 'Demo', 'domain': 'https://demo.com', 'accounts_file': 'demo_accounts.json'},
+	]), encoding='utf-8')
+	(tmp_path / 'demo_accounts.json').write_text('[]', encoding='utf-8')
+	import time
+	bs.active_tokens['hub-test-token'] = time.time() + 3600
+	from fastapi.testclient import TestClient
+	return TestClient(bs.app, headers={'Authorization': 'Bearer hub-test-token'})
+
+
+def ldb_record() -> bytes:
+	"""模拟 LevelDB 里的真实形态：value 是被转义一层的 JSON，含 account-uuid 外层 id。"""
+	rec = ('{"id":"account-12345678-1234-1234-1234-123456789abc",'
+		'"site_url":"https://demo.com","site_name":"Demo",'
+		'"account_info":{"id":42,"username":"u1","access_token":"TK"}}')
+	escaped = rec.replace('\\', '\\\\').replace('"', '\\"')
+	return ('{"db/save/1":"' + escaped + '"}').encode()
+
+
+def test_导入端点_预览不落盘(client, tmp_path):
+	r = client.post('/api/sites/import-hub?apply=false', files=[('files', ('000003.log', ldb_record(), 'application/octet-stream'))])
+	d = r.json()
+	assert d['success'] and d['applied'] is False
+	assert d['accounts_in_upload'] == 1 and d['changed_accounts'][0]['action'] == '新增账号'
+	assert not (tmp_path / 'demo_accounts.json').read_text(encoding='utf-8').strip() != '[]' or True
+	assert json.loads((tmp_path / 'demo_accounts.json').read_text(encoding='utf-8')) == [], '预览不得落盘'
+
+
+def test_导入端点_apply落盘并幂等(client, tmp_path):
+	f = [('files', ('000003.log', ldb_record(), 'application/octet-stream'))]
+	r1 = client.post('/api/sites/import-hub?apply=true', files=f)
+	assert r1.json()['applied'] is True
+	accs = json.loads((tmp_path / 'demo_accounts.json').read_text(encoding='utf-8'))
+	assert accs[0]['user_id'] == '42' and accs[0]['access_token'] == 'TK'
+	r2 = client.post('/api/sites/import-hub?apply=true', files=f)
+	assert r2.json()['changed_accounts'] == [], '二次导入幂等'
+
+
+def test_导入端点_非leveldb文件给出人话(client):
+	r = client.post('/api/sites/import-hub', files=[('files', ('readme.txt', b'hello', 'text/plain'))])
+	assert r.json()['success'] is False and '.log/.ldb' in r.json()['error']
+
+
+def test_导入端点_无账号数据报错(client):
+	r = client.post('/api/sites/import-hub', files=[('files', ('000003.log', b'{"unrelated":1}', 'application/octet-stream'))])
+	assert r.json()['success'] is False and '识别' in r.json()['error']
