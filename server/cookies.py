@@ -745,8 +745,8 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 		for name in st['accounts']:
 			st['accounts'][name] = {'status': 'failed', 'message': 'WAF cookies 获取失败', 'time': ts}
 		add_anyrouter_checkin_log('WAF cookies 获取失败，签到中止')
-		_finish()
 		await notify_anyrouter_issues(st)
+		_finish()
 		return
 
 	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
@@ -769,8 +769,10 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 	results = await asyncio.gather(*[_one(a) for a in accounts])
 	# 签到完成，顺带续期临期 cookie（限流中自动整轮跳过）
 	renew_results = await _auto_renew_stale_cookies(accounts, results, waf_cookies)
-	_finish()
+	# 告警放在 _finish() 之前：_finish 才把日志落盘，放它后面这些行只活在内存里 ——
+	# 服务一重启，"告警到底发没发"在 UI 的签到日志里就查不到了
 	await notify_anyrouter_issues(st, results, renew_results)
+	_finish()
 
 
 def start_anyrouter_checkin(trigger: str = 'manual') -> bool:

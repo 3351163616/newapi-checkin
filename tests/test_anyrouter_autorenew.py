@@ -30,11 +30,21 @@ def acc(name: str, session: str = 'S', api_user: str = '1') -> ck.AccountItem:
     return ck.AccountItem(name=name, cookies={'session': session}, api_user=api_user)
 
 
-def run_checkin(monkeypatch, accounts, sign_in_result=None, expiry_map=None, renew_result=None, concurrency=4, notify=None):
+def run_checkin(
+    monkeypatch,
+    accounts,
+    sign_in_result=None,
+    expiry_map=None,
+    renew_result=None,
+    concurrency=4,
+    notify=None,
+    on_save=None,
+):
     """搭好替身并跑一轮 run_anyrouter_checkin，返回 (st, calls) 供断言。
 
     sign_in_result：签到假实现返回的 dict；expiry_map：session 字符串 → _session_expiry_info 的返回；
-    notify：覆盖 get_notify_config 的字段（默认 on_checkin_failed=False，与出厂一致）。
+    notify：覆盖 get_notify_config 的字段（默认 on_checkin_failed=False，与出厂一致）；
+    on_save：落盘回调，用来断言「某行日志在保存时是否已经存在」。
     """
     state = fresh_state()
     calls = {'renew': [], 'sign_in': [], 'updates': {}, 'alerts': []}
@@ -71,7 +81,7 @@ def run_checkin(monkeypatch, accounts, sign_in_result=None, expiry_map=None, ren
         }
 
     monkeypatch.setattr(ck, 'load_cookie_accounts', lambda: accounts)
-    monkeypatch.setattr(ck, 'save_anyrouter_checkin_state', lambda: None)
+    monkeypatch.setattr(ck, 'save_anyrouter_checkin_state', lambda: on_save and on_save(state))
     monkeypatch.setattr(ck, 'save_renewed_sessions', lambda updates: calls['updates'].update(updates))
     monkeypatch.setattr(bs, 'anyrouter_checkin_state', state)
     monkeypatch.setattr(bs, 'sign_in', fake_sign_in)
@@ -241,3 +251,17 @@ def test_失效告警被节流时仍会发签到失败推送(monkeypatch):
     assert len(calls1['alerts']) == 1 and '登录已失效' in calls1['alerts'][0]['subject']
     _, calls2 = run_checkin(monkeypatch, **args)
     assert len(calls2['alerts']) == 1 and '签到失败' in calls2['alerts'][0]['subject']
+
+
+def test_告警日志在落盘前写入(monkeypatch):
+    # _finish() 才把日志写进状态文件；告警行若在它之后再追加，重启就查不到"告警发没发"
+    saved = []
+    st, calls = run_checkin(
+        monkeypatch,
+        [acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+        on_save=lambda s: saved.extend(rec['message'] for rec in s['logs']),
+    )
+    assert any('登录失效告警' in m for m in saved), '落盘时告警行就该已经在了'
