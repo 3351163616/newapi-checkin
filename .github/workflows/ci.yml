@@ -13,10 +13,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: 安装依赖
-        run: pip install fastapi uvicorn "curl-cffi>=0.15" pytest
+      - uses: astral-sh/setup-uv@v5
+      # 依赖一律按 uv.lock 装：此前手写 pip 列表漏了 python-multipart（hub 上传需要），
+      # 且不锁版本会拉到当天最新的 starlette，其 testclient 已不再支持 httpx，CI 直接红。
+      - name: 安装依赖（严格按 uv.lock）
+        run: uv sync --frozen
       - name: 后端测试（全离线，不发上游请求）
-        run: python -m pytest tests/ -q --ignore=tests/test_waf.py
+        run: uv run --frozen pytest tests/ -q --ignore=tests/test_waf.py
 
   frontend:
     runs-on: ubuntu-latest
