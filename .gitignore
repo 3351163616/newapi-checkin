@@ -60,3 +60,7 @@ archive/
 *-loaded.yml
 frontend/node_modules.old/
 solver_stats.json
+# 求职方向的采集脚本与数据（与本项目无关，纯属放错目录，忽略以免误提交）
+boss-data/
+collect_boss_jobs.py
+collect_ai_entry_jobs.py
