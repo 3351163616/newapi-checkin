@@ -64,3 +64,6 @@ solver_stats.json
 boss-data/
 collect_boss_jobs.py
 collect_ai_entry_jobs.py
+
+# 受控浏览器配置（含 anyrouter/linuxdo 登录态，绝不提交）
+.browser-profile/
