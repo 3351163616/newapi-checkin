@@ -372,3 +372,22 @@ def test_调度_全部已签时直接结束不碰打码(sandbox, monkeypatch, co
 	asyncio.run(bs.run_newapi_checkin(site, trigger='manual'))
 	st = bs.newapi_state(site)
 	assert st['already'] == 2 and st['signed'] == 0 and st['failed'] == 0
+
+
+def test_打码用量统计真的写得进去(monkeypatch, tmp_path):
+	"""回归：SOLVER_STATS_FILE 曾在重构时只留引用没留定义，bs.SOLVER_STATS_FILE 一直是
+	AttributeError，统计被 except 静默吞掉（线上日志里那句「用量统计写入失败」）。"""
+	import json
+	from datetime import datetime
+
+	stats_file = tmp_path / 'solver_stats.json'
+	monkeypatch.setattr(bs, 'SOLVER_STATS_FILE', stats_file)
+	import server.turnstile as tk
+
+	tk._solver_stats_bump(True)
+	tk._solver_stats_bump(True)
+	tk._solver_stats_bump(False)
+
+	data = json.loads(stats_file.read_text(encoding='utf-8'))
+	assert data['date'] == datetime.now().strftime('%Y-%m-%d')
+	assert data['solved'] == 2 and data['failed'] == 1

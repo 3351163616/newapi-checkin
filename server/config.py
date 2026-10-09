@@ -59,6 +59,9 @@ CHECKIN_SETTINGS_FILE = _BASE_DIR / 'checkin_settings.json'
 NEWAPI_SITES_FILE = _BASE_DIR / 'newapi_sites.json'
 KEYS_CACHE_FILE = _BASE_DIR / 'keys_cache.json'
 AGENTROUTER_SESSION_FILE = _BASE_DIR / 'agentrouter_sessions.json'
+# 打码平台用量统计（按天计数）。2026-10-09 查实：重构时这个常量只留了引用没留定义，
+# server/turnstile.py 里 `bs.SOLVER_STATS_FILE` 一直是 AttributeError，统计静默写不进去。
+SOLVER_STATS_FILE = _BASE_DIR / 'solver_stats.json'
 
 # ── mihomo 出口轮换 ─────────────────────────────────────────────────────────
 
