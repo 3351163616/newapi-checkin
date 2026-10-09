@@ -5,9 +5,20 @@
 """
 
 import asyncio
+import time
+
+import pytest
 
 import balance_server as bs
 import server.cookies as ck
+
+
+@pytest.fixture(autouse=True)
+def _clear_relogin_alerts():
+    """失效告警节流是模块级状态，用例之间必须隔离"""
+    ck._relogin_alerted.clear()
+    yield
+    ck._relogin_alerted.clear()
 
 
 def fresh_state() -> dict:
@@ -19,13 +30,25 @@ def acc(name: str, session: str = 'S', api_user: str = '1') -> ck.AccountItem:
     return ck.AccountItem(name=name, cookies={'session': session}, api_user=api_user)
 
 
-def run_checkin(monkeypatch, accounts, sign_in_result=None, expiry_map=None, renew_result=None, concurrency=4):
+def run_checkin(monkeypatch, accounts, sign_in_result=None, expiry_map=None, renew_result=None, concurrency=4, notify=None):
     """搭好替身并跑一轮 run_anyrouter_checkin，返回 (st, calls) 供断言。
 
-    sign_in_result：签到假实现返回的 dict；expiry_map：session 字符串 → _session_expiry_info 的返回。
+    sign_in_result：签到假实现返回的 dict；expiry_map：session 字符串 → _session_expiry_info 的返回；
+    notify：覆盖 get_notify_config 的字段（默认 on_checkin_failed=False，与出厂一致）。
     """
     state = fresh_state()
-    calls = {'renew': [], 'sign_in': [], 'updates': {}}
+    calls = {'renew': [], 'sign_in': [], 'updates': {}, 'alerts': []}
+
+    async def fake_send_alert(subject, body, webhook=True, email_cfg=None):
+        calls['alerts'].append({'subject': subject, 'body': body, 'webhook': webhook})
+        return '邮件已发'
+
+    monkeypatch.setattr(bs, 'send_alert', fake_send_alert)
+    monkeypatch.setattr(
+        bs,
+        'get_notify_config',
+        lambda: {'type': '', 'url': '', 'chat_id': '', 'on_alert': True, 'on_checkin_failed': False, **(notify or {})},
+    )
 
     async def fake_sign_in(account, waf):
         calls['sign_in'].append(account.name)
@@ -115,3 +138,77 @@ def test_续期中途撞限流时中止剩余账号(monkeypatch):
     # b 被跳过：不计成功也不计失败，汇总行只报 a 的失败
     assert any('自动续期结束：成功 0 · 失败 1' in rec['message'] for rec in st['logs'])
     assert not any('b:' in rec['message'] and '续期' in rec['message'] for rec in st['logs'])
+
+
+# ===== 登录失效：立刻试续期 + 推送告警（2026-10 线上那次账号哑了三周无推送）=====
+
+
+def test_签到返401时即使有效期充足也立刻试续期(monkeypatch):
+    # 登录态什么时候失效和 cookie 上自称的到期时间是两回事（站点可提前作废），
+    # 只看 days_left 会让账号静默烂到期 —— 线上 126296 用量断了 19 天，续期一次都没触发过
+    st, calls = run_checkin(
+        monkeypatch,
+        [acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 29.0}},
+    )
+    assert calls['renew'] == ['a'], '签到已 401，即便 cookie 自称还有 29 天也要试续期'
+
+
+def test_续期结论是登录失效时推送告警(monkeypatch):
+    st, calls = run_checkin(
+        monkeypatch,
+        [acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+    )
+    assert len(calls['alerts']) == 1
+    alert = calls['alerts'][0]
+    assert '登录已失效' in alert['subject']
+    assert 'a' in alert['body'] and 'session' in alert['body'], '正文要告诉用户怎么换 cookie'
+    assert any('登录失效告警' in rec['message'] for rec in st['logs'])
+
+
+def test_失效告警七天节流(monkeypatch):
+    args = dict(
+        accounts=[acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+    )
+    st1, calls1 = run_checkin(monkeypatch, **args)
+    assert len(calls1['alerts']) == 1
+    # 第二轮：账号还是坏的，但 7 天节流窗口内不再重复发信，只记一行日志
+    st2, calls2 = run_checkin(monkeypatch, **args)
+    assert calls2['alerts'] == []
+    assert any('告警 7 天内不重复' in rec['message'] for rec in st2['logs'])
+
+
+def test_续期成功后解除失效节流(monkeypatch):
+    ck._relogin_alerted['a'] = time.time()
+    st, calls = run_checkin(monkeypatch, [acc('a', 'A')], expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}})
+    assert 'a' not in ck._relogin_alerted, '账号活过来了，下次再失效要能立刻告警'
+
+
+def test_限流跳过续期时不误报告警(monkeypatch):
+    # 续期整轮被限流跳过 → 拿不到续期结论；签到结果是限流文案而不是 401，不该报"登录失效"
+    st, calls = run_checkin(
+        monkeypatch,
+        [acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': '被站点安全策略拦截（ESA http_ratelimit）', 'blocked': 'ratelimit'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+    )
+    assert calls['alerts'] == []
+
+
+def test_签到失败推送受on_checkin_failed开关控制(monkeypatch):
+    failing = {'name': 'a', 'success': False, 'message': 'HTTP 500'}
+    _, calls_off = run_checkin(monkeypatch, [acc('a', 'A')], sign_in_result=failing)
+    assert calls_off['alerts'] == [], '开关默认关，不推送'
+
+    st, calls_on = run_checkin(monkeypatch, [acc('a', 'A')], sign_in_result=failing, notify={'on_checkin_failed': True})
+    assert len(calls_on['alerts']) == 1
+    assert '签到失败' in calls_on['alerts'][0]['subject']
+    assert any('失败通知推送' in rec['message'] for rec in st['logs'])
+

@@ -33,11 +33,20 @@ ANYROUTER_CONFIG = {
 	'waf_cookie_names': ['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 }
 
-# 签到完成后顺带自动续期：剩余天数 ≤ 此值（或本地解码失败）的 cookie 账号
+# 签到完成后顺带自动续期：剩余天数 ≤ 此值（或本地解码失败、或签到已返 401）的 cookie 账号
 # 打一次 /api/oauth/state 换新 session（+30 天）。new-api 服务端只在这类请求里
 # 重发 session cookie，签到接口不会 —— 不续的话 30 天一到账号就掉出自动签到。
-# 阈值内平均每账号 ~23 天才触发一次，一个请求对 ESA 限流窗口毫无压力。
-RENEW_BEFORE_DAYS = 7
+#
+# 2026-10-09 由 7 天放宽到 15 天：续期是「签到流程末尾顺带做」的，签到撞站点限流会整轮跳过，
+# 连续几天被限流时 7 天的窗口可能整个错过，窗口一过就只能手工重新登录（实测 126296 就这么掉的）。
+# 阈值内平均每账号 ~15 天才触发一次（2 个账号一个月多打 2 个请求），对 ESA 限流毫无压力。
+RENEW_BEFORE_DAYS = 15
+
+# 已被判定为「登录已失效、需人工重新登录」的账号 → 上次告警时间戳。
+# 这类告警是我们最想要的（账号彻底哑了），但每天重复发一个月就是噪音：首次立即告警，
+# 之后同一账号 7 天提醒一次，直到续期/签到恢复正常（成功即丢弃）。
+_RELOGIN_ALERT_COOLDOWN = 7 * 86400
+_relogin_alerted: dict[str, float] = {}
 
 
 
@@ -560,15 +569,21 @@ async def _auto_renew_stale_cookies(accounts: list, checkin_results: list, waf_c
 		return
 
 	stale = []
+	# 签到返 401 的账号，哪怕 cookie 自称还没到期也立刻试续期：登录态什么时候失效和 cookie
+	# 上的到期时间是两回事（站点可提前作废），等「剩余 ≤ 阈值」再试就晚了 —— 2026-10-09
+	# 实测 126296 用量 9-19 就断，cookie 却自称 10-08 到期，续期从头到尾没被触发过。
+	auth_dead = {
+		r['name'] for r in checkin_results if r and not r.get('success') and '401' in str(r.get('message', ''))
+	}
 	for a in accounts:
 		info = bs._session_expiry_info(a.cookies.get('session', '')) or {}
 		days = info.get('days_left')
 		# 解码失败（days 为 None）也续：renew_one_cookie 会打接口核实身份，失效自会报错
-		if days is None or days <= RENEW_BEFORE_DAYS:
+		if days is None or days <= RENEW_BEFORE_DAYS or a.name in auth_dead:
 			stale.append(a)
 	if not stale:
 		add_anyrouter_checkin_log(f'自动续期跳过：全部 cookie 有效期充足（剩余 > {RENEW_BEFORE_DAYS} 天）')
-		return
+		return []
 
 	add_anyrouter_checkin_log(
 		f'自动续期 {len(stale)} 个临期账号：' + '、'.join(a.name for a in stale)
@@ -599,16 +614,89 @@ async def _auto_renew_stale_cookies(accounts: list, checkin_results: list, waf_c
 	failed = len(results) - renewed - skipped
 	for r in results:
 		if r.get('success'):
+			_relogin_alerted.pop(r['name'], None)  # 活过来了，下次再失效要立刻告警
 			add_anyrouter_checkin_log(f'{r["name"]}: 自动续期成功（有效期至 {r.get("expires_at", "?")}）')
 		elif not r.get('skipped'):
 			add_anyrouter_checkin_log(f'{r["name"]}: 自动续期失败 · {r.get("message", "")}')
 	add_anyrouter_checkin_log(f'自动续期结束：成功 {renewed} · 失败 {failed}' + (f' · 跳过 {skipped}（限流中止）' if skipped else ''))
+	return results
+
+
+def _renew_needs_relogin(r: dict) -> bool:
+	"""续期失败的结论是不是「这个账号得手工重新登录」——最该让用户知道的一种失败"""
+	msg = str(r.get('message', ''))
+	return '请重新登录' in msg or '401' in msg
+
+
+def _relogin_alert_due(name: str) -> bool:
+	"""失效告警节流：首次立即发，之后同一账号 7 天内不重复（账号哑掉是状态，不是事件）"""
+	last = _relogin_alerted.get(name)
+	now = time.time()
+	if last is not None and now - last < _RELOGIN_ALERT_COOLDOWN:
+		return False
+	_relogin_alerted[name] = now
+	return True
+
+
+async def notify_anyrouter_issues(st: dict, checkin_results: list | None = None, renew_results: list | None = None) -> None:
+	"""签到/续期出问题时推送告警，两条通道分开管：
+
+	- **登录已失效**（续期结论是「请重新登录」，或整轮续期被限流跳过而签到返 401）→ 告警通道：
+	  邮件按 saved_config.json 的 email 段默认发，webhook 受 on_alert 开关控制，同账号 7 天节流。
+	  这正是 2026-10 那次事故缺的东西——两个账号 401 三周，日志里全有、却没有任何推送。
+	- **普通签到失败** → 受 on_checkin_failed 开关控制（默认关，与通用站点同一套语义）。
+
+	只报不修：session 失效无法自动复活，必须人工登录一次换新 cookie（除非站点支持账密登录）。
+	"""
+	import balance_server as bs
+
+	renewed = {r['name'] for r in (renew_results or []) if r.get('success')}
+	dead = {r['name'] for r in (renew_results or []) if not r.get('success') and _renew_needs_relogin(r)}
+	if not renew_results:
+		# 整轮续期被限流跳过时拿不到续期结论，退回看签到本身：401 一样是登录失效
+		dead |= {
+			r['name'] for r in (checkin_results or []) if r and not r.get('success') and '401' in str(r.get('message', ''))
+		}
+	dead -= renewed
+	if dead:
+		fresh = sorted(n for n in dead if _relogin_alert_due(n))
+		if fresh:
+			subject = f'🔑 AnyRouter 账号登录已失效：{len(fresh)} 个需重新登录'
+			body = '\n'.join(
+				[
+					'以下账号的 session 已失效，自动签到与自动续期都救不回来，需要人工登录一次换新 cookie：',
+					'',
+					*[f'  🔑 {n}' for n in fresh],
+					'',
+					'取 cookie：浏览器登录 anyrouter.top → F12 → Application → Cookies → 复制 session 的值，',
+					'然后 Web UI → 账号管理 → JSON 标签（会自动载入当前全部账号，别只贴这几条）→',
+					'改这两个账号的 cookies.session → 应用 JSON。',
+					'',
+					f'⏰ 检测时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+				]
+			)
+			res = await bs.send_alert(subject, body, webhook=bs.get_notify_config()['on_alert'])
+			add_anyrouter_checkin_log(f'登录失效告警：{res}（{"、".join(fresh)}）')
+		throttled = sorted(set(dead) - set(fresh))
+		if throttled:
+			days = _RELOGIN_ALERT_COOLDOWN // 86400
+			add_anyrouter_checkin_log(f'{"、".join(throttled)}: 登录已失效（告警 {days} 天内不重复）')
+
+	if not bs.get_notify_config()['on_checkin_failed']:
+		return
+	bad = [(name, (v.get('message') or '')[:80]) for name, v in st['accounts'].items() if v.get('status') == 'failed']
+	if not bad:
+		return
+	body = '\n'.join([f'  ❌ {n}：{m}' for n, m in bad])
+	res = await bs.send_alert(f'❌ AnyRouter 签到失败 {len(bad)} 个', body)
+	add_anyrouter_checkin_log(f'失败通知推送：{res}')
 
 
 async def run_anyrouter_checkin(trigger: str = 'manual'):
 	"""执行签到：cookie 账号并发签到（Semaphore 取 ANYROUTER_CONCURRENCY），数秒内完成。
 
-	签到完成后顺带自动续期临期 cookie（≤ RENEW_BEFORE_DAYS 天），省去 30 天一次的手动续期。
+	签到完成后顺带自动续期临期 cookie（≤ RENEW_BEFORE_DAYS 天，或签到返 401），
+	省去 30 天一次的手动续期；出问题按 notify_anyrouter_issues 的规则推送告警。
 	"""
 	import balance_server as bs
 
@@ -652,6 +740,7 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 			st['accounts'][name] = {'status': 'failed', 'message': 'WAF cookies 获取失败', 'time': ts}
 		add_anyrouter_checkin_log('WAF cookies 获取失败，签到中止')
 		_finish()
+		await notify_anyrouter_issues(st)
 		return
 
 	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
@@ -673,8 +762,9 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 
 	results = await asyncio.gather(*[_one(a) for a in accounts])
 	# 签到完成，顺带续期临期 cookie（限流中自动整轮跳过）
-	await _auto_renew_stale_cookies(accounts, results, waf_cookies)
+	renew_results = await _auto_renew_stale_cookies(accounts, results, waf_cookies)
 	_finish()
+	await notify_anyrouter_issues(st, results, renew_results)
 
 
 def start_anyrouter_checkin(trigger: str = 'manual') -> bool:

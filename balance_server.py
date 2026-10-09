@@ -1109,6 +1109,7 @@ from server.cookies import (
 	AccountItem,
 	_get_waf_cookies_if_needed,
 	_query_balance_impl,
+	_relogin_alerted,
 	_session_is_authenticated,
 	_sign_in_impl,
 	_waf_lock,
@@ -1122,6 +1123,7 @@ from server.cookies import (
 	checkin_with_token,
 	get_token_accounts,
 	get_waf_cookies,
+	notify_anyrouter_issues,
 	query,
 	query_balance,
 	query_balance_with_token,
@@ -1181,8 +1183,12 @@ from server.monitor import (
 	_collect_monitor_accounts,
 	_monitor_alert_key,
 	add_monitor_log,
+	load_alert_email,
 	monitor_loop,
 	monitor_state,
+	note_query_failure,
+	reset_query_failure,
+	send_alert,
 	send_alert_email,
 )
 from server.notify import (

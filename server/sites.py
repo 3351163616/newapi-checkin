@@ -467,14 +467,15 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 			site, f'{site.label} 签到结束：成功 {st["signed"]} · 今日已签 {st["already"]} · 失败 {st["failed"]}'
 		)
 		save_newapi_checkin_state(site)
-		# 失败推 webhook（默认关，设置页可开）——失败只在日志里等用户翻页发现不了
-		if st['failed'] > 0 and bs.notify_configured() and bs.get_notify_config()['on_checkin_failed']:
+		# 失败推送（默认关，设置页可开）——失败只在日志里等用户翻页发现不了。
+		# 走 send_alert：邮件按 saved_config 的 email 段默认发，webhook 配了才发；此前只管
+		# webhook，没配 webhook 的用户等于这条推送根本不存在（线上就是这么静默的）。
+		if st['failed'] > 0 and bs.get_notify_config()['on_checkin_failed']:
 			bad = [f'{name}：{v["message"][:60]}' for name, v in st['accounts'].items() if v['status'] == 'failed']
 
 			async def _push_failure():
-				r = await bs.send_webhook_notify(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
-				if not r.get('sent'):
-					add_newapi_checkin_log(site, f'失败通知推送未发送：{r.get("error", "")}')
+				r = await bs.send_alert(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
+				add_newapi_checkin_log(site, f'失败通知推送：{r}')
 
 			bs._spawn(_push_failure())
 

@@ -420,3 +420,35 @@ def test_探测自动补全裸域名https(sandbox, monkeypatch):
 	out = asyncio.run(bs.probe_site({'domain': 'tabitoken.com'}))
 	assert out['success'] is True, '不带 http 前缀的裸域名应该自动补全 https://'
 	assert out['info']['system_name'] == 'TaBiAI'
+
+
+def test_签到失败推送带邮件通道且受开关控制(sandbox, monkeypatch):
+	"""失败推送此前只管 webhook：没配 webhook 的用户等于这条推送不存在（线上就这么静默的）。
+	现在统一走 send_alert —— 邮件按 saved_config 的 email 段发，webhook 配了才发。"""
+	s = site()
+	bs.save_newapi_accounts(s, [bs.NewapiAccountItem(name='n1', access_token='t', user_id='1')])
+	_stub_signin(monkeypatch, {'1': FakeResponse(payload={'success': False, 'message': 'HTTP 401'})})
+	monkeypatch.setattr(bs, 'record_account_usage', lambda *a: None)
+	alerts = []
+
+	async def fake_send_alert(subject, body, webhook=True, email_cfg=None):
+		alerts.append({'subject': subject, 'body': body})
+		return '邮件已发'
+
+	def notify_cfg(on_checkin_failed):
+		return lambda: {'type': '', 'url': '', 'chat_id': '', 'on_alert': True, 'on_checkin_failed': on_checkin_failed}
+
+	monkeypatch.setattr(bs, 'send_alert', fake_send_alert)
+
+	async def run_once():
+		await bs.run_newapi_checkin(s, trigger='auto')
+		await asyncio.sleep(0.05)  # 推送是 _spawn 出去的后台任务，等它跑完
+
+	monkeypatch.setattr(bs, 'get_notify_config', notify_cfg(False))
+	asyncio.run(run_once())
+	assert alerts == [], '开关默认关，不推送'
+
+	monkeypatch.setattr(bs, 'get_notify_config', notify_cfg(True))
+	asyncio.run(run_once())
+	assert len(alerts) == 1, '开关打开后应推送一次'
+	assert '签到失败' in alerts[0]['subject'] and 'n1' in alerts[0]['body']
