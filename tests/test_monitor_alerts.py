@@ -9,6 +9,8 @@
 import asyncio
 import json
 
+import pytest
+
 import balance_server as bs
 import server.monitor as mon
 
@@ -117,3 +119,48 @@ def test_只发邮件时不动webhook(monkeypatch, tmp_path):
 	assert called == [], 'webhook=False 时不该推 webhook'
 	assert asyncio.run(mon.send_alert('t', 'b', webhook=True)) == '邮件已发、webhook 已发'
 	assert called == ['t']
+
+
+# ===== 邮件发送的偶发失败重试 =====
+
+
+def _email_cfg() -> mon.EmailConfig:
+	return mon.EmailConfig(smtp_server='smtp.x', smtp_port=465, email_user='u', email_pass='p', email_to='to@x')
+
+
+def test_邮件握手超时会重试一次(monkeypatch):
+	attempts = []
+
+	class FlakySMTP:
+		def __init__(self, *a, **kw):
+			attempts.append(1)
+			if len(attempts) == 1:
+				raise TimeoutError('The handshake operation timed out')
+
+		def __enter__(self):
+			return self
+
+		def __exit__(self, *a):
+			return False
+
+		def login(self, *a):
+			pass
+
+		def send_message(self, *a):
+			pass
+
+	monkeypatch.setattr(mon.smtplib, 'SMTP_SSL', FlakySMTP)
+	monkeypatch.setattr('time.sleep', lambda s: None)
+	mon.send_alert_email(_email_cfg(), '标题', '正文')
+	assert len(attempts) == 2, '首次握手超时应重试一次（免费邮箱会节制连接数）'
+
+
+def test_邮件一直失败最终仍抛出(monkeypatch):
+	class DeadSMTP:
+		def __init__(self, *a, **kw):
+			raise TimeoutError('connection refused')
+
+	monkeypatch.setattr(mon.smtplib, 'SMTP_SSL', DeadSMTP)
+	monkeypatch.setattr('time.sleep', lambda s: None)
+	with pytest.raises(TimeoutError):
+		mon.send_alert_email(_email_cfg(), '标题', '正文')

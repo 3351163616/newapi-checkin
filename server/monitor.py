@@ -79,17 +79,32 @@ def add_monitor_log(msg: str):
 	print(f'[MONITOR {ts}] {msg}')
 
 
-def send_alert_email(email_cfg: EmailConfig, subject: str, body: str):
-	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）"""
-	msg = MIMEText(body, 'plain', 'utf-8')
-	msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
-	msg['To'] = email_cfg.email_to
-	msg['Subject'] = subject
+def send_alert_email(email_cfg: EmailConfig, subject: str, body: str, retries: int = 2):
+	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）。
 
-	# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
-	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
-		server.login(email_cfg.email_user, email_cfg.email_pass)
-		server.send_message(msg)
+	连接类失败重试一次：2026-10-09 实测 QQ SMTP 在几分钟内连发几封后偶发
+	「SSL 握手超时」（直连测试 2~6 秒正常，属于免费邮箱的连接数节制），不重试就等于漏报。
+	"""
+	import time as _time
+
+	last: Exception | None = None
+	for attempt in range(retries):
+		try:
+			msg = MIMEText(body, 'plain', 'utf-8')
+			msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
+			msg['To'] = email_cfg.email_to
+			msg['Subject'] = subject
+
+			# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
+			with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
+				server.login(email_cfg.email_user, email_cfg.email_pass)
+				server.send_message(msg)
+			return
+		except (smtplib.SMTPException, OSError, TimeoutError) as e:  # SSLError/TimeoutError 都是 OSError 子类
+			last = e
+			if attempt < retries - 1:
+				_time.sleep(2)
+	raise last  # type: ignore[misc]
 
 
 def _monitor_alert_key(acc: dict) -> str:
