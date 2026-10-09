@@ -112,6 +112,35 @@ SITE_PATROL_FIRST_DELAY = 300  # 启动 5 分钟后首巡（避开启动高峰�
 SITE_PATROL_FAIL_LIMIT = 3
 
 
+# new-api /api/status 的特征键：任一存在即视为「站点活着」。
+# 不能只看 version —— 实测有站点返回 `"version": ""`（字段在、值为空），旧判据把这类站点
+# 全判成不可达，连续 SITE_PATROL_FAIL_LIMIT 轮后把它们的每日签到自动暂停了（2026-10-09 查实）。
+_NEWAPI_STATUS_KEYS = (
+	'version',
+	'system_name',
+	'announcements_enabled',
+	'checkin_enabled',
+	'HeaderNavModules',
+	'quota_per_unit',
+	'docs_link',
+)
+
+
+def _is_newapi_status(resp) -> bool:
+	"""站点 /api/status 的应答看起来是 new-api 吗（判可达用）。
+
+	返回 HTML（CDN 错误页、WAF 挑战页）时 JSON 解析失败，自然判为不可达；
+	是 JSON 且 data 里带任一特征键就算活着。
+	"""
+	if getattr(resp, 'status_code', None) != 200:
+		return False
+	try:
+		data = (resp.json() or {}).get('data')
+	except Exception:
+		return False
+	return isinstance(data, dict) and any(k in data for k in _NEWAPI_STATUS_KEYS)
+
+
 async def run_site_patrol() -> None:
 	"""巡检一轮全部站点，更新三态状态并在持续失联时自动暂停签到"""
 	import balance_server as bs
@@ -122,12 +151,7 @@ async def run_site_patrol() -> None:
 	for s in sites:
 		try:
 			resp = await bs.newapi_request(s, 'GET', s.status_path, {'User-Agent': bs.USER_AGENT})
-			ok = resp.status_code == 200
-			if ok:
-				try:
-					ok = bool((resp.json() or {}).get('data', {}).get('version'))
-				except Exception:
-					ok = False
+			ok = _is_newapi_status(resp)
 		except Exception:
 			ok = False
 
