@@ -698,6 +698,47 @@ async def notify_anyrouter_issues(st: dict, checkin_results: list | None = None,
 	add_anyrouter_checkin_log(f'失败通知推送：{res}')
 
 
+# 独立续期调度：启动后先等这么久再跑第一轮（避开启动补签的请求高峰），之后每 24h 一轮
+RENEW_SCHEDULER_FIRST_DELAY = 600
+RENEW_SCHEDULER_INTERVAL = 86400
+
+
+async def renew_stale_sessions() -> list:
+	"""独立跑一轮 session 续期，不依赖签到流程。
+
+	续期原本只在签到流程末尾顺带做，而签到撞上站点限流会**整轮跳过** —— 连续几天被限流，
+	15 天窗口也可能整个错过，窗口一过就只能人工重新登录（2026-10 的 126296 就这么掉的）。
+	单独排一轮：只处理临期/已失效账号，健康的账号零请求，对 ESA 限流毫无压力。
+	"""
+	import balance_server as bs
+
+	if not bs.checkin_settings.get('anyrouter_auto'):
+		return []  # 用户关掉了 anyrouter 自动签到，就不该再去碰它的接口
+	accounts = load_cookie_accounts()
+	if not accounts:
+		return []
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies:
+		print('[ANYROUTER] 定时续期跳过：WAF cookies 获取失败')
+		return []
+	results = await _auto_renew_stale_cookies(accounts, [], waf_cookies)
+	if results:
+		# 只走告警通道：这里没有"签到失败"可言，静默失效才是要报的
+		await notify_anyrouter_issues({'accounts': {}}, [], results)
+	return results
+
+
+async def daily_cookie_renew_scheduler():
+	"""每日独立续期调度器（与签到/快照/巡检调度器互不依赖）"""
+	await asyncio.sleep(RENEW_SCHEDULER_FIRST_DELAY)
+	while True:
+		try:
+			await renew_stale_sessions()
+		except Exception as e:
+			print(f'[ANYROUTER] 定时续期出错（下一轮继续）: {e}')
+		await asyncio.sleep(RENEW_SCHEDULER_INTERVAL)
+
+
 async def run_anyrouter_checkin(trigger: str = 'manual'):
 	"""执行签到：cookie 账号并发签到（Semaphore 取 ANYROUTER_CONCURRENCY），数秒内完成。
 

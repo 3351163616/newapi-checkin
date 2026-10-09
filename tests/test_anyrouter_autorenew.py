@@ -265,3 +265,70 @@ def test_告警日志在落盘前写入(monkeypatch):
         on_save=lambda s: saved.extend(rec['message'] for rec in s['logs']),
     )
     assert any('登录失效告警' in m for m in saved), '落盘时告警行就该已经在了'
+
+
+# ===== 独立每日续期（不依赖签到流程）=====
+
+
+def _stub_standalone_renew(monkeypatch, accounts, expiry_map, renew_result=None, waf=('acw_tc',), settings=None):
+    """给 renew_stale_sessions 搭替身，返回 calls。"""
+    calls = {'renew': [], 'updates': {}, 'alerts': []}
+
+    async def fake_send_alert(subject, body, webhook=True, email_cfg=None):
+        calls['alerts'].append({'subject': subject, 'body': body})
+        return '邮件已发'
+
+    async def fake_waf():
+        return {k: 'x' for k in waf} if waf else None
+
+    async def fake_renew(account, wafc):
+        calls['renew'].append(account.name)
+        if renew_result is not None:
+            return {**renew_result, 'name': account.name}
+        return {'name': account.name, 'success': True, 'message': '续期成功', 'new_session': f'NEW-{account.name}'}
+
+    monkeypatch.setattr(ck, 'load_cookie_accounts', lambda: accounts)
+    monkeypatch.setattr(ck, 'save_renewed_sessions', lambda u: calls['updates'].update(u))
+    monkeypatch.setattr(bs, '_get_waf_cookies_if_needed', fake_waf)
+    monkeypatch.setattr(bs, 'renew_one_cookie', fake_renew)
+    monkeypatch.setattr(bs, '_session_expiry_info', lambda s: expiry_map.get(s, {'expires_at': 'x', 'days_left': 30.0}))
+    monkeypatch.setattr(bs, 'send_alert', fake_send_alert)
+    monkeypatch.setattr(bs, 'get_notify_config', lambda: {'type': '', 'url': '', 'chat_id': '', 'on_alert': True, 'on_checkin_failed': False})
+    monkeypatch.setattr(bs, 'checkin_settings', settings if settings is not None else {'anyrouter_auto': True})
+    return calls
+
+
+def test_独立续期只处理临期账号(monkeypatch):
+    calls = _stub_standalone_renew(
+        monkeypatch,
+        [acc('a', 'A'), acc('b', 'B')],
+        {'A': {'expires_at': 'x', 'days_left': 2.0}, 'B': {'expires_at': 'x', 'days_left': 29.0}},
+    )
+    asyncio.run(ck.renew_stale_sessions())
+    assert calls['renew'] == ['a'], '健康的账号一个请求都不该发'
+    assert calls['updates'] == {'a': 'NEW-a'}
+
+
+def test_独立续期在失效时也发告警(monkeypatch):
+    calls = _stub_standalone_renew(
+        monkeypatch,
+        [acc('a', 'A')],
+        {'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+    )
+    asyncio.run(ck.renew_stale_sessions())
+    assert len(calls['alerts']) == 1 and '登录已失效' in calls['alerts'][0]['subject']
+
+
+def test_关掉anyrouter自动签到后不再续期(monkeypatch):
+    calls = _stub_standalone_renew(
+        monkeypatch, [acc('a', 'A')], {'A': {'expires_at': 'x', 'days_left': 1.0}}, settings={'anyrouter_auto': False}
+    )
+    asyncio.run(ck.renew_stale_sessions())
+    assert calls['renew'] == [], '用户关掉了自动签到，就不该再去碰它的接口'
+
+
+def test_独立续期WAF拿不到时不发请求(monkeypatch):
+    calls = _stub_standalone_renew(monkeypatch, [acc('a', 'A')], {'A': {'expires_at': 'x', 'days_left': 1.0}}, waf=())
+    asyncio.run(ck.renew_stale_sessions())
+    assert calls['renew'] == []

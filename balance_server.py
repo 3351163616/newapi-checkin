@@ -978,6 +978,11 @@ async def startup_event():
 	_spawn(site_patrol_scheduler())
 	print('[PATROL] 站点健康巡检调度器已启动')
 
+	# AnyRouter session 独立续期（每天一轮）：签到撞限流会整轮跳过续期，这条独立于签到流程，
+	# 保证 15 天窗口内总有一次续期成功，session 就不会掉到需要人工重新登录
+	_spawn(daily_cookie_renew_scheduler())
+	print('[ANYROUTER] session 每日独立续期调度器已启动')
+
 
 # 三个 /api/usage/* 端点已迁至 server/usage.py（usage_router 已在上面 include）
 
@@ -1121,6 +1126,7 @@ from server.cookies import (
 	anyrouter_renew,
 	checkin,
 	checkin_with_token,
+	daily_cookie_renew_scheduler,
 	get_token_accounts,
 	get_waf_cookies,
 	notify_anyrouter_issues,
@@ -1129,6 +1135,7 @@ from server.cookies import (
 	query_balance_with_token,
 	query_with_token,
 	renew_one_cookie,
+	renew_stale_sessions,
 	run_anyrouter_checkin,
 	save_anyrouter_checkin_state,
 	save_renewed_sessions,
