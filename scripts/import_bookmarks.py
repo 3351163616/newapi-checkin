@@ -91,9 +91,9 @@ def main() -> int:
     if not args.probe:
         return 0
 
-    import httpx  # noqa: F401  # 不引入依赖，用 urllib
-
     from urllib import request
+
+    import httpx  # noqa: F401  # 不引入依赖，用 urllib
 
     for c in cands:
         try:

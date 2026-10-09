@@ -1,6 +1,6 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Coins, Filter, Globe2, Layers, Loader2, Plus, Search, Sparkles, Trash2, Users } from "lucide-react";
+import { Coins, Filter, Globe2, Layers, Loader2, Pencil, Plus, Search, Sparkles, Trash2, Users } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -20,7 +20,6 @@ import { SortableTableHead } from "@/shared/components/sortable-table-head";
 import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { siteDotClass } from "@/shared/lib/site-color";
 import { cn } from "@/shared/lib/cn";
-import type { AccountRef } from "@/shared/lib/account-ref";
 import type { QueryResult, QueryResultSuccess, SiteAccount } from "@/types";
 
 import {
@@ -113,7 +112,9 @@ export function AccountsPage() {
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [balances, setBalances] = useState<Record<string, QueryResult>>({});
   const [form, setForm] = useState<FormState | null>(null);
-  const [editingRef, setEditingRef] = useState<AccountRef | null>(null);
+  // 正在编辑的账号身份：进入编辑时记下，保存时按它把旧条目摘掉再写入新值
+  // （只 push 会留下两条同 id 的重复账号；改名了也得能摘到旧的，所以记身份而不是下标）
+  const [editing, setEditing] = useState<{ kind: Kind; name: string; identifier: string; siteId: string } | null>(null);
 
   const sitesQ = useQuery({ queryKey: ["accounts", "sites"], queryFn: fetchSites });
   const cookieQ = useQuery({ queryKey: ["accounts", "cookie"], queryFn: fetchSavedConfig });
@@ -209,7 +210,7 @@ export function AccountsPage() {
     const val = (r: AccountRow) => {
       if (sortBy === "quota") {
         const b = bal(r);
-        return b?.success ? (b as QueryResultSuccess).quota - (b as QueryResultSuccess).used : -1;
+        return b?.success ? (b as QueryResultSuccess).quota : -1;
       }
       if (sortBy === "used") {
         const b = bal(r);
@@ -379,6 +380,19 @@ export function AccountsPage() {
       login: [...buckets.login],
       site: copySiteBuckets(),
     };
+    // 编辑：先按进入编辑时记下的身份把旧条目摘掉，再 push 新值。
+    // 只 push 的话同 id 会留下两条；按身份（而不是下标）摘，改名也能摘到旧的。
+    if (editing) {
+      if (editing.kind === "cookie") {
+        next.cookie = next.cookie.filter((a) => !(a.name === editing.name && a.api_user === editing.identifier));
+      } else if (editing.kind === "token") {
+        next.token = next.token.filter((a) => !(a.name === editing.name && a.user_id === editing.identifier));
+      } else if (editing.kind === "login") {
+        next.login = next.login.filter((a) => a.name !== editing.name);
+      } else {
+        next.site[editing.siteId] = (next.site[editing.siteId] ?? []).filter((a) => a.name !== editing.name);
+      }
+    }
     const make: Record<Kind, () => void> = {
       token: () => next.token.push({ name: form.name, access_token: form.accessToken, user_id: form.userId, provider: "provider" }),
       cookie: () => next.cookie.push({ name: form.name, cookies: { session: form.session }, api_user: form.apiUser }),
@@ -386,14 +400,40 @@ export function AccountsPage() {
       site: () => (next.site[form.siteId] ??= []).push({ name: form.name, access_token: form.accessToken, user_id: form.userId }),
     };
     make[form.kind]();
-    void persist(next, [form.kind]).then(
+    // 改了类型（比如 cookie → token）时两个桶都动了，两个都要落盘
+    const kinds: Kind[] = editing && editing.kind !== form.kind ? [form.kind, editing.kind] : [form.kind];
+    void persist(next, kinds).then(
       () => {
-        toast.success(`已${editingRef ? "更新" : "添加"}账号 ${form.name}`);
+        toast.success(`已${editing ? "更新" : "添加"}账号 ${form.name}`);
         setForm(null);
-        setEditingRef(null);
+        setEditing(null);
       },
       (err) => toast.error(errorMessage(err, "保存失败")),
     );
+  }
+
+  /** 把某一行读进表单做编辑：cookie/token/站点账号的凭据都能回填，登录账号的密码不回传只能重填 */
+  function onEditRow(row: AccountRow) {
+    const [group, second, third] = row.ref.split(":");
+    const kind: Kind = group === "cookie" ? "cookie" : group === "token" ? "token" : group === "login" ? "login" : "site";
+    const siteId = kind === "site" ? second : "";
+    const index = Number(kind === "site" ? third : second);
+    if (kind === "cookie") {
+      const a = buckets.cookie[index];
+      if (!a) return;
+      setForm({ ...emptyForm, kind, name: a.name, session: a.cookies?.session ?? "", apiUser: a.api_user });
+    } else if (kind === "token") {
+      const a = buckets.token[index];
+      if (!a) return;
+      setForm({ ...emptyForm, kind, name: a.name, accessToken: a.access_token, userId: a.user_id });
+    } else if (kind === "login") {
+      setForm({ ...emptyForm, kind, name: row.name, username: row.identifier });
+    } else {
+      const a = (buckets.site[siteId] ?? [])[index];
+      if (!a) return;
+      setForm({ ...emptyForm, kind, siteId, name: a.name, accessToken: a.access_token, userId: a.user_id });
+    }
+    setEditing({ kind, name: row.name, identifier: row.identifier, siteId });
   }
 
   function onDeleteRow(row: AccountRow) {
@@ -419,7 +459,7 @@ export function AccountsPage() {
 
   const queried = Object.values(balances);
   const totalBalance = queried
-    .map((r) => (r.success ? r.quota - r.used : 0))
+    .map((r) => (r.success ? r.quota : 0))
     .reduce((a, b) => a + b, 0);
   const totalToday = rows
     .map((row) => computeTodayUsed(balances[`${row.keyPrefix}:${row.name}`]?.success ? balances[`${row.keyPrefix}:${row.name}`] : undefined, baselineQ.data?.baseline[`${row.keyPrefix}:${row.name}`]))
@@ -443,7 +483,7 @@ export function AccountsPage() {
               variant="secondary"
               onClick={() => {
                 setForm({ ...emptyForm, siteId: sites[0]?.id ?? "" });
-                setEditingRef(null);
+                setEditing(null);
               }}
             >
               <Plus className="size-4" aria-hidden="true" />
@@ -604,7 +644,7 @@ export function AccountsPage() {
                         </Badge>
                       </TableCell>
                       <TableCell className={cn("text-right font-data text-xs", result?.success === false && "text-checkin-failed")}>
-                        {result ? (result.success ? formatMoney(result.quota - result.used) : "失败") : "--"}
+                        {result ? (result.success ? formatMoney(result.quota) : "失败") : "--"}
                       </TableCell>
                       <TableCell className="text-right font-data text-xs">{result?.success ? formatMoney(result.used) : "--"}</TableCell>
                       <TableCell className="text-right font-data text-xs">{today === null ? "--" : formatMoney(today)}</TableCell>
@@ -612,6 +652,9 @@ export function AccountsPage() {
                         {row.cookieExpiry ? <span className={expiryTextClass[row.cookieExpiry.level]}>{row.cookieExpiry.label}</span> : "--"}
                       </TableCell>
                       <TableCell className="text-right">
+                        <Button variant="ghost" size="icon" className="size-7" onClick={() => onEditRow(row)} aria-label={`编辑 ${row.name}`}>
+                          <Pencil className="size-3.5" aria-hidden="true" />
+                        </Button>
                         <Button variant="ghost" size="icon" className="size-7" onClick={() => onDeleteRow(row)} aria-label={`删除 ${row.name}`}>
                           <Trash2 className="size-3.5" aria-hidden="true" />
                         </Button>
@@ -633,7 +676,7 @@ export function AccountsPage() {
                       size="sm"
                       onClick={() => {
                         setForm({ ...emptyForm, siteId: sites[0]?.id ?? "" });
-                        setEditingRef(null);
+                        setEditing(null);
                       }}
                     >
                       <Plus className="size-3.5" aria-hidden="true" />
@@ -666,7 +709,7 @@ export function AccountsPage() {
       {form ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
           <form onSubmit={onSubmitForm} className="w-full max-w-md animate-in fade-in zoom-in-95 space-y-4 rounded-lg border bg-card p-5">
-            <h2 className="text-sm font-medium">{editingRef ? "编辑账号" : "添加账号"}</h2>
+            <h2 className="text-sm font-medium">{editing ? "编辑账号" : "添加账号"}</h2>
             <Tabs
               value={form.kind}
               onValueChange={(v) => {

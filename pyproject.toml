@@ -8,6 +8,7 @@ dependencies = [
   "fastapi>=0.110.0",
   "uvicorn>=0.27.0",
   "curl-cffi>=0.15.0",
+  "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]
@@ -17,7 +18,8 @@ dev = [
   "pytest-cov>=4.1.0",
   "python-dotenv>=1.0.0",
   "ruff>=0.1.0",
-  "pre-commit>=3.0.0"
+  "pre-commit>=3.0.0",
+  "httpx>=0.28.1",
 ]
 
 [tool.pytest.ini_options]
@@ -32,6 +34,12 @@ fix = true
 select = ["ASYNC", "E", "F", "FAST", "I", "PLE"]
 ignore = ["ASYNC109", "ASYNC230", "E101", "E402", "E501", "F841", "E731"]
 unfixable = ["E101", "E402", "E501", "F841", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+# balance_server 是应用装配壳 + bs.<名字> 兼容再导出 hub：大量 import 仅供域模块跨域晚绑定
+# 与测试经 bs.X 转发，本文件不直接引用，对 ruff 逐文件分析呈现为「未用导入」。关闭 F401，
+# 以免 ruff（fix=true）把这些再导出整片误删（曾致域模块 bs.X 全线 AttributeError、90 测试挂）。
+"balance_server.py" = ["F401"]
 
 [tool.ruff.format]
 quote-style = "single"

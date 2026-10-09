@@ -15,9 +15,10 @@ import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
+from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel
-from fastapi import APIRouter
 
 sites_router = APIRouter()
 
@@ -58,6 +59,7 @@ class NewapiSite(BaseModel):
 	quota_per_unit: int = NEWAPI_DEFAULTS['quota_per_unit']
 	concurrency: int = NEWAPI_DEFAULTS['concurrency']
 	auto_checkin: bool = True
+	use_proxy: bool = True  # False = 直连；站点在 Cloudflare 后直连 403 时应保持 True
 	accounts_file: str = ''
 	state_file: str = ''
 
@@ -110,6 +112,35 @@ SITE_PATROL_FIRST_DELAY = 300  # 启动 5 分钟后首巡（避开启动高峰�
 SITE_PATROL_FAIL_LIMIT = 3
 
 
+# new-api /api/status 的特征键：任一存在即视为「站点活着」。
+# 不能只看 version —— 实测有站点返回 `"version": ""`（字段在、值为空），旧判据把这类站点
+# 全判成不可达，连续 SITE_PATROL_FAIL_LIMIT 轮后把它们的每日签到自动暂停了（2026-10-09 查实）。
+_NEWAPI_STATUS_KEYS = (
+	'version',
+	'system_name',
+	'announcements_enabled',
+	'checkin_enabled',
+	'HeaderNavModules',
+	'quota_per_unit',
+	'docs_link',
+)
+
+
+def _is_newapi_status(resp) -> bool:
+	"""站点 /api/status 的应答看起来是 new-api 吗（判可达用）。
+
+	返回 HTML（CDN 错误页、WAF 挑战页）时 JSON 解析失败，自然判为不可达；
+	是 JSON 且 data 里带任一特征键就算活着。
+	"""
+	if getattr(resp, 'status_code', None) != 200:
+		return False
+	try:
+		data = (resp.json() or {}).get('data')
+	except Exception:
+		return False
+	return isinstance(data, dict) and any(k in data for k in _NEWAPI_STATUS_KEYS)
+
+
 async def run_site_patrol() -> None:
 	"""巡检一轮全部站点，更新三态状态并在持续失联时自动暂停签到"""
 	import balance_server as bs
@@ -120,12 +151,7 @@ async def run_site_patrol() -> None:
 	for s in sites:
 		try:
 			resp = await bs.newapi_request(s, 'GET', s.status_path, {'User-Agent': bs.USER_AGENT})
-			ok = resp.status_code == 200
-			if ok:
-				try:
-					ok = bool((resp.json() or {}).get('data', {}).get('version'))
-				except Exception:
-					ok = False
+			ok = _is_newapi_status(resp)
 		except Exception:
 			ok = False
 
@@ -196,7 +222,8 @@ def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
 
 
 async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None, _auto_bypass: bool = True):
-	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
+	"""向 new-api 站点发请求。use_proxy=True（默认）走本地代理出口（_PROXY，可用 HTTPS_PROXY 覆盖），
+	直连被 Cloudflare 拦 403 的站点保持走代理；use_proxy=False 则直连。仍带 Chrome 指纹更稳。
 
 	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
 
@@ -207,6 +234,9 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 	import balance_server as bs
 
 	url = site.domain + path
+	proxies = {'https': bs._PROXY, 'http': bs._PROXY} if site.use_proxy else None
+	# 缓存键带上代理模式：Session 创建时就把 proxies 定死了，切换开关后必须换新 Session 才生效
+	sess_key = f'newapi:{site.id}:{"proxy" if site.use_proxy else "direct"}'
 	prot = bs.protection_cache.get(site.domain.rstrip('/'))
 	if prot and (prot.get('failed') or prot['expires'] <= time.time()):
 		prot = None  # 负缓存/过期条目对请求方不可见；负缓存的拦截图在 ensure 里做
@@ -215,10 +245,10 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 		send_headers['User-Agent'] = prot['user_agent']
 
 	def _do():
-		sess = bs._get_cffi_session(f'newapi:{site.id}')
+		sess = bs._get_cffi_session(sess_key, proxies)
 		if prot:
 			sess.cookies.update(prot['cookies'])
-		return sess.request(method.upper(), url, headers=send_headers, json=json_body)
+		return sess.request(method.upper(), url, headers=send_headers, json=json_body, proxies=proxies)
 
 	loop = asyncio.get_running_loop()
 	resp = await loop.run_in_executor(bs._UPSTREAM_POOL, _do)
@@ -246,9 +276,9 @@ async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, head
 	（取全量 key 的 batch/keys，20 次/20 分钟/IP）才借 mihomo 换出口。这里每次都新建连接，
 	不存在 keep-alive 隧道钉死旧出口的问题（agentrouter 轮换踩过的坑）。
 	"""
-	import balance_server as bs
-
 	from curl_cffi import requests as cffi_requests
+
+	import balance_server as bs
 
 	url = site.domain + path
 	proxies = {'https': bs._LOCAL_PROXY, 'http': bs._LOCAL_PROXY}
@@ -336,9 +366,9 @@ async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile
 	站点开着 Turnstile 且没传 token 时，接口会返回「Turnstile token 为空」——
 	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要先过人机校验。
 	"""
-	import balance_server as bs
-
 	from urllib.parse import quote
+
+	import balance_server as bs
 
 	headers = _newapi_headers(site, account)
 	path = site.sign_in_path + (f'?turnstile={quote(turnstile_token, safe="")}' if turnstile_token else '')
@@ -461,14 +491,15 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 			site, f'{site.label} 签到结束：成功 {st["signed"]} · 今日已签 {st["already"]} · 失败 {st["failed"]}'
 		)
 		save_newapi_checkin_state(site)
-		# 失败推 webhook（默认关，设置页可开）——失败只在日志里等用户翻页发现不了
-		if st['failed'] > 0 and bs.notify_configured() and bs.get_notify_config()['on_checkin_failed']:
+		# 失败推送（默认关，设置页可开）——失败只在日志里等用户翻页发现不了。
+		# 走 send_alert：邮件按 saved_config 的 email 段默认发，webhook 配了才发；此前只管
+		# webhook，没配 webhook 的用户等于这条推送根本不存在（线上就是这么静默的）。
+		if st['failed'] > 0 and bs.get_notify_config()['on_checkin_failed']:
 			bad = [f'{name}：{v["message"][:60]}' for name, v in st['accounts'].items() if v['status'] == 'failed']
 
 			async def _push_failure():
-				r = await bs.send_webhook_notify(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
-				if not r.get('sent'):
-					add_newapi_checkin_log(site, f'失败通知推送未发送：{r.get("error", "")}')
+				r = await bs.send_alert(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
+				add_newapi_checkin_log(site, f'失败通知推送：{r}')
 
 			bs._spawn(_push_failure())
 
@@ -623,7 +654,7 @@ async def save_sites(req: dict):
 			if not s.id.replace('_', '').replace('-', '').isalnum():
 				return {'success': False, 'error': f'站点 id 只能用字母数字与 -_：{s.id}'}
 			if not s.domain.startswith('http'):
-				return {'success': False, 'error': f'域名要带 http(s)://：{s.domain}'}
+				s.domain = f'https://{s.domain}'
 			s.domain = s.domain.rstrip('/')
 		bs.save_newapi_sites(validated)
 		return {'success': True, 'sites': [s.model_dump() for s in validated]}
@@ -642,7 +673,7 @@ async def probe_site(req: dict):
 	"""
 	domain = (req.get('domain') or '').strip().rstrip('/')
 	if not domain.startswith('http'):
-		return {'success': False, 'error': '域名要带 http(s)://'}
+		domain = f'https://{domain}'
 	probe = bs.NewapiSite(id='__probe__', label='probe', domain=domain)
 	try:
 		resp = await bs.newapi_request(probe, 'GET', probe.status_path, {'User-Agent': bs.USER_AGENT})
@@ -712,7 +743,7 @@ async def query_site(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 
 	async def _limited(a):
 		async with sem:
@@ -807,7 +838,7 @@ async def site_checkin_sync(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 	results: dict = {}
 
 	async def _one(acc: bs.NewapiAccountItem):
@@ -878,7 +909,7 @@ async def site_checkin_info_all(site_id: str):
 	if not accounts:
 		return {'success': False, 'error': f'没有 {site.label} 账号'}
 
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	sem = asyncio.Semaphore(site.concurrency or bs.NEWAPI_CONCURRENCY)
 
 	async def _limited(a):
 		async with sem:
@@ -888,3 +919,52 @@ async def site_checkin_info_all(site_id: str):
 	return {'success': True, 'accounts': results}
 
 
+@sites_router.post('/api/sites/import-hub')
+async def import_hub(files: Annotated[list[UploadFile], File()], apply: bool = False):
+	"""从上传的 All API Hub 插件 LevelDB 文件导入站点与账号。
+
+	前端用 webkitdirectory 选 `Local Extension Settings` 目录上传全部文件；解析按
+	内容特征（account-<uuid>）提取，选错目录时无关文件解析不出账号，天然安全。
+	apply=false 只返回变更预览（dry-run）；true 时按 merge_import 语义落盘
+	（新站点追加注册表、已有站点按 user_id upsert，保留开关与非 hub 站点）。
+	"""
+	import balance_server as bs
+	from server.hub import build_hub, extract_objects, merge_import
+
+	parts: list[str] = []
+	total = 0
+	for f in files:
+		name = (f.filename or '').lower()
+		if not name.endswith(('.log', '.ldb')):
+			continue
+		chunk = (await f.read()).decode('utf-8', errors='replace')
+		total += len(chunk)
+		if len(chunk) > 20 * 1024 * 1024 or total > 200 * 1024 * 1024:
+			return {'success': False, 'error': '文件过大（单文件 20MB / 总量 200MB 上限），请只选 Local Extension Settings 目录'}
+		parts.append(chunk)
+	if not parts:
+		return {'success': False, 'error': '没有 .log/.ldb 文件——请选择浏览器的 Local Extension Settings 目录'}
+
+	objs = extract_objects('\n'.join(parts))
+	if not objs:
+		return {'success': False, 'error': '未从上传数据中识别出 All API Hub 账号（选错目录或插件无数据）'}
+	hub, skipped_empty = build_hub(objs)
+	root = bs.NEWAPI_SITES_FILE.parent  # 注册表所在目录即数据根（测试改写此常量即可全链路隔离）
+	result = merge_import(hub, root, dry_run=not apply)
+	preview = []
+	for sid, accs in sorted(hub.items()):
+		preview.append({
+			'site_id': sid,
+			'label': next(iter(accs.values()))['label'],
+			'domain': next(iter(accs.values()))['domain'],
+			'accounts': [{'name': a['name'], 'user_id': uid} for uid, a in accs.items()],
+		})
+	return {
+		'success': True,
+		'applied': apply,
+		'sites_in_upload': len(hub),
+		'accounts_in_upload': sum(len(a) for a in hub.values()),
+		'skipped_empty': skipped_empty,
+		'preview': preview,
+		**result,
+	}

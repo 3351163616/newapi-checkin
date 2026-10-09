@@ -1,0 +1,15 @@
+# 统一行尾为 LF，杜绝 CRLF/LF 混用导致的「整文件幻影 diff」
+# （本仓库以 WSL/Linux 为准；曾出现前端 10 文件被重存为 CRLF、5848 行零内容改动的噪声）
+* text=auto eol=lf
+
+# 二进制资源不做行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.tar.gz binary

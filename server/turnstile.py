@@ -127,7 +127,7 @@ async def _solve_turnstile_token_raw(cfg: dict, site_key: str, page_url: str, ti
 
 
 # ── 打码用量统计：按天计数（次数 = 费用），跨重启持久化到 solver_stats.json ──
-# 路径常量 SOLVER_STATS_FILE 过渡期留在 balance_server（块E 随 config 一并收口）
+# 路径常量在 server/config.py（SOLVER_STATS_FILE，bs 再导出）；测试改写 bs.SOLVER_STATS_FILE。
 
 
 def _solver_stats() -> dict:

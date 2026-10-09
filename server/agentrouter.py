@@ -15,8 +15,8 @@ import time
 from collections import deque
 from datetime import datetime
 
-from pydantic import BaseModel
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 agentrouter_router = APIRouter()
 
@@ -574,7 +574,7 @@ async def save_login_accounts(req: dict):
 	try:
 		raw_accounts = req.get('accounts', [])
 		validated = [LoginAccountItem(**acc) for acc in raw_accounts]
-		bs._atomic_write_json(AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
+		bs._atomic_write_json(bs.AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
 		return {'success': True}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
 import { EmptyState, ErrorState, LoadingState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
 import { apiGet, apiPost } from "@/shared/api/client";
@@ -125,7 +126,7 @@ export function SitesPage() {
     }
     setAdding(true);
     try {
-      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim().replace(/^https?:\/\//, "") };
+      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim() };
       await apiPost<SitesResponse>("/sites", { sites: [...sites, input] });
       // 本页缓存键是 ["sites", ...]，其他页面的站点列表在 ["accounts","sites"]，两处都要失效
       await queryClient.invalidateQueries({ queryKey: ["sites"] });
@@ -151,6 +152,17 @@ export function SitesPage() {
       toast.success(`已移除 ${site.label}（账号数据已保留）`);
     } catch (err) {
       toast.error(errorMessage(err, "删除失败"));
+    }
+  }
+
+  async function onToggleProxy(site: NewapiSite, useProxy: boolean) {
+    const updated = sites.map((s) => (s.id === site.id ? { ...s, use_proxy: useProxy } : s));
+    try {
+      await apiPost<SitesResponse>("/sites", { sites: updated });
+      await queryClient.invalidateQueries({ queryKey: ["sites"] });
+      toast.success(useProxy ? `${site.label} 已改为走本地代理` : `${site.label} 已改为直连`);
+    } catch (err) {
+      toast.error(errorMessage(err, "保存失败"));
     }
   }
 
@@ -181,7 +193,7 @@ export function SitesPage() {
           </div>
           <div className="space-y-1">
             <Label htmlFor="site-domain" className="text-xs">域名</Label>
-            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="https://gorouter.app" />
+            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="kktoken.cc 或 https://gorouter.app" />
           </div>
           <div className="flex items-end gap-2">
             <Button type="button" variant="secondary" onClick={() => void onProbe()} disabled={probing}>
@@ -220,7 +232,14 @@ export function SitesPage() {
       ) : (
         <div className="grid gap-2 sm:grid-cols-2">
           {sites.map((site, i) => (
-            <SiteCard key={site.id} site={site} count={counts?.[site.id] ?? 0} index={i} onDelete={() => void onDelete(site)} />
+            <SiteCard
+              key={site.id}
+              site={site}
+              count={counts?.[site.id] ?? 0}
+              index={i}
+              onDelete={() => void onDelete(site)}
+              onToggleProxy={(useProxy) => void onToggleProxy(site, useProxy)}
+            />
           ))}
         </div>
       )}
@@ -271,7 +290,7 @@ export function SitesPage() {
   );
 }
 
-function SiteCard({ site, count, index, onDelete }: { site: NewapiSite; count: number; index: number; onDelete: () => void }) {
+function SiteCard({ site, count, index, onDelete, onToggleProxy }: { site: NewapiSite; count: number; index: number; onDelete: () => void; onToggleProxy: (useProxy: boolean) => void }) {
   const turnstileQ = useQuery({
     queryKey: ["checkin", "site-turnstile", site.id],
     queryFn: () => getSiteTurnstile(site.id),
@@ -319,6 +338,12 @@ function SiteCard({ site, count, index, onDelete }: { site: NewapiSite; count: n
         ) : null}
         <Badge variant="outline" className="text-[11px] text-muted-foreground">${site.quota_per_unit}/配额单位</Badge>
       </div>
+      <label className="mt-3 flex cursor-pointer items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 hover:bg-muted/50">
+        <span className="text-xs text-muted-foreground" title="开启后经本地代理（HTTPS_PROXY，默认 127.0.0.1:7890）访问该站点；直连被 Cloudflare 拦 403 的站点应保持开启">
+          走本地代理
+        </span>
+        <Switch checked={site.use_proxy ?? true} onCheckedChange={onToggleProxy} aria-label={`${site.label} 走本地代理`} />
+      </label>
       <p className="mt-2 text-[11px] text-muted-foreground">签到路径 <span className="font-data">{site.sign_in_path || "/api/user/checkin"}</span></p>
     </section>
   );

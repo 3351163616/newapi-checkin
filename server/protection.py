@@ -89,16 +89,18 @@ async def solve_aliyun_waf(domain: str) -> dict | None:
 	def _do():
 		from curl_cffi import requests as cffi_requests
 
-		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
-		resp = sess.get(domain + '/', headers={'User-Agent': bs.USER_AGENT})
-		m = _WAF_CHALLENGE_RE.search(resp.text or '')
-		if not m:
-			return None
-		cookies = {}
-		for name in _ALIYUN_WAF_COOKIE_NAMES:
-			val = sess.cookies.get(name)
-			if val:
-				cookies[name] = val
+		# 一次性 Session 一律 with 收尾：不显式 close 就得等引用计数/GC 回收 curl 句柄，
+		# 异常路径上被 traceback 挂住时回收不了，白占 fd（with 退出后 Response 照常可读）
+		with cffi_requests.Session(impersonate='chrome131', timeout=30) as sess:
+			resp = sess.get(domain + '/', headers={'User-Agent': bs.USER_AGENT})
+			m = _WAF_CHALLENGE_RE.search(resp.text or '')
+			if not m:
+				return None
+			cookies = {}
+			for name in _ALIYUN_WAF_COOKIE_NAMES:
+				val = sess.cookies.get(name)
+				if val:
+					cookies[name] = val
 		cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
 		return {'cookies': cookies, 'user_agent': None}
 
@@ -190,8 +192,8 @@ async def probe_page_protection(domain: str) -> dict:
 	def _do():
 		from curl_cffi import requests as cffi_requests
 
-		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
-		return sess.get(domain + '/', headers={'User-Agent': bs.USER_AGENT})
+		with cffi_requests.Session(impersonate='chrome131', timeout=30) as sess:
+			return sess.get(domain + '/', headers={'User-Agent': bs.USER_AGENT})
 
 	loop = asyncio.get_running_loop()
 	try:

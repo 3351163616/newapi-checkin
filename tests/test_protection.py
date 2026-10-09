@@ -66,8 +66,8 @@ class FakeSession:
 		self.requests = []
 		self.cookies = FakeCookieJar()
 
-	def request(self, method, url, headers=None, json=None):
-		self.requests.append({'method': method, 'url': url, 'headers': dict(headers or {})})
+	def request(self, method, url, headers=None, json=None, proxies=None):
+		self.requests.append({'method': method, 'url': url, 'headers': dict(headers or {}), 'proxies': proxies})
 		if len(self.script) > 1:
 			return self.script.pop(0)
 		return self.script[0]
@@ -91,8 +91,10 @@ def env(tmp_path, monkeypatch, config_file):
 	flare_sessions = []
 	site_script = []
 	flare_script = []
+	keys = []
 
 	def factory(key, proxies=None):
+		keys.append(key)
 		if key.startswith('flaresolverr:'):
 			sess = FakeSession(flare_script)
 			flare_sessions.append(sess)
@@ -105,6 +107,7 @@ def env(tmp_path, monkeypatch, config_file):
 	factory.flare_sessions = flare_sessions
 	factory.site_script = site_script
 	factory.flare_script = flare_script
+	factory.keys = keys
 	monkeypatch.setattr(bs, '_get_cffi_session', factory)
 	return factory
 
@@ -151,8 +154,18 @@ def test_acw算法可逆向量():
 # ===== 阿里云 WAF 泛化求解 =====
 
 
+class CtxSessionMixin:
+	"""补齐 with 支持：生产侧的一次性 Session 用 with 收尾，替身得跟着实现。"""
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		return False
+
+
 def test_solve_aliyun_waf_提取挑战并算cookie(monkeypatch):
-	class FakeWafSession:
+	class FakeWafSession(CtxSessionMixin):
 		def __init__(self, **kw):
 			self.cookies = FakeCookieJar({'acw_tc': 'tc-1', 'cdn_sec_tc': 'cdn-1'})
 
@@ -166,7 +179,7 @@ def test_solve_aliyun_waf_提取挑战并算cookie(monkeypatch):
 
 
 def test_solve_aliyun_waf_无挑战返回None(monkeypatch):
-	class FakeWafSession:
+	class FakeWafSession(CtxSessionMixin):
 		def __init__(self, **kw):
 			self.cookies = FakeCookieJar()
 
@@ -343,6 +356,22 @@ def test_请求_正常响应零开销不触发求解(env):
 	assert r.status_code == 200 and len(env.site_sessions) == 1
 
 
+def test_请求_use_proxy决定走代理还是直连(env):
+	"""use_proxy=True 带代理出口，False 直连（curl_cffi 不读环境代理，None 就是真直连）；
+	连接池 key 也要带上模式，否则切换开关后还会命中旧 Session、代理设置不生效。"""
+	env.site_script.append(FakeResp(200, payload={'success': True}))
+	proxy = {'https': bs._PROXY, 'http': bs._PROXY}
+
+	asyncio.run(bs.newapi_request(site(), 'GET', '/api/status', {}))
+	assert env.site_sessions[-1].requests[0]['proxies'] == proxy
+	assert 'newapi:t:proxy' in env.keys
+
+	direct = bs.NewapiSite(id='d', label='D', domain='https://d.com', use_proxy=False)
+	asyncio.run(bs.newapi_request(direct, 'GET', '/api/status', {}))
+	assert env.site_sessions[-1].requests[0]['proxies'] is None
+	assert 'newapi:d:direct' in env.keys
+
+
 # ===== 配置与检测端点 =====
 
 
@@ -499,3 +528,42 @@ def test_巡检_正常站点零动作(monkeypatch, tmp_path):
 	saved = json.loads((tmp_path / 'sites.json').read_text(encoding='utf-8'))
 	assert saved[0]['auto_checkin'] is True
 	assert bs.site_patrol_fails == {'t': 0}, '成功时计数清零'
+
+
+def test_巡检_version为空串仍算可达(monkeypatch, tmp_path):
+	"""实测有站点返回 "version": ""（字段在、值为空）—— 旧判据 bool(version) 把它们全判成
+	不可达，连续 3 轮后自动暂停了签到（2026-10-09 线上查实 4 个站点受害）。"""
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	(tmp_path / 'sites.json').write_text(
+		json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8'
+	)
+	monkeypatch.setattr(bs, 'site_patrol_fails', {})
+
+	async def ok_empty_version(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		return FakeResp(200, payload={'success': True, 'data': {'version': '', 'checkin_enabled': True}})
+
+	monkeypatch.setattr(bs, 'newapi_request', ok_empty_version)
+	asyncio.run(bs.run_site_patrol())
+	assert bs.site_patrol_fails == {'t': 0}, 'version 为空但有其它特征键 → 应算可达'
+	saved = json.loads((tmp_path / 'sites.json').read_text(encoding='utf-8'))
+	assert saved[0]['auto_checkin'] is True, '不该被暂停'
+
+
+def test_巡检_HTML应答仍算不可达(monkeypatch, tmp_path):
+	"""CDN 错误页/WAF 挑战页是 HTML，必须仍判不可达（别把死站当活的）"""
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	(tmp_path / 'sites.json').write_text(
+		json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8'
+	)
+	monkeypatch.setattr(bs, 'site_patrol_fails', {})
+
+	async def html_req(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		return FakeResp(200, body='<html><head><title>403 Forbidden</title></head></html>', headers={})
+
+	monkeypatch.setattr(bs, 'newapi_request', html_req)
+	asyncio.run(bs.run_site_patrol())
+	assert bs.site_patrol_fails == {'t': 1}, 'HTML 应答要算一次失败'

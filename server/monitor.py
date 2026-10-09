@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import re
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -25,6 +26,8 @@ monitor_state: dict = {
 	'last_check': None,
 	'next_check': None,
 	'alerted_accounts': set(),  # 已告警的账号（避免重复发送）
+	'failed_counts': {},  # 连续查询失败轮数（键同 alert_key）
+	'alerted_failures': set(),  # 已就「查询失败」告警过的账号（恢复后移除）
 	'logs': [],  # 最近的监控日志
 }
 
@@ -76,22 +79,125 @@ def add_monitor_log(msg: str):
 	print(f'[MONITOR {ts}] {msg}')
 
 
-def send_alert_email(email_cfg: EmailConfig, subject: str, body: str):
-	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）"""
-	msg = MIMEText(body, 'plain', 'utf-8')
-	msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
-	msg['To'] = email_cfg.email_to
-	msg['Subject'] = subject
+def send_alert_email(email_cfg: EmailConfig, subject: str, body: str, retries: int = 2):
+	"""发送告警邮件（同步阻塞，必须经线程池调用，别在事件循环里直接 await）。
 
-	# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
-	with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
-		server.login(email_cfg.email_user, email_cfg.email_pass)
-		server.send_message(msg)
+	连接类失败重试一次：2026-10-09 实测 QQ SMTP 在几分钟内连发几封后偶发
+	「SSL 握手超时」（直连测试 2~6 秒正常，属于免费邮箱的连接数节制），不重试就等于漏报。
+	"""
+	import time as _time
+
+	last: Exception | None = None
+	for attempt in range(retries):
+		try:
+			msg = MIMEText(body, 'plain', 'utf-8')
+			msg['From'] = f'AnyRouter Monitor <{email_cfg.email_user}>'
+			msg['To'] = email_cfg.email_to
+			msg['Subject'] = subject
+
+			# timeout 必须给：SMTP 默认无超时，网络挂起时线程会永远等下去
+			with smtplib.SMTP_SSL(email_cfg.smtp_server, email_cfg.smtp_port, timeout=30) as server:
+				server.login(email_cfg.email_user, email_cfg.email_pass)
+				server.send_message(msg)
+			return
+		except (smtplib.SMTPException, OSError, TimeoutError) as e:  # SSLError/TimeoutError 都是 OSError 子类
+			last = e
+			if attempt < retries - 1:
+				_time.sleep(2)
+	raise last  # type: ignore[misc]
 
 
 def _monitor_alert_key(acc: dict) -> str:
 	"""告警去重键：不同站点的账号可能同名，只用名字会互相吞掉告警"""
 	return f"{acc.get('kind', 'cookie')}:{acc.get('site_id', '')}/{acc.get('name', '?')}"
+
+
+# 连续几轮查询失败才告警：单轮网络抖动/站点抽风不该发邮件。401 这类一眼是登录失效的
+# 等不到「连续 N 轮」——账号已经彻底不可用，多等一轮就多烂 6 小时（默认监控间隔 6h）。
+QUERY_FAIL_ALERT_ROUNDS = 2
+_AUTH_FAIL_RE = re.compile(r'HTTP 401|unauthor|未登录|登录已过期|invalid token', re.I)
+
+
+def _is_auth_failure(error: str) -> bool:
+	"""错误是否属于「登录态失效」这类必须人工处理的情况"""
+	return bool(_AUTH_FAIL_RE.search(error or ''))
+
+
+def load_alert_email() -> EmailConfig | None:
+	"""读 saved_config.json 的 email 段（余额告警与失败告警共用同一份 SMTP 配置）。
+
+	没配或字段不全返回 None，调用方退化为只走 webhook。此前只有 /api/monitor/start
+	的请求体里带邮箱配置，签到等其它域发起告警时拿不到 —— 这里补一个统一入口。
+	"""
+	import balance_server as bs
+
+	try:
+		cfg = bs._read_json_cached(bs.CONFIG_FILE)
+	except Exception:
+		return None
+	raw = cfg.get('email') if isinstance(cfg, dict) else None
+	if not isinstance(raw, dict):
+		return None
+	try:
+		return EmailConfig(**raw)
+	except Exception:
+		return None
+
+
+async def send_alert(subject: str, body: str, webhook: bool = True, email_cfg: EmailConfig | None = None) -> str:
+	"""统一告警出口：邮件 + webhook 各自按配置发，返回一句人话结果供调用方记日志。
+
+	邮件在 saved_config.json 的 email 段（email_cfg 传了就优先用它，监控循环用自己
+	请求里那份配置）、webhook 在 notify 段，两者独立配置、都配就都发；
+	webhook=False 表示本次只发邮件（给 on_alert / on_checkin_failed 这类开关用）。
+	没有任何通道可用时返回提示而不是抛错——告警失败不该把调用方（签到流程）带崩。
+	"""
+	import balance_server as bs
+
+	parts = []
+	email_cfg = email_cfg or load_alert_email()
+	if email_cfg is not None:
+		try:
+			# smtplib 是同步 IO，直呼会冻结整个事件循环（所有 API/签到全卡住），扔线程池
+			await asyncio.get_running_loop().run_in_executor(None, send_alert_email, email_cfg, subject, body)
+			parts.append('邮件已发')
+		except Exception as e:
+			parts.append(f'邮件失败（{str(e)[:40]}）')
+	if webhook and bs.notify_configured():
+		try:
+			r = await bs.send_webhook_notify(subject, body)
+			parts.append('webhook 已发' if r.get('sent') else f'webhook 未发（{r.get("error", "")}）')
+		except Exception as e:
+			parts.append(f'webhook 失败（{str(e)[:40]}）')
+	return '、'.join(parts) if parts else '未配置任何告警通道'
+
+
+def note_query_failure(alert_key: str, error: str) -> bool:
+	"""记一次查询失败；返回 True 表示此刻该发告警（同账号只发一次，恢复后重新武装）。
+
+	登录失效第一轮就告警，其余错误要连续 QUERY_FAIL_ALERT_ROUNDS 轮。去重是必须的：
+	监控每 6 小时一轮，账号烂一周就是 28 封同样的邮件。
+	"""
+	import balance_server as bs
+
+	st = bs.monitor_state
+	counts = st.setdefault('failed_counts', {})
+	counts[alert_key] = counts.get(alert_key, 0) + 1
+	alerted = st.setdefault('alerted_failures', set())
+	if alert_key in alerted:
+		return False
+	if _is_auth_failure(error) or counts[alert_key] >= QUERY_FAIL_ALERT_ROUNDS:
+		alerted.add(alert_key)
+		return True
+	return False
+
+
+def reset_query_failure(alert_key: str) -> None:
+	"""查询成功：清掉连续失败计数与已告警标记，下次再坏会重新告警"""
+	import balance_server as bs
+
+	bs.monitor_state.setdefault('failed_counts', {}).pop(alert_key, None)
+	bs.monitor_state.setdefault('alerted_failures', set()).discard(alert_key)
 
 
 async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
@@ -165,6 +271,7 @@ async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
 				results = await asyncio.gather(*tasks, return_exceptions=True)
 
 				low_balance = []
+				failed_now = []  # (账号名, 去重键, 错误) —— 本轮查询失败的账号
 				all_balances = []  # 所有账号余额
 				total_quota = 0
 				total_used = 0
@@ -175,15 +282,20 @@ async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
 					alert_key = _monitor_alert_key(acc)
 
 					if isinstance(r, BaseException):
-						add_monitor_log(f'{name}: 查询异常 - {type(r).__name__}: {str(r)[:80]}')
-						all_balances.append({'name': name, 'success': False, 'error': str(r)[:120]})
+						err = f'{type(r).__name__}: {str(r)[:80]}'
+						add_monitor_log(f'{name}: 查询异常 - {err}')
+						all_balances.append({'name': name, 'success': False, 'error': err[:120]})
+						failed_now.append((name, alert_key, err))
 						continue
 
 					if not r.get('success'):
-						add_monitor_log(f'{r["name"]}: 查询失败 - {r.get("error", "")}')
-						all_balances.append({'name': r['name'], 'success': False, 'error': r.get('error', '')})
+						err = r.get('error', '') or '查询失败'
+						add_monitor_log(f'{r["name"]}: 查询失败 - {err}')
+						all_balances.append({'name': r['name'], 'success': False, 'error': err})
+						failed_now.append((r['name'], alert_key, err))
 						continue
 
+					reset_query_failure(alert_key)
 					all_balances.append(r)
 					total_quota += r['quota']
 					total_used += r['used']
@@ -218,22 +330,32 @@ async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
 					)
 					body = '\n'.join(lines)
 
-					try:
-						# smtplib 是纯同步 IO，直呼会冻结整个事件循环（所有 API/签到全卡住），
-						# 扔进默认线程池执行
-						await asyncio.get_running_loop().run_in_executor(
-							None, send_alert_email, config.email, subject, body
-						)
-						add_monitor_log(f'告警邮件已发送：{len(low_balance)} 个账号')
-					except Exception as e:
-						add_monitor_log(f'邮件发送失败：{str(e)[:80]}')
+					res = await send_alert(subject, body, webhook=bs.get_notify_config()['on_alert'], email_cfg=config.email)
+					add_monitor_log(f'余额告警：{res}（{len(low_balance)} 个账号）')
 				else:
 					add_monitor_log('所有账号余额正常')
 
-				# webhook 通知独立于邮件：配置了就走，两者可并存（未配置不记日志，免噪音）
-				if low_balance and bs.notify_configured() and bs.get_notify_config()['on_alert']:
-					wr = await bs.send_webhook_notify(subject, body)
-					add_monitor_log(f'webhook 通知：{"已发送" if wr["sent"] else "未发送（" + wr.get("error", "") + "）"}')
+				# 查询失败告警：401/未登录立即告警、其余连续 QUERY_FAIL_ALERT_ROUNDS 轮，
+				# 同账号只发一次（恢复后重新武装）。此前失败只写一行日志，账号烂了都没人知道。
+				new_failures = []
+				for name, key, err in failed_now:
+					if note_query_failure(key, err):
+						new_failures.append((name, err, bs.monitor_state['failed_counts'][key]))
+				if new_failures:
+					subject = f'❌ 账号查询失败告警：{len(new_failures)} 个账号'
+					body = '\n'.join(
+						[
+							'以下账号查询余额持续失败（登录失效请重新登录，其余错误见监控日志）：',
+							'',
+							*[f'  ❌ {n}：{e}（连续 {c} 轮）' for n, e, c in new_failures],
+							'',
+							f'⏰ 检测时间：{bs.monitor_state["last_check"]}',
+						]
+					)
+					res = await send_alert(
+						subject, body, webhook=bs.get_notify_config()['on_alert'], email_cfg=config.email
+					)
+					add_monitor_log(f'查询失败告警：{res}（{len(new_failures)} 个账号）')
 			except Exception as e:
 				add_monitor_log(f'检测出错：{str(e)[:80]}')
 
@@ -264,6 +386,8 @@ async def monitor_start(req: MonitorStartRequest):
 
 	bs.monitor_state['running'] = True
 	bs.monitor_state['alerted_accounts'] = set()
+	bs.monitor_state['failed_counts'] = {}
+	bs.monitor_state['alerted_failures'] = set()
 	bs.monitor_state['logs'] = []
 	bs.monitor_state['config'] = {
 		'interval_hours': req.interval_hours,
