@@ -81,11 +81,27 @@ _UPSTREAM_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix='upstream
 
 _thread_local = threading.local()
 
+# 每个线程缓存的会话数上限。一个活着的会话占 1 个 eventfd，带 keep-alive 时再占 1 个
+# socket —— 站点数 × 上游线程数（24 × 32）的无界缓存会顶满进程 fd 上限，2026-10-09
+# 线上就因此 EMFILE（1023/1024：accept 失败、静态文件 500）。而出口代数还在持续造新
+# key（mihomo 每轮换一次 +1），所以必须有淘汰，不能指望 key 数量天然有限。
+_SESSION_CACHE_MAX = 8
+
+
+def _close_cffi_session(sess) -> None:
+	"""关闭会话释放底层 curl 句柄占的 fd；关失败不该拖垮调用方，记一行就够。"""
+	try:
+		sess.close()
+	except Exception as e:
+		print(f'[SESSION] 关闭旧会话失败: {type(e).__name__}: {e}')
+
 
 def _get_cffi_session(key: str, proxies: dict | None = None):
 	"""取当前线程的 curl_cffi Session（按 key 区分不同站点/代理配置）。
 
 	复用 Session 才能复用代理 CONNECT 隧道与 TLS 握手，实测单请求中位耗时 0.56s → 0.19s。
+	缓存按线程隔离（Session 非线程安全），上限 _SESSION_CACHE_MAX 个，超出淘汰最久未用的那个
+	并 close()：句柄不 close 就不会还 fd，这是此前线上 fd 耗尽的根因。
 
 	注意：curl_cffi 的 Session 会把每次请求传入的 cookies 累积进自己的 jar，并在后续请求中
 	继续发送（已实测），而同一个 Session 会被不同账号轮流复用，所以每次取用时必须清空 cookie，
@@ -97,9 +113,14 @@ def _get_cffi_session(key: str, proxies: dict | None = None):
 	if pool is None:
 		pool = {}
 		_thread_local.sessions = pool
-	sess = pool.get(key)
+	sess = pool.pop(key, None)  # 先摘再插：dict 的插入序即 LRU 序，末尾最新
 	if sess is None:
 		sess = cffi_requests.Session(impersonate='chrome131', proxies=proxies, timeout=30)
-		pool[key] = sess
+	pool[key] = sess
+	while len(pool) > _SESSION_CACHE_MAX:
+		oldest = next(iter(pool))
+		if oldest == key:  # 上限被配成 0 的退化情况：不自闭
+			break
+		_close_cffi_session(pool.pop(oldest))
 	sess.cookies.clear()
 	return sess

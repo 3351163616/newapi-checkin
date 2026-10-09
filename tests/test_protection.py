@@ -151,8 +151,18 @@ def test_acw算法可逆向量():
 # ===== 阿里云 WAF 泛化求解 =====
 
 
+class CtxSessionMixin:
+	"""补齐 with 支持：生产侧的一次性 Session 用 with 收尾，替身得跟着实现。"""
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		return False
+
+
 def test_solve_aliyun_waf_提取挑战并算cookie(monkeypatch):
-	class FakeWafSession:
+	class FakeWafSession(CtxSessionMixin):
 		def __init__(self, **kw):
 			self.cookies = FakeCookieJar({'acw_tc': 'tc-1', 'cdn_sec_tc': 'cdn-1'})
 
@@ -166,7 +176,7 @@ def test_solve_aliyun_waf_提取挑战并算cookie(monkeypatch):
 
 
 def test_solve_aliyun_waf_无挑战返回None(monkeypatch):
-	class FakeWafSession:
+	class FakeWafSession(CtxSessionMixin):
 		def __init__(self, **kw):
 			self.cookies = FakeCookieJar()
 

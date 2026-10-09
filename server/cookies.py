@@ -227,17 +227,18 @@ async def get_waf_cookies() -> dict | None:
 
 			# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
 			# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
-			sess = cffi_requests.Session(
+			# with 收尾：每 5 分钟泄一个 curl 句柄，30 天也能攒到 fd 上限
+			with cffi_requests.Session(
 				impersonate='chrome131',
 				proxies={'https': bs._LOCAL_PROXY, 'http': bs._LOCAL_PROXY},
 				timeout=30,
-			)
-			resp = sess.get(login_url, headers={'User-Agent': bs.USER_AGENT})
-			waf_cookies = {}
-			for name in required:
-				val = sess.cookies.get(name)
-				if val:
-					waf_cookies[name] = val
+			) as sess:
+				resp = sess.get(login_url, headers={'User-Agent': bs.USER_AGENT})
+				waf_cookies = {}
+				for name in required:
+					val = sess.cookies.get(name)
+					if val:
+						waf_cookies[name] = val
 			m = bs._WAF_CHALLENGE_RE.search(resp.text)
 			if m:
 				waf_cookies['acw_sc__v2'] = bs._solve_acw_sc_v2(m.group(1))
