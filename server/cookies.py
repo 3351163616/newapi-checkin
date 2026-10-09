@@ -658,9 +658,11 @@ async def notify_anyrouter_issues(st: dict, checkin_results: list | None = None,
 			r['name'] for r in (checkin_results or []) if r and not r.get('success') and '401' in str(r.get('message', ''))
 		}
 	dead -= renewed
+	alerted_dead = False
 	if dead:
 		fresh = sorted(n for n in dead if _relogin_alert_due(n))
 		if fresh:
+			alerted_dead = True
 			subject = f'🔑 AnyRouter 账号登录已失效：{len(fresh)} 个需重新登录'
 			body = '\n'.join(
 				[
@@ -686,6 +688,10 @@ async def notify_anyrouter_issues(st: dict, checkin_results: list | None = None,
 		return
 	bad = [(name, (v.get('message') or '')[:80]) for name, v in st['accounts'].items() if v.get('status') == 'failed']
 	if not bad:
+		return
+	# 刚发过失效告警、且失败的就是那几个失效账号时不再补一封「签到失败」：
+	# 同一件事两封邮件，第二封不含任何新信息和处置办法
+	if alerted_dead and {n for n, _ in bad} <= dead:
 		return
 	body = '\n'.join([f'  ❌ {n}：{m}' for n, m in bad])
 	res = await bs.send_alert(f'❌ AnyRouter 签到失败 {len(bad)} 个', body)

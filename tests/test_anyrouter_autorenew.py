@@ -212,3 +212,32 @@ def test_签到失败推送受on_checkin_failed开关控制(monkeypatch):
     assert '签到失败' in calls_on['alerts'][0]['subject']
     assert any('失败通知推送' in rec['message'] for rec in st['logs'])
 
+
+
+def test_失效告警已发时不再补发一条签到失败(monkeypatch):
+    # 同一件事两封邮件，第二封不含新信息：失效那封已经写清了「怎么换 cookie」
+    st, calls = run_checkin(
+        monkeypatch,
+        [acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+        notify={'on_checkin_failed': True},
+    )
+    assert len(calls['alerts']) == 1, '只该发失效告警这一封'
+    assert '登录已失效' in calls['alerts'][0]['subject']
+
+
+def test_失效告警被节流时仍会发签到失败推送(monkeypatch):
+    # 节流窗口内不再发失效告警，但「账号还在失败」这件事每天该提醒
+    args = dict(
+        accounts=[acc('a', 'A')],
+        sign_in_result={'name': 'a', 'success': False, 'message': 'HTTP 401', 'blocked': 'http'},
+        expiry_map={'A': {'expires_at': 'x', 'days_left': 1.0}},
+        renew_result={'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'},
+        notify={'on_checkin_failed': True},
+    )
+    _, calls1 = run_checkin(monkeypatch, **args)
+    assert len(calls1['alerts']) == 1 and '登录已失效' in calls1['alerts'][0]['subject']
+    _, calls2 = run_checkin(monkeypatch, **args)
+    assert len(calls2['alerts']) == 1 and '签到失败' in calls2['alerts'][0]['subject']
